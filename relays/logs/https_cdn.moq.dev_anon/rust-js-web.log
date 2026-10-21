@@ -1,0 +1,12 @@
+[page] negotiated protocol: moq-lite-06
+[page] announced: prefix=
+[page] announce: prefix=
+[page] announced: broadcast=anon/doom/game/e1m1 active=true
+[page] announced: broadcast=badchulo-test-0209.hang active=true
+[page] announced: broadcast=smoke-rust-5099-23522.hang active=true
+[page] subscribe start: id=0 broadcast=smoke-rust-5099-23522.hang track=catalog.json
+[page] subscribe ok: id=0 broadcast=smoke-rust-5099-23522.hang track=catalog.json
+[page] received catalog hang smoke-rust-5099-23522.hang {video: Object, audio: Object, archive: Object, clock: Object}
+[page] subscribe start: id=1 broadcast=smoke-rust-5099-23522.hang track=0.avc3
+[page] subscribe ok: id=1 broadcast=smoke-rust-5099-23522.hang track=0.avc3
+decoded 9 frames from smoke-rust-5099-23522.hang (vite)
