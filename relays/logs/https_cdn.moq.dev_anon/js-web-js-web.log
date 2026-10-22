@@ -3,11 +3,12 @@
 [page] announce: prefix=
 [page] announced: broadcast=anon/doom/game/e1m1 active=true
 [page] announced: broadcast=badchulo-test-0209.hang active=true
-[page] announced: broadcast=smoke-js-web-5099-3696.hang active=true
-[page] subscribe start: id=0 broadcast=smoke-js-web-5099-3696.hang track=catalog.json
-[page] subscribe ok: id=0 broadcast=smoke-js-web-5099-3696.hang track=catalog.json
-[page] received catalog hang smoke-js-web-5099-3696.hang {video: Object, clock: Object}
-[page] subscribe start: id=1 broadcast=smoke-js-web-5099-3696.hang track=video
-[page] subscribe ok: id=1 broadcast=smoke-js-web-5099-3696.hang track=video
-[page] subscribe update: id=1 broadcast=smoke-js-web-5099-3696.hang track=video
-decoded 2 frames from smoke-js-web-5099-3696.hang (vite)
+[page] announced: broadcast=lcb-6658971-9caf.hang active=true
+[page] announced: broadcast=smoke-js-web-5142-21434.hang active=true
+[page] subscribe start: id=0 broadcast=smoke-js-web-5142-21434.hang track=catalog.json
+[page] subscribe ok: id=0 broadcast=smoke-js-web-5142-21434.hang track=catalog.json
+[page] received catalog hang smoke-js-web-5142-21434.hang {video: Object, clock: Object}
+[page] subscribe start: id=1 broadcast=smoke-js-web-5142-21434.hang track=video
+[page] subscribe ok: id=1 broadcast=smoke-js-web-5142-21434.hang track=video
+[page] subscribe update: id=1 broadcast=smoke-js-web-5142-21434.hang track=video
+decoded 3 frames from smoke-js-web-5142-21434.hang (vite)
