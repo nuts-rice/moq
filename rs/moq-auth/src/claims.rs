@@ -49,15 +49,20 @@ impl Scope {
 	/// `**` covers everything beneath the scope root, so a scope of `root: "demo"` +
 	/// `publish: ["**"]` grants publish anywhere under `demo`.
 	pub fn allows(&self, claims: &Claims) -> bool {
+		self.covers(&claims.root, &claims.publish, &claims.subscribe)
+	}
+
+	/// [`allows`](Self::allows) for any grant with a root and per-role patterns.
+	pub(crate) fn covers(&self, root: &str, publish: &Patterns, subscribe: &Patterns) -> bool {
 		let covers = |granted: &Patterns, requested: &Patterns| {
-			match (granted.rooted(&self.root), requested.rooted(&claims.root)) {
+			match (granted.rooted(&self.root), requested.rooted(root)) {
 				(Ok(granted), Ok(requested)) => granted.covers(&requested),
 				// A root too deep to place the patterns beneath cannot be granted either way.
 				_ => false,
 			}
 		};
 
-		covers(&self.publish, &claims.publish) && covers(&self.subscribe, &claims.subscribe)
+		covers(&self.publish, publish) && covers(&self.subscribe, subscribe)
 	}
 }
 

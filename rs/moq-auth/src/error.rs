@@ -199,6 +199,14 @@ pub enum Error {
 	/// Fetching a remote JWKS failed.
 	#[error("{0}")]
 	Other(String),
+
+	/// A peer grant was signed or verified with an HMAC key, which every verifier could forge with.
+	#[error("peer grants need an asymmetric key; HMAC keys issue none")]
+	SymmetricPeerGrant,
+
+	/// A peer grant's presenter key (`cnf`) carries private material.
+	#[error("peer grant cnf must be a public asymmetric key")]
+	PrivateCnf,
 }
 
 // Dependency errors are flattened to their message so their crates stay out of this crate's

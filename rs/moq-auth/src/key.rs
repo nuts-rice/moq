@@ -1,6 +1,6 @@
 use crate::error::KeyError;
 use crate::generate::generate;
-use crate::{Algorithm, Claims};
+use crate::{Algorithm, Claims, PeerGrant};
 use base64::Engine;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header};
 use p256::elliptic_curve::SecretKey;
@@ -610,6 +610,48 @@ impl Key {
 	/// Verify the signature, claims, and key scope but not the times, so an expired
 	/// token's root is still known to be genuine.
 	pub(crate) fn verify_claims(&self, token: &str) -> crate::Result<Claims> {
+		let claims: Claims = self.decode(token)?;
+		claims.validate()?;
+		self.validate_scope(&claims.root, &claims.publish, &claims.subscribe)?;
+		Ok(claims)
+	}
+
+	/// Sign the claims with this key, returning the encoded token.
+	pub fn sign(&self, payload: &Claims) -> crate::Result<String> {
+		payload.validate()?;
+		self.validate_scope(&payload.root, &payload.publish, &payload.subscribe)?;
+		self.encode(payload)
+	}
+
+	/// Sign a peer grant with this key, returning the encoded token.
+	///
+	/// Refuses an HMAC key, since every peer that verifies the grant would need the secret.
+	pub fn sign_peer(&self, grant: &PeerGrant) -> crate::Result<String> {
+		if self.is_symmetric() {
+			return Err(crate::Error::SymmetricPeerGrant);
+		}
+		grant.validate()?;
+		self.validate_scope(&grant.root, &grant.publish, &grant.subscribe)?;
+		self.encode(grant)
+	}
+
+	/// Verify a peer grant's signature, claims, expiry, and key scope.
+	///
+	/// This does not check that the presenter holds the `cnf` key; the direct session proves that.
+	pub fn verify_peer(&self, token: &str) -> crate::Result<PeerGrant> {
+		if self.is_symmetric() {
+			return Err(crate::Error::SymmetricPeerGrant);
+		}
+		let grant: PeerGrant = self.decode(token)?;
+		grant.validate()?;
+		self.validate_scope(&grant.root, &grant.publish, &grant.subscribe)?;
+		if grant.expires <= moq_clock::wall() {
+			return Err(crate::Error::TokenExpired);
+		}
+		Ok(grant)
+	}
+
+	fn decode<T: serde::de::DeserializeOwned>(&self, token: &str) -> crate::Result<T> {
 		if !self.operations.contains(&KeyOperation::Verify) {
 			return Err(KeyError::VerifyUnsupported.into());
 		}
@@ -626,27 +668,25 @@ impl Key {
 		validation.validate_exp = false;
 		validation.validate_nbf = false;
 		validation.validate_aud = false;
-		let claims: Claims = jsonwebtoken::decode(token, self.to_decoding_key()?, &validation)?.claims;
-		claims.validate()?;
-		self.validate_scope(&claims)?;
-		Ok(claims)
+		Ok(jsonwebtoken::decode(token, self.to_decoding_key()?, &validation)?.claims)
 	}
 
-	/// Sign the claims with this key, returning the encoded token.
-	pub fn sign(&self, payload: &Claims) -> crate::Result<String> {
+	fn encode(&self, payload: &impl Serialize) -> crate::Result<String> {
 		if !self.operations.contains(&KeyOperation::Sign) {
 			return Err(KeyError::SignUnsupported.into());
 		}
-
-		payload.validate()?;
-		self.validate_scope(payload)?;
 
 		let encode = self.to_encoding_key()?;
 
 		let mut header = Header::new(self.algorithm.into());
 		header.kid = self.kid.as_ref().map(|k| k.to_string());
-		let token = jsonwebtoken::encode(&header, &payload, encode)?;
+		let token = jsonwebtoken::encode(&header, payload, encode)?;
 		Ok(token)
+	}
+
+	fn is_symmetric(&self) -> bool {
+		matches!(self.algorithm, Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512)
+			|| matches!(self.material, KeyMaterial::OCT { .. })
 	}
 
 	/// Generate a key pair for the given algorithm, returning the private and public keys.
@@ -670,10 +710,10 @@ impl Key {
 		self
 	}
 
-	fn validate_scope(&self, claims: &Claims) -> crate::Result<()> {
+	fn validate_scope(&self, root: &str, publish: &crate::Patterns, subscribe: &crate::Patterns) -> crate::Result<()> {
 		if let Some(scope) = &self.scope {
 			scope.validate()?;
-			if !scope.allows(claims) {
+			if !scope.covers(root, publish, subscribe) {
 				return Err(crate::Error::ScopeExceeded);
 			}
 		}
@@ -1205,6 +1245,113 @@ mod tests {
 		assert_eq!(verified_claims.publish, claims.publish);
 		assert_eq!(verified_claims.subscribe, claims.subscribe);
 		assert_eq!(verified_claims.expires, None);
+	}
+
+	fn peer_grant(cnf: &Key) -> PeerGrant {
+		PeerGrant::new(cnf.to_public().unwrap(), moq_clock::wall() + Duration::from_secs(60))
+			.with_root("room")
+			.with_publish(patterns(&["alice/**"]))
+			.with_subscribe(patterns(&["**"]))
+	}
+
+	#[test]
+	fn peer_grant_round_trip() {
+		let presenter = Key::generate(Algorithm::EdDSA, None).unwrap();
+		for algorithm in [Algorithm::ES256, Algorithm::EdDSA] {
+			let relay = Key::generate(algorithm, None).unwrap();
+			let token = relay.sign_peer(&peer_grant(&presenter)).unwrap();
+
+			let grant = relay.to_public().unwrap().verify_peer(&token).unwrap();
+			assert_eq!(grant.root, "room");
+			assert_eq!(grant.publish, patterns(&["alice/**"]));
+			assert_eq!(grant.subscribe, patterns(&["**"]));
+			assert_eq!(
+				grant.cnf.to_str().unwrap(),
+				presenter.to_public().unwrap().to_str().unwrap()
+			);
+		}
+	}
+
+	#[test]
+	fn peer_grant_refuses_hmac() {
+		let presenter = Key::generate(Algorithm::ES256, None).unwrap();
+		let relay = create_test_key();
+		assert!(matches!(
+			relay.sign_peer(&peer_grant(&presenter)),
+			Err(crate::Error::SymmetricPeerGrant)
+		));
+
+		// A token signed with the secret anyway is still refused by a verifier holding it.
+		let token = relay.encode(&peer_grant(&presenter)).unwrap();
+		assert!(matches!(
+			relay.verify_peer(&token),
+			Err(crate::Error::SymmetricPeerGrant)
+		));
+	}
+
+	#[test]
+	fn peer_grant_and_claims_are_not_interchangeable() {
+		let presenter = Key::generate(Algorithm::ES256, None).unwrap();
+		let relay = Key::generate(Algorithm::ES256, None).unwrap();
+
+		let peer = relay.sign_peer(&peer_grant(&presenter)).unwrap();
+		assert!(relay.verify(&peer).is_err());
+
+		let claims = relay.sign(&create_test_claims()).unwrap();
+		assert!(relay.verify_peer(&claims).is_err());
+	}
+
+	#[test]
+	fn peer_grant_refuses_private_cnf() {
+		let presenter = Key::generate(Algorithm::ES256, None).unwrap();
+		let relay = Key::generate(Algorithm::ES256, None).unwrap();
+		let mut grant = peer_grant(&presenter);
+		grant.cnf = presenter;
+		assert!(matches!(relay.sign_peer(&grant), Err(crate::Error::PrivateCnf)));
+
+		let token = relay.encode(&grant).unwrap();
+		assert!(matches!(relay.verify_peer(&token), Err(crate::Error::PrivateCnf)));
+	}
+
+	#[moq_clock::test]
+	async fn peer_grant_expires_on_the_ambient_wall() {
+		let presenter = Key::generate(Algorithm::ES256, None).unwrap();
+		let relay = Key::generate(Algorithm::ES256, None).unwrap();
+		let token = relay.sign_peer(&peer_grant(&presenter)).unwrap();
+		relay.verify_peer(&token).unwrap();
+		moq_clock::sleep(Duration::from_secs(60)).await;
+		assert!(matches!(relay.verify_peer(&token), Err(crate::Error::TokenExpired)));
+	}
+
+	#[test]
+	fn peer_grant_refuses_wrong_signer_and_unknown_claims() {
+		let presenter = Key::generate(Algorithm::ES256, None).unwrap();
+		let relay = Key::generate(Algorithm::ES256, None).unwrap();
+		let other = Key::generate(Algorithm::ES256, None).unwrap();
+
+		let token = other.sign_peer(&peer_grant(&presenter)).unwrap();
+		assert!(relay.verify_peer(&token).is_err());
+
+		let mut payload = serde_json::to_value(peer_grant(&presenter)).unwrap();
+		payload["aud"] = "relay".into();
+		assert!(relay.verify_peer(&sign_raw(&relay, payload)).is_err());
+	}
+
+	#[test]
+	fn peer_grant_respects_key_scope() {
+		let presenter = Key::generate(Algorithm::ES256, None).unwrap();
+		let relay = Key::generate(Algorithm::ES256, None)
+			.unwrap()
+			.with_scope(crate::Scope {
+				root: "room".into(),
+				publish: patterns(&["bob/**"]),
+				subscribe: patterns(&["**"]),
+			})
+			.unwrap();
+		assert!(matches!(
+			relay.sign_peer(&peer_grant(&presenter)),
+			Err(crate::Error::ScopeExceeded)
+		));
 	}
 
 	#[test]

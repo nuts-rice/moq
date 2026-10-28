@@ -338,22 +338,6 @@ impl<'a> Message<'a> for ReceivedSetup {
 	}
 }
 
-#[cfg(feature = "p2p")]
-#[derive(Clone)]
-pub(crate) struct PeersSetup(kio::Shared<PeersSetupState>);
-
-#[cfg(feature = "p2p")]
-struct PeersSetupState {
-	enabled: bool,
-	connect: Url,
-	listen: crate::transport::Address,
-	setup: Option<Setup>,
-	prefix: String,
-	ice_servers: Option<String>,
-	max: usize,
-	meta: serde_json::Value,
-}
-
 /// Shared slot for the peer's SETUP, written once when its Setup stream is read.
 ///
 /// Streams whose encoding depends on a negotiated capability (e.g. the PROBE

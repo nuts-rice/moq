@@ -222,12 +222,6 @@ impl Refresh {
 		self.dispatch();
 	}
 
-	#[cfg(feature = "p2p")]
-	fn auth_keys(&mut self) {}
-
-	#[cfg(feature = "p2p")]
-	fn auth_peers(&mut self) {}
-
 	/// Send waiting tokens to the decider while slots are free, dropping any the peer
 	/// withdrew or whose admission timed out while it waited.
 	fn dispatch(&mut self) {

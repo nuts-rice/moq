@@ -15,8 +15,6 @@ default = ["client"]
 client = ["dep:reqwest", "dep:rustls", "dep:tokio", "moq-clock/runtime", "dep:tracing", "dep:rand"]
 # The reference auth server behind `moq auth serve`: the policy a relay held, on axum.
 serve = ["dep:axum", "dep:tokio", "dep:tracing", "tokio/net"]
-# Peer grants for direct P2P sessions. Work in progress.
-p2p = []
 
 [dependencies]
 aws-lc-rs = { workspace = true }
