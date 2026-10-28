@@ -31,6 +31,9 @@ default = ["cluster-lan", "quic", "websocket", "nvidia", "s3", "gcs", "azure"]
 iroh = ["moq-relay/iroh", "moq-tokio/iroh"]
 # LAN discovery and meshing (`--cluster-lan`).
 cluster-lan = ["moq-relay/cluster-lan"]
+
+p2p = ["default", "moq-auth/p2p", "moq-relay/p2p"]
+
 jemalloc = ["moq-tokio/jemalloc"]
 quic = ["moq-tokio/quic"]
 # qlog trace capture (`--client-quic-qlog <DIR>`). Off by default: it compiles the

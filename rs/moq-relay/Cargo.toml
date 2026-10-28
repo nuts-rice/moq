@@ -27,6 +27,8 @@ doc = false
 test-support = []
 # The optional public STUN Binding listener (`--stun-bind`).
 stun = ["dep:stun-types"]
+# Peer grant issuance for direct P2P sessions. Work in progress.
+p2p = ["moq-auth/p2p"]
 default = ["acme", "cluster-lan", "quic", "websocket", "uds"]
 acme = ["dep:rustls-acme"]
 iroh = ["moq-tokio/iroh"]

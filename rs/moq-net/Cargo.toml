@@ -25,6 +25,8 @@ async = ["dep:futures", "moq-clock/runtime"]
 # default and hidden from the docs.
 fuzz = ["async"]
 
+p2p = ["async"]
+
 [dependencies]
 arrayvec = "0.7"
 bytes = { workspace = true }

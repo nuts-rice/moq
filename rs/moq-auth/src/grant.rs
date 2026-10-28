@@ -1,3 +1,9 @@
+#[cfg(feature = "p2p")]
+use crate::error::KeyError;
+#[cfg(feature = "p2p")]
+use crate::generate::generate;
+#[cfg(feature = "p2p")]
+use crate::{Algorithm, Claims};
 use moq_clock::Wall;
 use moq_pattern::Patterns;
 use serde::{Deserialize, Serialize};
@@ -111,6 +117,37 @@ impl Grant {
 			return Err(crate::Error::GrantExpired);
 		}
 		Ok(())
+	}
+}
+
+#[cfg(feature = "p2p")]
+#[serde_as]
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct PeerGrant {
+	#[serde(skip_serializing_if = "Patterns::is_empty")]
+	pub publish: Patterns,
+
+	/// Patterns the session may subscribe to, relative to the root.
+	#[serde(skip_serializing_if = "Patterns::is_empty")]
+	pub subscribe: Patterns,
+
+	pub cnf: Key,
+
+	pub exp: Option<Duration>,
+}
+
+#[cfg(feature = "p2p")]
+impl PeerGrant {
+	pub fn new(publish: impl Into<Patterns>, subscribe: impl Into<Patterns>) -> Self {
+		let public = Key::generate(Algorithm::ES256, None).unwrap().to_public().unwrap();
+		Self {
+			publish: publish.into(),
+			subscribe: subscribe.into(),
+			..Default::default()
+		}
 	}
 }
 

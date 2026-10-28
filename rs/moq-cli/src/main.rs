@@ -14,6 +14,8 @@ mod devices;
 mod fetch;
 mod hls;
 mod moq;
+#[cfg(feature = "p2p")]
+mod p2p;
 mod play;
 mod publish;
 mod report;
