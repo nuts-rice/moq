@@ -1,5 +1,5 @@
 use crate::error::KeyError;
-use crate::{Claims, Key, KeyOperation};
+use crate::{Claims, Key, KeyOperation, PeerGrant};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::Path;
 use std::str::FromStr;
@@ -116,6 +116,11 @@ impl KeySet {
 	/// A token without a `kid` is accepted only when the set holds exactly one key and that key has no `kid`.
 	pub fn verify(&self, token: &str) -> crate::Result<Claims> {
 		self.key(token)?.verify(token)
+	}
+
+	/// Verify a peer grant with the key matching its `kid` header, as [`verify`](Self::verify) selects it.
+	pub fn verify_peer(&self, token: &str) -> crate::Result<PeerGrant> {
+		self.key(token)?.verify_peer(token)
 	}
 
 	pub(crate) fn key(&self, token: &str) -> crate::Result<Arc<Key>> {

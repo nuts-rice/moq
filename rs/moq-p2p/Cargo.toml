@@ -5,14 +5,20 @@ edition = "2024"
 rust-version.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 moq-auth.workspace = true
+moq-json = "0.5.16"
 moq-net.workspace = true
 moq-pattern = "0.1.3"
 moq-quic.workspace = true
+rand.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 serde_with = { workspace = true, features = ["macros"] }
 url = { workspace = true, features = ["serde"] }
+moq-tokio = { path = "../moq-tokio", default-features = false, features = ["quic", "aws-lc-rs", "websocket"] }
+
+[dev-dependencies]
 
 [lints]
 workspace = true
