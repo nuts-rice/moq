@@ -1,11 +1,14 @@
 import { expect, test } from "bun:test";
-import { Manual, Milli, Nano } from "@moq/clock";
+import { Duration, Instant, Manual } from "@moq/clock";
 import { u53 } from "@moq/hang/catalog";
 import * as Moq from "@moq/net";
 import { Signal } from "@moq/signals";
 import { Fanout } from "../fanout";
-import { Baseline } from "../jitter";
+import { Estimator, Order } from "../order";
 import { Encoder } from "./encoder";
+
+// A probe chunk's bytes: an Annex B start code, which the probe requires of H.264 and HEVC.
+const ANNEX_B = { byteLength: 4, copyTo: (dest: Uint8Array) => dest.set([0, 0, 0, 1]) };
 
 // Model an encoder that cannot accept more work until the test completes its pending input.
 // The codec probe completes immediately, independently of the live encoder's service rate.
@@ -55,7 +58,7 @@ class SlowEncoder {
 
 	async flush() {
 		this.output(
-			{ type: "key", timestamp: 0, byteLength: 1, copyTo: () => {} } as never,
+			{ type: "key", timestamp: 0, ...ANNEX_B } as never,
 			{ decoderConfig: { codec: this.codec } } as never,
 		);
 	}
@@ -95,7 +98,7 @@ test("a slower-than-realtime encoder drops input instead of ratcheting catalog l
 	SlowEncoder.instances = [];
 	Input.all = [];
 	const clock = new Manual();
-	const restore = clock.install();
+	const installed = clock.install();
 	let controller!: ReadableStreamDefaultController<VideoFrame>;
 	const fanout = new Fanout(
 		new ReadableStream<VideoFrame>({
@@ -106,10 +109,22 @@ test("a slower-than-realtime encoder drops input instead of ratcheting catalog l
 		{ clone: (frame) => frame.clone(), release: (frame) => frame.close() },
 	);
 	const track = new Moq.Track.Producer("video").accept({ timescale: Moq.Time.Timescale.MICRO });
-	const baseline = new Baseline();
-	const rendition = { config: new Signal(undefined), track: new Signal(track), close: () => track.close() };
+	const order = new Order();
+	// An on-time audio rendition shares the broadcast, writing each capture as it happens.
+	const audio = new Estimator();
+	const rendition = {
+		slot: new Signal(undefined),
+		config: new Signal(undefined),
+		stats: new Signal(undefined),
+		track: new Signal(track),
+		join: new Signal(undefined),
+		close: () => {
+			track.finish();
+			track.close();
+		},
+	};
 	const encoder = new Encoder("video", {
-		broadcast: { video: () => rendition, baseline } as never,
+		broadcast: { video: () => rendition, order, join: new Signal(undefined) } as never,
 		capture: {
 			in: { source: new Signal({ getSettings: () => ({ frameRate: 25 }), getConstraints: () => ({}) }) },
 			out: { display: new Signal({ width: 640, height: 480 }), frames: new Signal(fanout) },
@@ -117,14 +132,14 @@ test("a slower-than-realtime encoder drops input instead of ratcheting catalog l
 		config: { frameRate: 25 },
 	});
 	const send = async (millis = 40) => {
-		await clock.advance(Nano.fromMilli(Milli(millis)));
-		const timestamp = Nano.toMicro(Nano(clock.now()));
-		baseline.observe(0, timestamp); // An on-time audio rendition shares the broadcast.
+		await clock.advance(Duration.millis(millis));
+		const timestamp = clock.now().since(Instant.ZERO).asMicros();
+		audio.write(timestamp, order, true);
 		controller.enqueue(new Input(timestamp) as never);
-		await clock.advance(Nano.zero);
+		await clock.advance(Duration.ZERO);
 	};
 	try {
-		await clock.advance(Nano.zero);
+		await clock.advance(Duration.ZERO);
 		expect(encoder.out.resolved.peek()).toBeDefined();
 		const live = SlowEncoder.instances.find((instance) => instance.state === "configured");
 		if (!live) throw new Error("live encoder was not configured");
@@ -135,7 +150,7 @@ test("a slower-than-realtime encoder drops input instead of ratcheting catalog l
 			largestQueue = Math.max(largestQueue, live.encodeQueueSize);
 			if (frame % 3 === 2) {
 				live.finish();
-				await clock.advance(Nano.zero);
+				await clock.advance(Duration.ZERO);
 			}
 		}
 		// A kept frame waits exactly two capture intervals, independent of stream duration.
@@ -162,9 +177,10 @@ test("a slower-than-realtime encoder drops input instead of ratcheting catalog l
 	} finally {
 		encoder.close();
 		fanout.close();
+		track.finish();
 		track.close();
-		await clock.advance(Nano.zero);
-		restore();
+		await clock.advance(Duration.ZERO);
+		installed.close();
 		for (const [index, name] of ["VideoEncoder", "VideoFrame"].entries()) {
 			const original = originals[index];
 			if (original) Object.defineProperty(globalThis, name, original);

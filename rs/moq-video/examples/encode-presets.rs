@@ -19,12 +19,16 @@
 //! times the input's size on disk.
 //!
 //! Hardware on another machine needs its own run; nothing here extrapolates.
-#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+#![expect(
+	clippy::disallowed_methods,
+	clippy::disallowed_types,
+	reason = "the example reads the host clock"
+)]
 
 use std::time::{Duration, Instant};
 
 use moq_video::encode::{Codec, Config, Encoder, Kind, Preset};
-use moq_video::{Frame, I420, Rate, Size, Surface};
+use moq_video::{Frame, FrameRate, I420, Size, Surface};
 
 const PRESETS: [(Preset, &str); 3] = [
 	(Preset::LowLatency, "low-latency"),
@@ -64,12 +68,12 @@ fn main() -> anyhow::Result<()> {
 	let pictures: Vec<&[u8]> = raw.chunks_exact(len).collect();
 	anyhow::ensure!(!pictures.is_empty(), "input holds no {size} I420 frame");
 
-	println!("preset\tcontrols\tp50 ms\tp95 ms\tmax ms\tfps\tcpu ms/frame\theld\tskipped\tkbps");
+	println!("preset\tencoder\tp50 ms\tp95 ms\tmax ms\tfps\tcpu ms/frame\theld\tskipped\tkbps");
 	for (preset, label) in PRESETS
 		.into_iter()
 		.filter(|(_, label)| only.is_none_or(|only| only == *label))
 	{
-		let mut config = Config::new(size.width, size.height, Rate::new(fps, 1)?);
+		let mut config = Config::new(size.width, size.height, FrameRate::new(fps, 1)?);
 		config.codec = codec;
 		config.kind = Kind::Named(backend.clone());
 		config.bitrate = Some(moq_net::bandwidth::Rate::from_bps(bitrate));
@@ -99,7 +103,7 @@ fn main() -> anyhow::Result<()> {
 		let seconds = pictures.len() as f64 / fps as f64;
 		println!(
 			"{label}\t{}\t{:.2}\t{:.2}\t{:.2}\t{:.0}\t{:.2}\t{}\t{}\t{:.0}",
-			paced.controls,
+			paced.name,
 			pick(0.5),
 			pick(0.95),
 			pick(1.0),
@@ -114,7 +118,8 @@ fn main() -> anyhow::Result<()> {
 }
 
 struct Run {
-	controls: String,
+	/// The encoder backend that ran.
+	name: String,
 	/// Per emitted frame, from `encode` being called to the packet stamped with it coming back.
 	latency: Vec<Duration>,
 	/// Frames the codec dropped rather than encoded (openh264 skips to hold its rate).
@@ -129,8 +134,7 @@ struct Run {
 /// Encode every picture, at real-time pacing when `paced` and back to back otherwise.
 fn run(config: &Config, pictures: &[&[u8]], paced: bool) -> anyhow::Result<Run> {
 	let mut encoder = Encoder::new(config)?;
-	let applied = encoder.applied();
-	let controls = format!("{} {:?}: {}", encoder.name(), applied.preset, applied.controls);
+	let name = encoder.name().to_owned();
 
 	let frame_time = Duration::from_micros(1_000_000 / config.framerate.rounded() as u64);
 	let mut submitted: Vec<Instant> = Vec::with_capacity(pictures.len());
@@ -141,13 +145,14 @@ fn run(config: &Config, pictures: &[&[u8]], paced: bool) -> anyhow::Result<Run> 
 	let mut stream = Vec::new();
 
 	let mut collect =
-		|packets: Vec<moq_video::encode::Encoded>, submitted: &[Instant], emitted: &mut [Option<Duration>]| {
+		|encoder: &mut Encoder, submitted: &[Instant], emitted: &mut [Option<Duration>]| -> anyhow::Result<()> {
 			let now = Instant::now();
-			for packet in packets {
+			while let Some(packet) = encoder.receive()? {
 				let index = (packet.timestamp.as_micros() / frame_time.as_micros()) as usize;
 				emitted[index] = Some(now - submitted[index]);
 				stream.extend_from_slice(&packet.payload);
 			}
+			Ok(())
 		};
 
 	let start = Instant::now();
@@ -162,11 +167,12 @@ fn run(config: &Config, pictures: &[&[u8]], paced: bool) -> anyhow::Result<Run> 
 		let i420 = I420::new(config.size(), picture.to_vec())?;
 		let timestamp = moq_net::Timestamp::from_micros((frame_time * index as u32).as_micros() as u64)?;
 		submitted.push(Instant::now());
-		let packets = encoder.encode(&Frame::new(Surface::I420(i420), timestamp))?;
-		collect(packets, &submitted, &mut emitted);
+		encoder.encode(&Frame::new(Surface::I420(i420), timestamp))?;
+		collect(&mut encoder, &submitted, &mut emitted)?;
 		returned.push(emitted.iter().filter(|e| e.is_some()).count());
 	}
-	collect(encoder.finish()?, &submitted, &mut emitted);
+	encoder.flush()?;
+	collect(&mut encoder, &submitted, &mut emitted)?;
 	let (wall, cpu) = (start.elapsed(), cpu_time() - cpu);
 
 	// Only knowable at the end: a frame that never came back was skipped, not held.
@@ -179,7 +185,7 @@ fn run(config: &Config, pictures: &[&[u8]], paced: bool) -> anyhow::Result<Run> 
 		.unwrap_or(0);
 
 	Ok(Run {
-		controls,
+		name,
 		latency: emitted.into_iter().flatten().collect(),
 		skipped,
 		held,

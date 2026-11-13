@@ -1,9 +1,6 @@
 import * as THREE from "three";
 
-export type Placement =
-	| { kind: "ambisonic" }
-	| { kind: "point"; position: THREE.Vector3 }
-	| { kind: "head" };
+export type Placement = { kind: "ambisonic" } | { kind: "point"; position: THREE.Vector3 } | { kind: "head" };
 
 // Virtual speakers at the corners of a cube in ambisonic axes (W, Y, Z, X)
 const SPEAKERS = [-1, 1].flatMap((x) =>
@@ -12,15 +9,29 @@ const SPEAKERS = [-1, 1].flatMap((x) =>
 
 const MAX_RE = 1 / Math.sqrt(3);
 
+// Scratch for pose(), which runs every XR frame.
+const POSE = {
+	position: new THREE.Vector3(),
+	rotation: new THREE.Quaternion(),
+	scale: new THREE.Vector3(),
+	forward: new THREE.Vector3(),
+	up: new THREE.Vector3(),
+};
+
 // Renders audio graph around a viewer's head
 export class Spatial {
 	#context: BaseAudioContext;
 	#nodes: AudioNode[] = [];
 	#tracksPosition: boolean;
+	// Every placement mixes here, so muting is one param.
+	#out: GainNode;
 
 	constructor(root: AudioNode, placement: Placement) {
 		this.#context = root.context;
-		const destination = this.#context.destination;
+		this.#out = new GainNode(this.#context);
+		this.#out.connect(this.#context.destination);
+		this.#nodes.push(this.#out);
+		const destination = this.#out;
 
 		switch (placement.kind) {
 			case "head":
@@ -80,14 +91,16 @@ export class Spatial {
 		return panner;
 	}
 
+	set muted(muted: boolean) {
+		this.#out.gain.setTargetAtTime(muted ? 0 : 1, this.#context.currentTime, 0.01);
+	}
 
-		// Move the audio with the transform of viewer's head
-		pose(head: THREE.Matrix4) {
-		const position = new THREE.Vector3();
-		const rotation = new THREE.Quaternion();
-		head.decompose(position, rotation, new THREE.Vector3());
-		const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(rotation);
-		const up = new THREE.Vector3(0, 1, 0).applyQuaternion(rotation);
+	// Move the listener to the viewer's head, in the same space as the placement.
+	pose(head: THREE.Matrix4) {
+		const { position, rotation, scale, forward, up } = POSE;
+		head.decompose(position, rotation, scale);
+		forward.set(0, 0, -1).applyQuaternion(rotation);
+		up.set(0, 1, 0).applyQuaternion(rotation);
 
 		const listener = this.#context.listener;
 		const at = this.#context.currentTime;

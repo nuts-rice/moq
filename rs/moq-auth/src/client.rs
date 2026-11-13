@@ -3,16 +3,21 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use moq_clock::Instant;
+use kio::clock::Instant;
 use url::Url;
 
-use crate::lease::{self, Due, Reason};
+use crate::lease::{self, Due, DueTimers, Reason};
 use crate::{Bytes, Error, Event, Grant, Request};
 
 /// Every request is bounded so a hung server refuses rather than parks the session.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The HTTP side of the contract: one JSON POST per event to an auth server.
+/// The largest reply read from the auth server. Each one is held whole before it is
+/// parsed, once per admission in flight, so the size bounds that memory; a grant
+/// with thousands of patterns still fits.
+const MAX_REPLY: usize = 1 << 20;
+
+/// The HTTP side of the contract: one JSON POST per credential event to an auth server.
 ///
 /// `connect` admits a session and hands back the [`lease::Consumer`] it holds; a task
 /// behind it re-POSTs `revalidate` on the grant's cadence, applies each reply, revokes
@@ -29,12 +34,15 @@ impl Client {
 	/// A client for the server at `url`.
 	///
 	/// `http://` is accepted for a loopback host only; `https://` presents `tls`, the
-	/// caller's client identity and roots; `unix://` speaks HTTP over the socket at
-	/// the URL's path. Anything else is refused here rather than at the first session.
+	/// caller's client identity and roots, or without it rind's TLS and the platform's
+	/// roots; `unix://` speaks HTTP over the socket at the URL's path. Anything else is
+	/// refused here rather than at the first session.
 	pub fn new(url: Url, tls: Option<rustls::ClientConfig>) -> crate::Result<Self> {
 		// No client-wide timeout: `connect` runs under its caller's deadline, and the
-		// requests that run after the handshake are bounded one by one.
-		let builder = reqwest::Client::builder();
+		// requests that run after the handshake are bounded one by one. Every request carries
+		// a credential in its body, which a followed 307 or 308 would resend to wherever it
+		// points, so a redirect is refused rather than followed.
+		let builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
 
 		let (builder, url) = match url.scheme() {
 			"http" => {
@@ -49,10 +57,7 @@ impl Client {
 				}
 				(builder, url)
 			}
-			"https" => match tls {
-				Some(tls) => (builder.use_preconfigured_tls(tls), url),
-				None => (builder, url),
-			},
+			"https" => (builder, url),
 			#[cfg(unix)]
 			"unix" => {
 				let path = url.to_file_path().map_err(|()| Error::InvalidUrl(redact(&url)))?;
@@ -63,9 +68,14 @@ impl Client {
 			_ => return Err(Error::InvalidUrl(redact(&url))),
 		};
 
+		let tls = match tls {
+			Some(tls) => tls,
+			None => crate::crypto::tls()?,
+		};
+
 		Ok(Self {
 			identity: Arc::new(()),
-			http: builder.build()?,
+			http: builder.use_preconfigured_tls(tls).build()?,
 			url,
 		})
 	}
@@ -78,12 +88,20 @@ impl Client {
 	/// deadline is the bound, and dropping the future drops the request. Every later
 	/// request for the session ([`attach`](Self::attach), revalidate, end) is bounded
 	/// on its own, since nothing else bounds it.
+	///
+	/// The end POST runs on the tokio runtime after the lease drops; await
+	/// [`reported`](lease::Consumer::reported) before shutting the runtime down.
 	pub async fn connect(&self, request: Request) -> crate::Result<lease::Consumer> {
+		if request.auth.is_some() {
+			return Err(Error::Refused(Default::default()));
+		}
 		let context = Context::new(request.clone(), self.identity.clone());
 		admit(self.clone(), request, context).await
 	}
 
-	/// Verify another credential for this connection without owning its end event.
+	/// Verify another credential for this connection and report its own end when it closes.
+	///
+	/// Like [`connect`](Self::connect), the end POST needs the runtime alive after the lease drops.
 	pub async fn attach(&self, connection: &lease::Consumer, request: Request) -> crate::Result<lease::Consumer> {
 		let context = connection.context().ok_or(Error::Refused(Default::default()))?;
 		let context = context.attach(&request, &self.identity)?;
@@ -96,6 +114,7 @@ impl Client {
 pub(crate) struct Context {
 	connection: Arc<Connection>,
 	owner: bool,
+	attachment: Option<(String, kio::Shared<Lifecycle>)>,
 }
 
 struct Connection {
@@ -116,15 +135,12 @@ struct Lifecycle {
 /// connection id: its Connect, and each Revalidate until its driver stops.
 struct Admission(Arc<Connection>);
 
-/// Held by the owner's driver; dropping it, posted or not, releases
-/// [`Context::reported`] so a task aborted mid-post cannot park a waiter forever.
+/// Dropping a credential's driver releases [`Context::reported`] even if its POST failed.
 struct Reporting(Context);
 
 impl Drop for Reporting {
 	fn drop(&mut self) {
-		if self.0.owner {
-			self.0.connection.lifecycle.lock().reported = true;
-		}
+		self.0.lifecycle().lock().reported = true;
 	}
 }
 
@@ -152,6 +168,7 @@ impl Context {
 				lifecycle: Default::default(),
 			}),
 			owner: true,
+			attachment: None,
 		}
 	}
 
@@ -171,6 +188,10 @@ impl Context {
 		Ok(Self {
 			connection: self.connection.clone(),
 			owner: false,
+			attachment: Some((
+				Request::new(&request.node, request.transport, &request.path).id,
+				Default::default(),
+			)),
 		})
 	}
 
@@ -186,31 +207,30 @@ impl Context {
 		Ok(Some(Admission(self.connection.clone())))
 	}
 
+	fn lifecycle(&self) -> &kio::Shared<Lifecycle> {
+		match &self.attachment {
+			Some((_, lifecycle)) => lifecycle,
+			None => &self.connection.lifecycle,
+		}
+	}
+
 	pub(crate) fn close(&self, reason: Reason, bytes: Bytes) {
 		if self.owner {
-			self.connection
-				.lifecycle
+			self.lifecycle()
 				.lock()
 				.ended
 				.get_or_insert((reason, bytes, Instant::now()));
 		}
 	}
 
-	/// Resolve once the connection's `end` was posted, or its driver stopped without
-	/// posting it. At once for an attached credential, which never posts one.
-	pub(crate) async fn reported(&self) {
-		if !self.owner {
-			return;
-		}
-		drop(
-			self.connection
-				.lifecycle
-				.wait(|lifecycle| match lifecycle.reported {
-					true => std::task::Poll::Ready(()),
-					false => std::task::Poll::Pending,
-				})
-				.await,
-		);
+	/// Ready once this credential's end was reported, or its driver stopped.
+	pub(crate) fn poll_reported(&self, waiter: &kio::Waiter) -> std::task::Poll<()> {
+		self.lifecycle()
+			.poll(waiter, |lifecycle| match lifecycle.reported {
+				true => std::task::Poll::Ready(()),
+				false => std::task::Poll::Pending,
+			})
+			.map(drop)
 	}
 
 	/// Resolve with the connection's end reason, for an attached credential only.
@@ -231,23 +251,18 @@ impl Context {
 		.await
 	}
 
-	async fn end(&self) -> Option<(Reason, Bytes, Instant)> {
-		if !self.owner {
-			return None;
-		}
-		Some(
-			kio::wait(|waiter| {
-				let lifecycle = std::task::ready!(self.connection.lifecycle.poll(waiter, |ended| {
-					if ended.ended.is_some() && ended.pending == 0 {
-						std::task::Poll::Ready(())
-					} else {
-						std::task::Poll::Pending
-					}
-				}));
-				std::task::Poll::Ready(lifecycle.ended.clone().expect("waited for connection end"))
-			})
-			.await,
-		)
+	async fn end(&self) -> (Reason, Bytes, Instant) {
+		kio::wait(|waiter| {
+			let lifecycle = std::task::ready!(self.lifecycle().poll(waiter, |ended| {
+				if ended.ended.is_some() && ended.pending == 0 {
+					std::task::Poll::Ready(())
+				} else {
+					std::task::Poll::Pending
+				}
+			}));
+			std::task::Poll::Ready(lifecycle.ended.clone().expect("waited for credential end"))
+		})
+		.await
 	}
 }
 
@@ -255,7 +270,7 @@ impl Context {
 /// answer in tests, so the lease's timers run on Tokio's paused clock with no
 /// socket for them to outrun.
 trait Post: Clone + Send + Sync + 'static {
-	/// Send a `connect` or `revalidate`: the grant as answered, not yet validated,
+	/// Send a `connect`, `attach`, or `revalidate`: the grant as answered, not yet validated,
 	/// a refusal, or an outage.
 	fn post(&self, request: &Request) -> impl Future<Output = crate::Result<Grant>> + Send;
 
@@ -264,30 +279,55 @@ trait Post: Clone + Send + Sync + 'static {
 }
 
 impl Post for Client {
-	/// A 2xx carries the grant, a 401 or 403 refuses, and everything else is an
-	/// outage the caller decides about. A JSON refusal carries its reason and verified attribution;
-	/// legacy bodies refuse without attribution.
+	/// A 2xx carries the grant, a 401 or 403 refuses, and everything else, a redirect
+	/// included, is an outage the caller decides about. A JSON refusal carries its reason and
+	/// verified attribution; legacy bodies refuse without attribution.
 	async fn post(&self, request: &Request) -> crate::Result<Grant> {
 		let response = self.http.post(self.url.clone()).json(request).send().await?;
 		let status = response.status();
 		if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-			return Err(Error::Refused(response.json().await.unwrap_or_default()));
+			let refusal = reply(response)
+				.await
+				.ok()
+				.and_then(|body| serde_json::from_slice(&body).ok());
+			return Err(Error::Refused(refusal.unwrap_or_default()));
 		}
-		if !status.is_success() {
-			return Err(Error::Unavailable(format!("auth server answered {status}")));
-		}
-		Ok(response.json().await?)
+		check(status)?;
+		serde_json::from_slice(&reply(response).await?)
+			.map_err(|err| Error::Unavailable(format!("auth server answered an invalid grant: {err}")))
 	}
 
 	async fn post_end(&self, request: &Request) -> crate::Result<()> {
-		self.http
-			.post(self.url.clone())
-			.json(request)
-			.send()
-			.await?
-			.error_for_status()?;
-		Ok(())
+		let response = self.http.post(self.url.clone()).json(request).send().await?;
+		check(response.status())
 	}
+}
+
+/// Refuse anything but a 2xx, naming a redirect as one, since it is not followed.
+fn check(status: reqwest::StatusCode) -> crate::Result<()> {
+	if status.is_redirection() {
+		return Err(Error::Unavailable(format!(
+			"auth server answered {status}; redirects are not followed"
+		)));
+	}
+	if !status.is_success() {
+		return Err(Error::Unavailable(format!("auth server answered {status}")));
+	}
+	Ok(())
+}
+
+/// Read a reply body of at most [`MAX_REPLY`] bytes, refusing a longer one as it arrives.
+async fn reply(mut response: reqwest::Response) -> crate::Result<Vec<u8>> {
+	let mut body = Vec::new();
+	while let Some(chunk) = response.chunk().await? {
+		if body.len() + chunk.len() > MAX_REPLY {
+			return Err(Error::Unavailable(format!(
+				"auth server reply exceeds {MAX_REPLY} bytes"
+			)));
+		}
+		body.extend_from_slice(&chunk);
+	}
+	Ok(body)
 }
 
 /// Admit a session through `server` and spawn the driver behind its lease.
@@ -295,7 +335,12 @@ impl Post for Client {
 /// The connection's own `connect` runs under the caller's deadline; an attached
 /// credential arrives after the handshake, so its request is bounded here.
 async fn admit<S: Post>(server: S, mut request: Request, context: Context) -> crate::Result<lease::Consumer> {
-	request.event = Event::Connect;
+	request.auth = context.attachment.as_ref().map(|(id, _)| id.clone());
+	request.event = if request.auth.is_some() {
+		Event::Attach
+	} else {
+		Event::Connect
+	};
 	let admission = context.admitting()?;
 
 	let grant = match context.owner {
@@ -317,6 +362,8 @@ async fn admit<S: Post>(server: S, mut request: Request, context: Context) -> cr
 		producer: Some(producer),
 		started: Instant::now(),
 	};
+	// Spawned rather than returned: reqwest already needs a tokio runtime, and the driver must
+	// outlive the session to report its end.
 	tokio::spawn(driver.run());
 
 	Ok(consumer)
@@ -337,7 +384,7 @@ async fn ask<S: Post>(server: &S, request: &Request) -> crate::Result<Grant> {
 /// Finish a request that nothing else bounds within [`TIMEOUT`], or report the
 /// server as unavailable, so a stalled server cannot pile up requests.
 async fn bounded<T>(request: impl Future<Output = crate::Result<T>>) -> crate::Result<T> {
-	moq_clock::timeout(TIMEOUT, request).await.unwrap_or_else(|_| {
+	kio::clock::timeout(TIMEOUT, request).await.unwrap_or_else(|_| {
 		Err(Error::Unavailable(format!(
 			"the auth server did not answer within {TIMEOUT:?}"
 		)))
@@ -370,9 +417,7 @@ struct Driver<S> {
 impl<S: Post> Driver<S> {
 	async fn run(mut self) {
 		self.drive().await;
-		let Some((reason, bytes, ended)) = self.context.end().await else {
-			return;
-		};
+		let (reason, bytes, ended) = self.context.end().await;
 
 		let mut request = self.request.clone();
 		request.event = Event::End {
@@ -395,6 +440,7 @@ impl<S: Post> Driver<S> {
 		// Keep an in-flight request alive while expiry or a push is observed.
 		let mut inflight: Option<Pin<Box<dyn Future<Output = crate::Result<Grant>> + Send>>> = None;
 		let mut pending = false;
+		let mut timers = DueTimers::default();
 
 		let ended = loop {
 			let reply = async {
@@ -408,7 +454,7 @@ impl<S: Post> Driver<S> {
 				ended = producer.closed() => break ended,
 				// An attached credential ends with its connection.
 				reason = self.context.connection_ended() => break producer.finish(reason, Bytes::default()),
-				due = producer.due() => match due {
+				due = kio::wait(|waiter| producer.poll_due(waiter, &mut timers)) => match due {
 					Due::Expired => break producer.finish(Reason::Expired, Bytes::default()),
 					Due::Revalidate if inflight.is_some() => pending = true,
 					Due::Revalidate => inflight = Some(self.post_revalidate()),
@@ -440,6 +486,15 @@ impl<S: Post> Driver<S> {
 				},
 			}
 		};
+		// An attachment reports its lease's verdict, even if its consumer closes later
+		// with another reason. The connection owner reports the connection's own close.
+		if !self.context.owner {
+			self.context
+				.lifecycle()
+				.lock()
+				.ended
+				.get_or_insert((ended.0.clone(), ended.1, Instant::now()));
+		}
 		// Land an in-flight Revalidate before releasing the connection's End, so
 		// End is the last request for this id however the lease ended.
 		if let Some(request) = inflight {
@@ -457,12 +512,10 @@ impl<S: Post> Driver<S> {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
 	use super::*;
 	use moq_pattern::Patterns;
 	use std::task::Poll;
-	use std::time::SystemTime;
 	use wiremock::matchers::{method, path};
 	use wiremock::{Mock, MockServer, Request as Received, ResponseTemplate};
 
@@ -501,7 +554,7 @@ mod tests {
 
 		/// Wait for the background `end` POST and return it.
 		async fn end(&self) -> Request {
-			let is_end = |r: &Request| matches!(r.event, Event::End { .. });
+			let is_end = |r: &Request| matches!(r.event, Event::End { .. }) && r.auth.is_none();
 			self.until(|log| log.iter().any(is_end)).await;
 			self.0.read().iter().find(|r| is_end(r)).cloned().unwrap()
 		}
@@ -532,7 +585,10 @@ mod tests {
 	struct Script {
 		identity: Arc<()>,
 		log: Log,
-		#[allow(clippy::type_complexity)]
+		#[expect(
+			clippy::type_complexity,
+			reason = "a one-off test responder; an alias would only move the type"
+		)]
 		respond: std::sync::Arc<dyn Fn(&Request) -> Option<crate::Result<Grant>> + Send + Sync>,
 	}
 
@@ -581,7 +637,7 @@ mod tests {
 	/// as zero and be refused; these tests run on a one-second cadence.
 	fn grant(expires_in: Option<Duration>, revalidate: Option<Duration>) -> Grant {
 		let mut grant = Grant::new(patterns(&["**"]), Patterns::new());
-		grant.expires = expires_in.map(|d| SystemTime::now() + d);
+		grant.expires = expires_in.map(|d| kio::clock::wall() + d);
 		grant.revalidate = revalidate;
 		grant
 	}
@@ -595,7 +651,7 @@ mod tests {
 		.await;
 
 		let consumer = client(&server).connect(request()).await.unwrap();
-		assert_eq!(consumer.grant().publish, patterns(&["**"]).into());
+		assert_eq!(consumer.grant().publish, patterns(&["**"]));
 		assert_eq!(log.events(), [Event::Connect]);
 
 		consumer.close("disconnected", Bytes { sent: 7, received: 11 });
@@ -719,9 +775,15 @@ mod tests {
 		let mut request = request();
 		request.query = Some("jwt=replacement".into());
 		let attached = script.attach(&owner, request).await.unwrap();
+		let reported = attached.reported();
 		drop(attached);
-		tokio::task::yield_now().await;
-		assert_eq!(log.events(), [Event::Connect, Event::Connect]);
+		reported.await;
+		let events = log.0.read();
+		assert!(matches!(events.last().unwrap().event, Event::End { .. }));
+		let attachment = events[1].auth.as_ref().expect("attachment identity");
+		assert_eq!(events[2].auth.as_ref(), Some(attachment));
+		assert_eq!(events[2].id, events[0].id);
+		drop(events);
 		owner.close("done", Bytes { sent: 7, received: 11 });
 		match log.end().await.event {
 			Event::End { reason, bytes, .. } => {
@@ -749,7 +811,7 @@ mod tests {
 		assert!(
 			matches!(
 				log.events().as_slice(),
-				[Event::Connect, Event::Connect, Event::End { .. }]
+				[Event::Connect, Event::Attach, Event::End { .. }, Event::End { .. }]
 			),
 			"an attached lease outlived its connection's End"
 		);
@@ -764,7 +826,7 @@ mod tests {
 		struct Slow(Script);
 		impl Post for Slow {
 			async fn post(&self, request: &Request) -> crate::Result<Grant> {
-				tokio::time::sleep(TIMEOUT + Duration::from_secs(1)).await;
+				kio::clock::sleep(TIMEOUT + Duration::from_secs(1)).await;
 				self.0.post(request).await
 			}
 			async fn post_end(&self, request: &Request) -> crate::Result<()> {
@@ -774,7 +836,7 @@ mod tests {
 		let script = Script::new(Log::default(), |_| Some(Ok(grant(None, None))));
 		let server = Slow(script.clone());
 
-		let start = tokio::time::Instant::now();
+		let start = kio::clock::now();
 		let owner = match admit(
 			server.clone(),
 			request(),
@@ -790,7 +852,7 @@ mod tests {
 		let mut attached = request();
 		attached.query = Some("jwt=replacement".into());
 		let context = owner.context().unwrap().attach(&attached, &script.identity).unwrap();
-		let start = tokio::time::Instant::now();
+		let start = kio::clock::now();
 		let Err(err) = admit(server, attached, context).await else {
 			panic!("an attached credential waited past its bound");
 		};
@@ -838,14 +900,20 @@ mod tests {
 		tokio::task::yield_now().await;
 		assert_eq!(
 			log.events(),
-			[Event::Connect, Event::Connect],
+			[Event::Connect, Event::Attach],
 			"end overtook a withdrawn attachment's in-flight revalidate"
 		);
 		server.release.notify_one();
 		log.end().await;
 		assert!(matches!(
 			log.events().as_slice(),
-			[Event::Connect, Event::Connect, Event::Revalidate, Event::End { .. }]
+			[
+				Event::Connect,
+				Event::Attach,
+				Event::Revalidate,
+				Event::End { .. },
+				Event::End { .. }
+			]
 		));
 	}
 
@@ -866,7 +934,7 @@ mod tests {
 		request.query = Some("jwt=replacement".into());
 		let attached = script.attach(&owner, request).await.unwrap();
 		assert_eq!(owner.closed().await, Reason::Expired);
-		assert_eq!(log.events(), [Event::Connect, Event::Connect]);
+		assert_eq!(log.events(), [Event::Connect, Event::Attach]);
 		assert!(matches!(attached.poll_closed(&kio::Waiter::noop()), Poll::Pending));
 		owner.close(Reason::Shutdown, Bytes::default());
 		assert!(matches!(
@@ -926,7 +994,7 @@ mod tests {
 		));
 		assert!(matches!(
 			log.events().as_slice(),
-			[Event::Connect, Event::Connect, Event::End { .. }]
+			[Event::Connect, Event::Attach, Event::End { .. }]
 		));
 	}
 
@@ -996,10 +1064,46 @@ mod tests {
 		assert!(matches!(err, Error::Refused(_)), "{err}");
 	}
 
+	/// A reply of exactly `MAX_REPLY` bytes admits; one byte more is an outage, or a
+	/// plain refusal on a 403, never read whole.
+	#[tokio::test]
+	async fn replies_are_bounded() {
+		let padded = |status: u16, body: &str, len: usize| {
+			// JSON allows trailing whitespace, so the padded reply still parses.
+			let body = format!("{body}{}", " ".repeat(len - body.len()));
+			ResponseTemplate::new(status).set_body_raw(body, "application/json")
+		};
+		let grant = serde_json::to_string(&grant(None, None)).unwrap();
+		let refusal = r#"{"reason":"expired","root":"tenant"}"#;
+
+		let fits = server(Log::default(), {
+			let grant = grant.clone();
+			move |_| padded(200, &grant, MAX_REPLY)
+		})
+		.await;
+		client(&fits)
+			.connect(request())
+			.await
+			.expect("a reply at the bound admits");
+
+		let over = server(Log::default(), move |_| padded(200, &grant, MAX_REPLY + 1)).await;
+		let err = client(&over).connect(request()).await.unwrap_err();
+		assert!(
+			matches!(&err, Error::Unavailable(message) if message.contains("exceeds")),
+			"{err}"
+		);
+
+		let refused = server(Log::default(), move |_| padded(403, refusal, MAX_REPLY + 1)).await;
+		let Error::Refused(actual) = client(&refused).connect(request()).await.unwrap_err() else {
+			panic!("expected refusal")
+		};
+		assert_eq!(actual, crate::Refusal::default());
+	}
+
 	#[tokio::test]
 	async fn typed_refusal_preserves_reason_root_and_tier() {
 		use crate::refusal::Reason;
-		for reason in [Reason::Refused, Reason::Forbidden, Reason::Expired] {
+		for reason in [Reason::Refused, Reason::Forbidden, Reason::Expired, Reason::Malformed] {
 			for root in [None, Some("tenant")] {
 				for tier in [None, Some("edge")] {
 					let expected = crate::Refusal {
@@ -1048,7 +1152,9 @@ mod tests {
 		tokio::time::pause();
 		let server = Script::new(Log::default(), |request| {
 			Some(match request.event {
-				Event::Connect => Ok(grant(Some(Duration::from_secs(3600)), Some(Duration::from_secs(1)))),
+				Event::Connect | Event::Attach => {
+					Ok(grant(Some(Duration::from_secs(3600)), Some(Duration::from_secs(1))))
+				}
 				_ => Err(crate::Refusal {
 					reason: crate::refusal::Reason::Expired,
 					..Default::default()
@@ -1077,6 +1183,42 @@ mod tests {
 		}
 	}
 
+	/// A 307 or 308 from the auth server fails every credential-bearing request, and the body
+	/// never reaches the destination the redirect names.
+	#[tokio::test]
+	async fn redirects_are_refused_without_resending_the_credential() {
+		let foreign = MockServer::start().await;
+		Mock::given(method("POST"))
+			.respond_with(ResponseTemplate::new(200))
+			.mount(&foreign)
+			.await;
+		for status in [307, 308] {
+			let auth = MockServer::start().await;
+			Mock::given(method("POST"))
+				.respond_with(
+					ResponseTemplate::new(status).insert_header("location", format!("{}/foreign", foreign.uri())),
+				)
+				.mount(&auth)
+				.await;
+			let client = Client::new(auth.uri().parse().unwrap(), None).unwrap();
+
+			let refused = |err: Error| {
+				assert!(
+					matches!(&err, Error::Unavailable(message) if message.contains("redirects are not followed")),
+					"{status}: {err}"
+				);
+			};
+			refused(client.connect(request()).await.unwrap_err());
+			refused(Post::post(&client, &request()).await.unwrap_err());
+			refused(Post::post_end(&client, &request()).await.unwrap_err());
+			assert_eq!(auth.received_requests().await.unwrap().len(), 3);
+		}
+		assert!(
+			foreign.received_requests().await.unwrap().is_empty(),
+			"a credential followed the redirect"
+		);
+	}
+
 	#[tokio::test(start_paused = true)]
 	async fn revalidate_runs_on_cadence_and_applies_the_reply() {
 		let log = Log::default();
@@ -1089,7 +1231,7 @@ mod tests {
 		});
 
 		let mut consumer = script.connect().await.unwrap();
-		let fresh = tokio::time::timeout(Duration::from_secs(3), consumer.changed())
+		let fresh = kio::clock::timeout(Duration::from_secs(3), consumer.changed())
 			.await
 			.expect("a re-check within the cadence")
 			.unwrap();
@@ -1106,13 +1248,15 @@ mod tests {
 		for refuse in refusals {
 			let script = Script::new(Log::default(), move |request| {
 				Some(match request.event {
-					Event::Connect => Ok(grant(Some(Duration::from_secs(3600)), Some(Duration::from_secs(1)))),
+					Event::Connect | Event::Attach => {
+						Ok(grant(Some(Duration::from_secs(3600)), Some(Duration::from_secs(1))))
+					}
 					_ => refuse(),
 				})
 			});
 
 			let consumer = script.connect().await.unwrap();
-			let reason = tokio::time::timeout(Duration::from_secs(3), consumer.closed())
+			let reason = kio::clock::timeout(Duration::from_secs(3), consumer.closed())
 				.await
 				.expect("revoked within the cadence");
 			assert_eq!(reason, Reason::Refused);
@@ -1123,13 +1267,13 @@ mod tests {
 	async fn an_invalid_grant_on_recheck_revokes() {
 		let script = Script::new(Log::default(), |request| {
 			Some(Ok(match request.event {
-				Event::Connect => grant(Some(Duration::from_secs(3600)), Some(Duration::from_secs(1))),
+				Event::Connect | Event::Attach => grant(Some(Duration::from_secs(3600)), Some(Duration::from_secs(1))),
 				_ => grant(None, Some(Duration::from_secs(1))),
 			}))
 		});
 
 		let consumer = script.connect().await.unwrap();
-		let reason = tokio::time::timeout(Duration::from_secs(3), consumer.closed())
+		let reason = kio::clock::timeout(Duration::from_secs(3), consumer.closed())
 			.await
 			.expect("revoked within the cadence");
 		assert_eq!(reason, Reason::Invalid);
@@ -1139,7 +1283,7 @@ mod tests {
 	async fn an_expired_grant_is_refused() {
 		tokio::time::pause();
 		let mut grant = Grant::new(patterns(&["**"]), Patterns::new());
-		grant.expires = Some(SystemTime::now() - Duration::from_secs(1));
+		grant.expires = Some(kio::clock::wall() - Duration::from_secs(1));
 		let script = Script::new(Log::default(), move |_| Some(Ok(grant.clone())));
 		assert!(matches!(script.connect().await, Err(Error::GrantExpired)));
 	}
@@ -1160,7 +1304,7 @@ mod tests {
 		let consumer = script.connect().await.unwrap();
 		// A nudge's reply schedules the next re-check the same way.
 		consumer.revalidate();
-		let reason = tokio::time::timeout(Duration::from_secs(4), consumer.closed())
+		let reason = kio::clock::timeout(Duration::from_secs(4), consumer.closed())
 			.await
 			.expect("closed at expires");
 		assert_eq!(reason, Reason::Expired);
@@ -1172,11 +1316,11 @@ mod tests {
 	#[tokio::test]
 	async fn an_outage_keeps_the_grant_until_expires() {
 		tokio::time::pause();
-		let expires = SystemTime::now() + Duration::from_secs(3);
+		let expires = kio::clock::wall() + Duration::from_secs(3);
 		let log = Log::default();
 		let script = Script::new(log.clone(), move |request| {
 			Some(match request.event {
-				Event::Connect => {
+				Event::Connect | Event::Attach => {
 					let mut grant = grant(None, Some(Duration::from_secs(1)));
 					grant.expires = Some(expires);
 					Ok(grant)
@@ -1187,15 +1331,15 @@ mod tests {
 
 		// `expires` is wall-clock time, which the client maps onto Tokio's clock
 		// somewhere inside `connect`, so bracket it: the bounds hold however long it takes.
-		let (wall, tick) = (SystemTime::now(), tokio::time::Instant::now());
+		let (wall, tick) = (kio::clock::wall(), kio::clock::now());
 		let consumer = script.connect().await.unwrap();
-		let earliest = tick + expires.duration_since(SystemTime::now()).unwrap();
-		let latest = tokio::time::Instant::now() + expires.duration_since(wall).unwrap();
+		let earliest = tick.saturating_add(expires.checked_duration_since(kio::clock::wall()).unwrap());
+		let latest = kio::clock::now().saturating_add(expires.checked_duration_since(wall).unwrap());
 
 		// A millisecond either side for Tokio's timer resolution.
 		let tolerance = Duration::from_millis(1);
 		assert!(
-			tokio::time::timeout_at(earliest - tolerance, consumer.closed())
+			kio::clock::timeout_at(earliest.saturating_sub(tolerance), consumer.closed())
 				.await
 				.is_err(),
 			"an outage must not close before expires"
@@ -1203,10 +1347,10 @@ mod tests {
 		assert!(log.revalidates() >= 1, "the outage was answered before expires");
 		assert_eq!(
 			consumer.grant().publish,
-			patterns(&["**"]).into(),
+			patterns(&["**"]),
 			"the grant stands through the outage"
 		);
-		let reason = tokio::time::timeout_at(latest + tolerance, consumer.closed())
+		let reason = kio::clock::timeout_at(latest.saturating_add(tolerance), consumer.closed())
 			.await
 			.expect("closed at expires, not later");
 		assert_eq!(reason, Reason::Expired);
@@ -1224,12 +1368,14 @@ mod tests {
 	async fn expiry_fires_while_a_recheck_is_stalled() {
 		tokio::time::pause();
 		let script = Script::new(Log::default(), |request| match request.event {
-			Event::Connect => Some(Ok(grant(Some(Duration::from_secs(3)), Some(Duration::from_secs(1))))),
+			Event::Connect | Event::Attach => {
+				Some(Ok(grant(Some(Duration::from_secs(3)), Some(Duration::from_secs(1)))))
+			}
 			_ => None,
 		});
 		let consumer = script.connect().await.unwrap();
 
-		let reason = tokio::time::timeout(Duration::from_secs(5), consumer.closed())
+		let reason = kio::clock::timeout(Duration::from_secs(5), consumer.closed())
 			.await
 			.expect("expired while the re-check was in flight");
 		assert_eq!(reason, Reason::Expired);
@@ -1239,7 +1385,9 @@ mod tests {
 	async fn a_close_is_reported_while_a_recheck_is_stalled() {
 		let log = Log::default();
 		let script = Script::new(log.clone(), |request| match request.event {
-			Event::Connect => Some(Ok(grant(Some(Duration::from_secs(3600)), Some(Duration::from_secs(1))))),
+			Event::Connect | Event::Attach => {
+				Some(Ok(grant(Some(Duration::from_secs(3600)), Some(Duration::from_secs(1)))))
+			}
 			_ => None,
 		});
 
@@ -1300,7 +1448,7 @@ mod tests {
 		let consumer = client(&server).connect(request()).await.unwrap();
 		assert_eq!(log.events(), [Event::Connect]);
 		consumer.revalidate();
-		tokio::time::timeout(
+		kio::clock::timeout(
 			Duration::from_secs(2),
 			log.until(|log| log.iter().any(|r| r.event == Event::Revalidate)),
 		)
@@ -1312,7 +1460,7 @@ mod tests {
 	async fn a_nudge_during_inflight_posts_once_more_when_the_reply_lands() {
 		let log = Log::default();
 		let server = server(log.clone(), |request| match request.event {
-			Event::Connect => ResponseTemplate::new(200)
+			Event::Connect | Event::Attach => ResponseTemplate::new(200)
 				.set_body_json(grant(Some(Duration::from_secs(3600)), Some(Duration::from_secs(3600)))),
 			Event::Revalidate => ResponseTemplate::new(200)
 				.set_body_json(grant(Some(Duration::from_secs(3600)), Some(Duration::from_secs(3600))))
@@ -1323,7 +1471,7 @@ mod tests {
 
 		let consumer = client(&server).connect(request()).await.unwrap();
 		consumer.revalidate();
-		tokio::time::timeout(
+		kio::clock::timeout(
 			Duration::from_secs(2),
 			log.until(|log| log.iter().any(|r| r.event == Event::Revalidate)),
 		)
@@ -1334,7 +1482,7 @@ mod tests {
 		consumer.revalidate();
 		// `changed` jumps to the latest grant epoch, so two replies can arrive as one
 		// observation. The request log does not coalesce.
-		tokio::time::timeout(
+		kio::clock::timeout(
 			Duration::from_secs(3),
 			log.until(|log| log.iter().filter(|r| r.event == Event::Revalidate).count() >= 2),
 		)

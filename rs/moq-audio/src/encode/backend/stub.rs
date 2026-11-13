@@ -2,13 +2,15 @@
 //! platform encoder. A test opts in with [`install`]; every other test sees the
 //! real tiers.
 
-use std::cell::Cell;
+use std::cell::RefCell;
+use std::collections::VecDeque;
+use std::sync::{Arc, Weak};
 
 use bytes::Bytes;
 
 use super::Backend;
 use crate::Error;
-use crate::encode::{Encoded, Settings};
+use crate::encode::{Config, Encoded};
 
 pub(crate) const NAME: &str = "stub";
 
@@ -16,53 +18,86 @@ pub(crate) const NAME: &str = "stub";
 pub(crate) const DELAY: usize = 2112;
 
 thread_local! {
-	static INSTALLED: Cell<bool> = const { Cell::new(false) };
+	static INSTALLED: RefCell<Weak<()>> = const { RefCell::new(Weak::new()) };
 }
 
 /// Stand the stub in for the platform tier on this thread until the guard drops.
 pub(crate) fn install() -> Installed {
-	INSTALLED.set(true);
-	Installed(())
+	let resource = Arc::new(());
+	INSTALLED.set(Arc::downgrade(&resource));
+	Installed(resource)
 }
 
 /// Whether this thread has the stub installed.
 pub(super) fn installed() -> bool {
-	INSTALLED.get()
+	INSTALLED.with(|installed| installed.borrow().strong_count() > 0)
 }
 
 /// Uninstalls the stub on drop.
-pub(crate) struct Installed(());
+pub(crate) struct Installed(Arc<()>);
+
+impl Installed {
+	/// The backend resources still owned by encoders opened under this guard.
+	pub(crate) fn resources(&self) -> usize {
+		Arc::strong_count(&self.0) - 1
+	}
+}
 
 impl Drop for Installed {
 	fn drop(&mut self) {
-		INSTALLED.set(false);
+		INSTALLED.set(Weak::new());
 	}
 }
 
 /// Emits each frame's index as its payload, and cannot retune.
+///
+/// Pipelines like a platform encoder: it holds every other frame and releases
+/// it with the next, so submissions alternate between readying no packet and two,
+/// and a tail waits for [`flush`](Backend::flush).
 pub(crate) struct Stub {
+	_resource: Arc<()>,
 	bitrate: u64,
 	frames: u64,
+	held: Option<Encoded>,
+	ready: VecDeque<Encoded>,
 }
 
 impl Stub {
-	pub(super) fn open(settings: &Settings) -> Result<Box<dyn Backend>, Error> {
+	pub(super) fn open(config: &Config) -> Result<Box<dyn Backend>, Error> {
 		Ok(Box::new(Self {
-			bitrate: settings.bitrate.map_or(128_000, |rate| rate.as_bps()),
+			_resource: INSTALLED.with(|installed| installed.borrow().upgrade().unwrap()),
+			bitrate: config.bitrate.map_or(128_000, |rate| rate.as_bps()),
 			frames: 0,
+			held: None,
+			ready: VecDeque::new(),
 		}))
 	}
 }
 
 impl Backend for Stub {
-	fn encode(&mut self, _pcm: &[f32]) -> Result<Encoded, Error> {
-		let payload = Bytes::copy_from_slice(&self.frames.to_be_bytes());
+	fn encode(&mut self, _pcm: &[f32]) -> Result<(), Error> {
+		let packet = Encoded::new(Bytes::copy_from_slice(&self.frames.to_be_bytes()));
 		self.frames += 1;
-		Ok(Encoded::new(payload))
+		match self.held.take() {
+			Some(held) => self.ready.extend([held, packet]),
+			None => self.held = Some(packet),
+		}
+		Ok(())
+	}
+
+	fn receive(&mut self) -> Result<Option<Encoded>, Error> {
+		Ok(self.ready.pop_front())
+	}
+
+	fn flush(&mut self) -> Result<(), Error> {
+		self.ready.extend(self.held.take());
+		Ok(())
 	}
 
 	fn reset(&mut self) {
 		self.frames = 0;
+		self.held = None;
+		self.ready.clear();
 	}
 
 	fn set_bitrate(&mut self, bitrate: u64) -> Result<(), Error> {

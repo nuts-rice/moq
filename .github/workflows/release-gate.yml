@@ -30,7 +30,8 @@ jobs:
     timeout-minutes: 10
     outputs:
       android: ${{ steps.filter.outputs.android }}
-      audio-quality: ${{ steps.filter.outputs.audio-quality }}
+      api-diff: ${{ steps.filter.outputs.api-diff }}
+      c: ${{ steps.filter.outputs.c }}
       cpp: ${{ steps.filter.outputs.cpp }}
       interop: ${{ steps.filter.outputs.interop }}
       moq-sh: ${{ steps.filter.outputs.moq-sh }}
@@ -46,7 +47,6 @@ jobs:
       ts: ${{ steps.filter.outputs.ts }}
       uring: ${{ steps.filter.outputs.uring }}
       video: ${{ steps.filter.outputs.video }}
-      wasm: ${{ steps.filter.outputs.wasm }}
       x11: ${{ steps.filter.outputs.x11 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -71,7 +71,6 @@ jobs:
               - "rs/moq-loc/**"
               - "rs/moq-msf/**"
               - "rs/moq-json/**"
-              - "rs/moq-flate/**"
               - "rs/moq-pattern/**"
               - "rs/hang/**"
               - "rs/kio/**"
@@ -81,28 +80,45 @@ jobs:
               - "Cargo.toml"
               - "Cargo.lock"
               - "rust-toolchain.toml"
+              - "sh/rs/android-test.sh"
               - ".github/workflows/android.yml"
-            audio-quality:
-              - "js/watch/**"
-              # The container consumer decides what a replay delivers, waits for, and skips, on the
-              # groups, tracks, and signals underneath it.
-              - "js/hang/**"
-              - "js/net/**"
-              - "js/signals/**"
-              - "test/audio-quality/**"
-              - "test/lib/**"
-              - "test/justfile"
-              - ".github/workflows/audio-quality.yml"
+            # Anything a published API is built from, including the lockfiles,
+            # since a bumped dependency can change a re-exported type.
+            api-diff:
+              - "rs/**"
+              - ".cargo/config.toml"
+              - "js/**"
+              - "Cargo.toml"
+              - "Cargo.lock"
+              - "package.json"
+              - "bun.lock"
+              - "cpp/moq/uniffi.toml"
+              - "sh/api-diff/**"
+              - "justfile"
+              - ".github/workflows/api-diff.yml"
+              - ".github/workflows/release-gate.yml"
+            c:
+              - "c/**"
+              - "rs/moq-ffi/**"
+              - ".cargo/config.toml"
+              - "sh/c/**"
+              - "rs/moq-c/native-libs/**"
+              - "cpp/moq/cmake/moq-ffi.cmake"
+              - "Cargo.lock"
+              - ".github/workflows/c.yml"
+              - ".github/actions/uniffi-bindgen/**"
             cpp:
               - "cpp/moq/**"
               - "cpp/justfile"
               - "rs/moq-ffi/**"
+              - ".cargo/config.toml"
               - "sh/cpp/**"
               - "rs/moq-c/native-libs/**"
               - "doc/lib/cpp/**"
               - "doc/lib/samples.sh"
               - "Cargo.lock"
               - ".github/workflows/cpp.yml"
+              - ".github/actions/uniffi-bindgen/**"
             # A backported change to the interop harness itself; nightly covers main.
             interop:
               - "test/lib/**"
@@ -111,7 +127,18 @@ jobs:
               - "test/interop/**"
               - "test/max-age/**"
               - "test/portrait/**"
+              - "test/vr/**"
+              - "demo/vr/**"
               - "rs/moq-tokio/tests/integration/max_age.rs"
+              - "test/datagram-tracks/**"
+              - "rs/moq-tokio/tests/integration/datagram_tracks.rs"
+              - "test/stream-limits/**"
+              - "rs/moq-tokio/tests/integration/stream_limits.rs"
+              - "test/relay-fill/**"
+              - "rs/moq-tokio/tests/integration/relay_fill.rs"
+              - "test/receive-credit/**"
+              - "rs/moq-tokio/tests/integration/receive_credit.rs"
+              - "rs/moq-uring/tests/integration/receive_credit.rs"
               # The interop job also depends on the recipe that invokes it and the
               # workspace membership that links the JS clients to source.
               - "test/justfile"
@@ -119,6 +146,7 @@ jobs:
               # The Go client builds against the modules this script stages.
               - "sh/go/**"
               - "cpp/moq/**"
+              - ".cargo/config.toml"
               - ".github/workflows/interop.yml"
             moq-sh:
               - "infra/moq-sh/**"
@@ -128,6 +156,7 @@ jobs:
               - "cpp/moq/**"
               - "sh/obs/**"
               - "rs/moq-ffi/**"
+              - ".cargo/config.toml"
               - "rs/moq-c/**"
               - "doc/lib/c/**"
               - "doc/lib/samples.sh"
@@ -141,6 +170,7 @@ jobs:
               - ".github/workflows/obs.yml"
             oss-scanner:
               - ".oss-scanner/**"
+              - ".github/actions/nextest/VERSION"
               - "sh/oss-scanner.sh"
               - ".github/workflows/oss-scanner.yml"
             release-dart:
@@ -158,6 +188,7 @@ jobs:
               - "dart/moq_ffi/**"
               - "sh/dart/**"
               - "rs/moq-ffi/build.sh"
+              - ".cargo/config.toml"
             release-go-ffi:
               - ".github/workflows/release-go-ffi.yml"
               - ".github/workflows/release-ffi.yml"
@@ -168,6 +199,9 @@ jobs:
               - "sh/go/package-ffi.sh"
               - "sh/go/publish-ffi.sh"
               - "rs/moq-ffi/build.sh"
+              - ".cargo/config.toml"
+              # release-ffi.yml installs the Go generator through this action.
+              - ".github/actions/uniffi-bindgen/**"
             release-js:
               - "js/**"
               - ".github/workflows/release-js.yml"
@@ -179,6 +213,7 @@ jobs:
               - ".github/workflows/release-kt-lib.yml"
               - "sh/gh/release.sh"
               - "rs/moq-ffi/build.sh"
+              - ".cargo/config.toml"
             release-swift-lib:
               - "swift/VERSION"
               - "swift/Package.swift.template"
@@ -202,13 +237,13 @@ jobs:
               # Exactly the workspace crates run.sh builds; sh/gh/ts-paths.py fails Check on drift.
               - "rs/hang/**"
               - "rs/kio/**"
+              - "rs/kio/macros/**"
               - "rs/moq-archive/**"
               - "rs/moq-auth/**"
               - "rs/moq-cli/**"
-              - "rs/moq-clock/**"
-              - "rs/moq-flate/**"
+              - "rs/moq-congestion/**"
+              - "rs/moq-crypto/**"
               - "rs/moq-hls/**"
-              - "rs/moq-ice/**"
               - "rs/moq-json/**"
               - "rs/moq-loc/**"
               - "rs/moq-msf/**"
@@ -217,7 +252,6 @@ jobs:
               - "rs/moq-pattern/**"
               - "rs/moq-quic/**"
               - "rs/moq-relay/**"
-              - "rs/moq-rtc/**"
               - "rs/moq-rtmp/**"
               - "rs/moq-rtsp/**"
               - "rs/moq-shaper/**"
@@ -225,6 +259,7 @@ jobs:
               - "rs/moq-srt/**"
               - "rs/moq-stats/**"
               - "rs/moq-tokio/**"
+              - "rs/moq-webrtc/**"
               - "rs/qmux/**"
               - "Cargo.toml"
               - "Cargo.lock"
@@ -253,6 +288,10 @@ jobs:
               - "js/video/**"
               - "js/publish/src/preview.ts"
               - "js/publish/src/element.ts"
+              - "js/watch/src/player.ts"
+              - "js/watch/src/sync.ts"
+              - "js/watch/src/audio/**"
+              - "js/watch/src/video/**"
               - "test/video/**"
               - "test/justfile"
               - "package.json"
@@ -260,27 +299,6 @@ jobs:
               - "flake.nix"
               - "flake.lock"
               - ".github/workflows/video.yml"
-            wasm:
-              - "rs/moq-wasm/**"
-              - "rs/moq-clock/**"
-              - "rs/moq-net/**"
-              - "rs/kio/**"
-              - "js/wasm/**"
-              - "test/wasm/**"
-              - "test/lib/**"
-              - "justfile"
-              - "js/justfile"
-              - "rs/justfile"
-              - "test/justfile"
-              - ".cargo/config.toml"
-              - "package.json"
-              - "bun.lock"
-              - "Cargo.toml"
-              - "Cargo.lock"
-              - "rust-toolchain.toml"
-              - "flake.nix"
-              - "flake.lock"
-              - ".github/workflows/wasm.yml"
             x11:
               - "rs/moq-video/**"
               - "rs/justfile"
@@ -310,11 +328,18 @@ jobs:
     if: needs.scope.outputs.android == 'true'
     uses: ./.github/workflows/android.yml
 
-  audio-quality:
-    name: Audio quality
+  api-diff:
+    name: API diff
     needs: scope
-    if: needs.scope.outputs.audio-quality == 'true'
-    uses: ./.github/workflows/audio-quality.yml
+    if: needs.scope.outputs.api-diff == 'true'
+    uses: ./.github/workflows/api-diff.yml
+    secrets: inherit
+
+  c:
+    name: C
+    needs: scope
+    if: needs.scope.outputs.c == 'true'
+    uses: ./.github/workflows/c.yml
 
   cpp:
     name: C++
@@ -365,7 +390,6 @@ jobs:
     secrets: inherit
     permissions:
       contents: read
-      id-token: write
 
   uring:
     name: io_uring
@@ -379,13 +403,6 @@ jobs:
     needs: scope
     if: needs.scope.outputs.video == 'true'
     uses: ./.github/workflows/video.yml
-
-  wasm:
-    name: WASM
-    needs: scope
-    if: needs.scope.outputs.wasm == 'true'
-    uses: ./.github/workflows/wasm.yml
-    secrets: inherit
 
   x11:
     name: X11 capture
@@ -438,7 +455,6 @@ jobs:
     uses: ./.github/workflows/release-kt-lib.yml
     permissions:
       contents: read
-      actions: read
 
   release-swift-lib:
     name: Release Swift Lib
@@ -461,7 +477,8 @@ jobs:
       - platform
       - features
       - android
-      - audio-quality
+      - api-diff
+      - c
       - cpp
       - interop
       - moq-sh
@@ -471,7 +488,6 @@ jobs:
       - ts
       - uring
       - video
-      - wasm
       - x11
       - release-dart
       - release-dart-ffi

@@ -10,7 +10,8 @@ use crate::support;
 
 use std::time::Duration;
 
-use moq_net::{Hop, Version, goaway::Goaway};
+use moq_net::{Version, goaway::Goaway};
+use support::Draining;
 use support::harness::{MockConnectOptions, MockPair, connect_mock};
 use support::mock::create_mock_session_pair;
 
@@ -20,49 +21,40 @@ fn timed() -> moq_net::track::Info {
 }
 
 /// Build an origin producer, spawning its driver on the ambient runtime.
-fn produce_origin(hop: Hop) -> moq_net::origin::Producer {
-	let (producer, driver) = moq_net::origin::Producer::new(moq_net::origin::Config::new(hop));
+fn produce_origin() -> moq_net::origin::Producer {
+	let (producer, driver) = moq_net::origin::Producer::new(moq_net::origin::Config::default());
 	support::harness::spawn(driver);
-	producer
+	producer.with_proxy(true)
 }
 
 /// Maximum time any single test may run before being treated as a deadlock.
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Every version with GOAWAY support, across both wires and their distinct
-/// channels: the lite Goaway control stream, the IETF draft-14-16 shared
-/// control stream, and the IETF draft-17+ SETUP uni streams.
-const GOAWAY_VERSIONS: &[&str] = &[
-	"moq-lite-04",
-	"moq-lite-05",
-	"moq-transport-14",
-	"moq-transport-16",
-	"moq-transport-17",
-	"moq-transport-18",
-	"moq-transport-19",
-];
+/// channels: the lite Goaway control stream and the IETF SETUP uni streams.
+const GOAWAY_VERSIONS: &[&str] = &["moq-lite-04", "moq-lite-05", "moq-transport-18", "moq-transport-22"];
 
 /// A full receive window or missing FIN ACK cannot hold a drain beyond its local deadline.
 async fn closes_stalled_goaway(version: Version, writes: bool) {
 	let pair = connect_mock(MockConnectOptions::new(version)).await;
-	moq_clock::sim::idle().await;
+	kio::clock::sim::idle().await;
 	let before = pair.server_transport.blocked_writes();
 	if writes {
 		pair.server_transport.hold_writes();
 	} else {
 		pair.server_transport.hold_fin_acknowledgements();
 	}
-	let started = moq_clock::now();
+	let started = kio::clock::now();
 	let timeout = Duration::from_secs(1);
 	pair.server.drain().send(Goaway::new().with_timeout(timeout)).unwrap();
-	let reason = moq_clock::timeout(timeout * 2, pair.server.closed())
+	let reason = kio::clock::timeout(timeout * 2, pair.server.closed())
 		.await
 		.unwrap_or_else(|_| panic!("{version}: a stalled GOAWAY held the session past its deadline"));
 	assert!(
 		matches!(reason, moq_net::Error::Session(moq_net::SessionError::GoawayTimeout)),
 		"{version}: {reason}"
 	);
-	assert_eq!(moq_clock::now() - started, timeout, "{version}: drain window moved");
+	assert_eq!(kio::clock::now() - started, timeout, "{version}: drain window moved");
 	if writes {
 		assert!(
 			pair.server_transport.blocked_writes() > before,
@@ -71,7 +63,7 @@ async fn closes_stalled_goaway(version: Version, writes: bool) {
 	}
 }
 
-#[moq_clock::test]
+#[kio::test]
 async fn a_stalled_lite_goaway_is_still_closed_at_the_deadline() {
 	for name in ["moq-lite-04", "moq-lite-05", "moq-lite-06", "moq-lite-07-wip"] {
 		let version = name.parse().unwrap();
@@ -81,20 +73,23 @@ async fn a_stalled_lite_goaway_is_still_closed_at_the_deadline() {
 	}
 }
 
-#[moq_clock::test]
+#[kio::test]
 async fn a_stalled_ietf_goaway_is_still_closed_at_the_deadline() {
-	for name in Version::names().filter(|name| name.starts_with("moq-transport-")) {
-		closes_stalled_goaway(name.parse().unwrap(), true).await;
+	for version in support::every_version()
+		.into_iter()
+		.filter(|version| !version.is_lite())
+	{
+		closes_stalled_goaway(version, true).await;
 	}
 }
 
 /// Server drains with a redirect URI; the client observes it through
 /// `Session::draining()`. Exercises every GOAWAY channel in the version
 /// matrix, in both directions.
-#[moq_clock::test]
+#[kio::test]
 async fn goaway_send_receive_all_versions() {
 	for version in GOAWAY_VERSIONS {
-		moq_clock::timeout(TEST_TIMEOUT, async {
+		kio::clock::timeout(TEST_TIMEOUT, async {
 			let version: Version = version.parse().unwrap();
 			let pair = connect_mock(MockConnectOptions::new(version)).await;
 
@@ -133,12 +128,12 @@ async fn goaway_send_receive_all_versions() {
 	}
 }
 
-/// The IETF draft-17+ GOAWAY carries a timeout on the wire; the receiver
-/// observes the sender's advertised deadline.
-#[moq_clock::test]
-async fn goaway_wire_timeout_moq_transport_17() {
-	moq_clock::timeout(TEST_TIMEOUT, async {
-		let version: Version = "moq-transport-17".parse().unwrap();
+/// The IETF GOAWAY carries a timeout on the wire; the receiver observes the
+/// sender's advertised deadline.
+#[kio::test]
+async fn goaway_wire_timeout_moq_transport() {
+	kio::clock::timeout(TEST_TIMEOUT, async {
+		let version: Version = "moq-transport-18".parse().unwrap();
 		let pair = connect_mock(MockConnectOptions::new(version)).await;
 
 		pair.server
@@ -163,9 +158,9 @@ async fn goaway_wire_timeout_moq_transport_17() {
 }
 
 /// The client also drains the server: GOAWAY is symmetric.
-#[moq_clock::test]
+#[kio::test]
 async fn goaway_client_to_server_moq_lite_04() {
-	moq_clock::timeout(TEST_TIMEOUT, async {
+	kio::clock::timeout(TEST_TIMEOUT, async {
 		let version: Version = "moq-lite-04".parse().unwrap();
 		let pair = connect_mock(MockConnectOptions::new(version)).await;
 
@@ -190,9 +185,9 @@ async fn goaway_client_to_server_moq_lite_04() {
 /// A version with no GOAWAY message (moq-lite-03 and earlier) still drains: the
 /// deadline is the sender's own timer, so the session closes on schedule even
 /// though the peer is never told why. Callers do not branch on the version.
-#[moq_clock::test]
+#[kio::test]
 async fn goaway_drains_without_a_wire_message_moq_lite_03() {
-	moq_clock::timeout(TEST_TIMEOUT, async {
+	kio::clock::timeout(TEST_TIMEOUT, async {
 		let version: Version = "moq-lite-03".parse().unwrap();
 		let pair = connect_mock(MockConnectOptions::new(version)).await;
 
@@ -217,10 +212,10 @@ async fn goaway_drains_without_a_wire_message_moq_lite_03() {
 
 /// A moq-transport client cannot tell a server where to reconnect, so naming a
 /// URI is refused locally instead of getting the session closed by the peer.
-#[moq_clock::test]
-async fn goaway_client_redirect_refused_moq_transport_19() {
-	moq_clock::timeout(TEST_TIMEOUT, async {
-		let version: Version = "moq-transport-19".parse().unwrap();
+#[kio::test]
+async fn goaway_client_redirect_refused_moq_transport_18() {
+	kio::clock::timeout(TEST_TIMEOUT, async {
+		let version: Version = "moq-transport-18".parse().unwrap();
 		let pair = connect_mock(MockConnectOptions::new(version)).await;
 
 		let err = pair
@@ -250,10 +245,10 @@ async fn goaway_client_redirect_refused_moq_transport_19() {
 
 /// The draining side force-closes the session when the peer overstays the
 /// deadline, and the peer observes the GOAWAY_TIMEOUT close code.
-#[moq_clock::test]
+#[kio::test]
 async fn goaway_timeout_force_close_moq_transport_17() {
-	moq_clock::timeout(TEST_TIMEOUT, async {
-		let version: Version = "moq-transport-17".parse().unwrap();
+	kio::clock::timeout(TEST_TIMEOUT, async {
+		let version: Version = "moq-transport-18".parse().unwrap();
 		let pair = connect_mock(MockConnectOptions::new(version)).await;
 
 		pair.server
@@ -289,7 +284,7 @@ async fn goaway_timeout_force_close_moq_transport_17() {
 /// The public API's drain claim only ever sends one GOAWAY per session, so the
 /// handshake is hand-rolled to keep a raw transport clone for injecting
 /// wire-level GOAWAY control streams.
-#[moq_clock::test]
+#[kio::test]
 async fn duplicate_goaway_keeps_first_payload_moq_lite_04() {
 	/// Open a raw lite Goaway control stream:
 	/// `[ControlType::Goaway][message size][uri length][uri bytes]`.
@@ -317,11 +312,10 @@ async fn duplicate_goaway_keeps_first_payload_moq_lite_04() {
 	/// Block until the peer closes its half of the stream, i.e. it finished
 	/// processing the control message and dropped the stream.
 	async fn wait_processed<R: moq_net::transport::poll::RecvStream>(mut recv: R) {
-		let mut buf = [0u8; 16];
-		while let Ok(Some(_)) = recv.read(&mut buf).await {}
+		while let Ok(Some(_)) = recv.read_chunk(usize::MAX).await {}
 	}
 
-	moq_clock::timeout(TEST_TIMEOUT, async {
+	kio::clock::timeout(TEST_TIMEOUT, async {
 		let version: Version = "moq-lite-04".parse().unwrap();
 
 		let mut mock = moq_net::transport::memory::Config::default();
@@ -372,14 +366,22 @@ async fn duplicate_goaway_keeps_first_payload_moq_lite_04() {
 /// After a received GOAWAY, a new subscription still opens on the draining
 /// session, which is the only route, while an existing one keeps delivering.
 async fn goaway_keeps_new_subscribes(version: Version) {
-	moq_clock::timeout(TEST_TIMEOUT, async {
+	kio::clock::timeout(TEST_TIMEOUT, async {
 		// Server publishes a broadcast with one live track.
-		let pub_origin = produce_origin(Hop::random());
-		let broadcast = pub_origin.create_broadcast("test").expect("create broadcast");
-		broadcast.announce(moq_net::origin::Route::default()).expect("announce");
-		let track = broadcast.create_track("video", timed()).expect("create track");
+		let pub_origin = produce_origin();
+		let broadcast = pub_origin
+			.route("test", moq_net::origin::RouteOptions::hidden())
+			.expect("create broadcast");
+		broadcast.announce().expect("announce");
+		let track = broadcast
+			.broadcast()
+			.create_track("video", timed())
+			.expect("create track");
 		// A second track with content ready for the subscribe opened after the GOAWAY.
-		let audio = broadcast.create_track("audio", timed()).expect("create track");
+		let audio = broadcast
+			.broadcast()
+			.create_track("audio", timed())
+			.expect("create track");
 		let mut audio_group = audio.append_group().expect("append group");
 		audio_group
 			.write_frame(moq_net::Timestamp::ZERO, b"audio".as_ref())
@@ -387,7 +389,7 @@ async fn goaway_keeps_new_subscribes(version: Version) {
 		audio_group.finish().expect("finish group");
 
 		// Client consumes into its own origin.
-		let sub_origin = produce_origin(Hop::random());
+		let sub_origin = produce_origin();
 
 		let mut opts = MockConnectOptions::new(version);
 		opts.server_publish = Some(pub_origin.consume());
@@ -396,8 +398,13 @@ async fn goaway_keeps_new_subscribes(version: Version) {
 
 		// Subscribe BEFORE the GOAWAY and receive a first group.
 		let sub = sub_origin.consume();
-		sub.routed("test").await.expect("route announced");
-		let bc = sub.request_broadcast("test", None).await.expect("broadcast resolves");
+		let bc = sub
+			.follow("test", None)
+			.unwrap()
+			.available()
+			.await
+			.expect("broadcast resolves")
+			.unwrap();
 		let mut existing = bc.track("video").unwrap().subscribe(None).await.expect("subscribe");
 
 		let mut group = track.append_group().expect("append group");
@@ -461,76 +468,97 @@ async fn goaway_keeps_new_subscribes(version: Version) {
 	.expect("test timed out (likely a mock deadlock)");
 }
 
-#[moq_clock::test]
+#[kio::test]
 async fn goaway_keeps_new_subscribes_moq_lite_04() {
 	goaway_keeps_new_subscribes("moq-lite-04".parse().unwrap()).await;
 }
 
-#[moq_clock::test]
+#[kio::test]
 async fn goaway_keeps_new_subscribes_moq_lite_05() {
 	goaway_keeps_new_subscribes("moq-lite-05".parse().unwrap()).await;
 }
 
-#[moq_clock::test]
-async fn goaway_keeps_new_subscribes_moq_transport_19() {
-	goaway_keeps_new_subscribes("moq-transport-19".parse().unwrap()).await;
+#[kio::test]
+async fn goaway_keeps_new_subscribes_moq_transport_22() {
+	goaway_keeps_new_subscribes("moq-transport-22".parse().unwrap()).await;
 }
 
-/// A GOAWAY costs the peer's routes at [`Cost::DRAIN`] so the origin stops
-/// preferring a connection that is about to close.
+/// A GOAWAY ranks the peer's routes below every other eligible route, whatever their
+/// link preference, so the origin stops preferring a connection that is about to close.
+/// The drain is local selection state, not a price: the route keeps its real cost.
 ///
 /// The peer sends nothing after the GOAWAY, which is the case that matters: the
 /// subscriber has to react to the signal itself, not to a later announce that a
 /// draining peer has no reason to send.
 async fn goaway_drains_routes(version: Version) {
-	moq_clock::timeout(TEST_TIMEOUT, async {
-		let pub_origin = produce_origin(Hop::random());
-		let broadcast = pub_origin.create_broadcast("test").expect("create broadcast");
-		broadcast.announce(moq_net::origin::Route::default()).expect("announce");
+	kio::clock::timeout(TEST_TIMEOUT, async {
+		// A publisher of its own instance at `test`, behind its own session.
+		let publish = || {
+			let origin = produce_origin();
+			let route = origin
+				.route("test", moq_net::origin::RouteOptions::hidden())
+				.expect("create broadcast");
+			route.announce().expect("announce");
+			(origin, route)
+		};
 
-		let sub_origin = produce_origin(Hop::random());
+		let sub_origin = produce_origin();
+		let mut announced = sub_origin.consume().routes();
 
+		// A standby on a demoted link serves until the primary lands.
+		let (standby_origin, _standby) = publish();
 		let mut opts = MockConnectOptions::new(version);
-		opts.server_publish = Some(pub_origin.consume());
+		opts.server_publish = Some(standby_origin.consume());
+		opts.client_subscribe = Some(sub_origin.clone().with_preference(moq_net::origin::Preference::new(-1)));
+		let _standby_pair = connect_mock(opts).await;
+		let standby = route_at(&mut announced, |_| true).await.instance().clone();
+
+		// The primary outranks it by preference.
+		let (primary_origin, _primary) = publish();
+		let mut opts = MockConnectOptions::new(version);
+		opts.server_publish = Some(primary_origin.consume());
 		opts.client_subscribe = Some(sub_origin.clone());
 		let MockPair { client, server, .. } = connect_mock(opts).await;
-
-		let sub = sub_origin.consume();
-		let route = sub.routed("test").await.expect("route announced");
-		assert_ne!(
-			route.cost,
-			moq_net::origin::Cost::DRAIN,
-			"a healthy route must not start out draining"
-		);
+		route_at(&mut announced, |route| *route.instance() != standby).await;
 
 		server.drain().send(Goaway::new()).expect("send goaway");
 		client.draining().recv().await.expect("goaway");
 
 		// Nothing else is sent on the announce stream, so this only resolves if the
-		// subscriber acted on the GOAWAY rather than on another message. The drain
-		// re-prices the route in place, which arrives as another active update.
-		let mut announced = sub.announced();
-		loop {
-			let (moq_net::announce::Event::Start(update) | moq_net::announce::Event::Update(update)) =
-				announced.next().await.expect("update")
-			else {
-				continue;
-			};
-			if update.prefix.as_str() == "test" && update.route.cost == moq_net::origin::Cost::DRAIN {
-				break;
-			}
-		}
+		// subscriber acted on the GOAWAY rather than on another message: the draining
+		// primary ranks below even the demoted standby.
+		route_at(&mut announced, |route| *route.instance() == standby).await;
 	})
 	.await
 	.expect("test timed out (likely a route that never drained)");
 }
 
-#[moq_clock::test]
+/// The next route `announced` delivers at `test` that `ready` accepts.
+async fn route_at(
+	announced: &mut moq_net::origin::Routes,
+	ready: impl Fn(&moq_net::origin::RouteInfo) -> bool,
+) -> moq_net::origin::RouteInfo {
+	loop {
+		let moq_net::origin::RouteEvent {
+			kind:
+				moq_net::origin::RouteKind::Start | moq_net::origin::RouteKind::Update | moq_net::origin::RouteKind::Restart,
+			announce: update,
+		} = announced.next().await.expect("update")
+		else {
+			continue;
+		};
+		if update.prefix.as_str() == "test" && ready(&update.route) {
+			return update.route;
+		}
+	}
+}
+
+#[kio::test]
 async fn goaway_drains_routes_moq_lite_04() {
 	goaway_drains_routes("moq-lite-04".parse().unwrap()).await;
 }
 
-#[moq_clock::test]
-async fn goaway_drains_routes_moq_transport_19() {
-	goaway_drains_routes("moq-transport-19".parse().unwrap()).await;
+#[kio::test]
+async fn goaway_drains_routes_moq_transport_18() {
+	goaway_drains_routes("moq-transport-18".parse().unwrap()).await;
 }

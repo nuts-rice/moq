@@ -10,19 +10,11 @@ const condition = (run: { name: string; event: string; conclusion: string }) =>
 	watched.includes(run.name) &&
 	evaluate({ event: { workflow_run: run } }, (values: string[], value: string) => values.includes(value), JSON.parse);
 
-for (const event of [
-	"pull_request",
-	"pull_request_target",
-	"merge_group",
-	"push",
-	"schedule",
-	"workflow_dispatch",
-	"workflow_run",
-]) {
+for (const event of ["pull_request", "pull_request_target", "push", "schedule", "workflow_dispatch", "workflow_run"]) {
 	test(`Discord alert policy for ${event}`, () => {
 		for (const conclusion of ["failure", "timed_out", "success", "cancelled", "skipped"]) {
 			const expected =
-				!["pull_request", "pull_request_target", "merge_group"].includes(event) &&
+				!["pull_request", "pull_request_target"].includes(event) &&
 				["failure", "timed_out"].includes(conclusion);
 			for (const name of ["Release JS", "moq.sh", "release-brew", "apt-repo"]) {
 				expect(condition({ name, event, conclusion })).toBe(expected);
@@ -46,12 +38,12 @@ test("cron workflows only alert on scheduled failures", async () => {
 });
 
 test("ordinary CI never subscribes to Discord alerts", () => {
-	for (const name of ["Check", "Cache", "OBS", "Platform", "Quest"]) {
+	for (const name of ["Check", "OBS", "Platform", "Quest"]) {
 		expect(watched).not.toContain(name);
 	}
 });
 
-test("alert coverage excludes queue-only workflows and retains release and nightly workflows", () => {
+test("alert coverage excludes CI-only workflows and retains release and nightly workflows", () => {
 	const root = mkdtempSync(join(tmpdir(), "moq-alert-"));
 	try {
 		mkdirSync(join(root, "sh/gh"), { recursive: true });
@@ -59,10 +51,9 @@ test("alert coverage excludes queue-only workflows and retains release and night
 		copyFileSync("sh/gh/alert.sh", join(root, "sh/gh/alert.sh"));
 		const configs = {
 			alert: { name: "Alert", on: { workflow_run: { workflows: ["Release", "Nightly"] } } },
-			check: { name: "Check", on: { pull_request: null, merge_group: null } },
-			queue: { name: "Queue", on: ["merge_group"] },
+			check: { name: "Check", on: { pull_request: null } },
 			quest: { name: "Quest", on: { push: { branches: ["quest/**"] } } },
-			cache: { name: "Cache", on: { push: { branches: ["main"] } } },
+			obs: { name: "OBS", on: { push: { branches: ["main"] } } },
 			release: { name: "Release", on: { pull_request: null, push: null } },
 			nightly: { name: "Nightly", on: "schedule" },
 		};

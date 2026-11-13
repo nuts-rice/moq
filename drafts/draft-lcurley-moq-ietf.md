@@ -143,6 +143,11 @@ The Version also gives each property its meaning: drafts 18 and 19 serialize a b
 Other properties are opaque to this extension.
 
 ## Timestamps {#timestamps}
+A relay MUST preserve a relayed track's Timescale and timestamps across a negotiated hop.
+A nonzero Version identifies timestamps from MoQ Transport, which may be arrival times and need not rise with Group Sequence.
+The receiver MUST NOT apply moq-lite's group-start rewind check to such a track; a Version of zero retains that check.
+Without this extension, or in a listing ({{track}}), the receiver may check them like native moq-lite timestamps and refuse a Group that rewinds.
+
 On a timed track, the FRAME's Timestamp, or the datagram's for a datagram, is the object's time, and nothing else carries it.
 The Property Block MUST NOT contain a mutable Timestamp (0x10) there; a receiver MUST treat one as malformed.
 A relay forwarding the object to {{moqt}} restates the time as the mutable Timestamp, unless a Timestamp inside the Immutable Properties already says it.
@@ -179,13 +184,14 @@ A message MUST NOT carry more than 64 properties, nor any a relay interprets rat
 TRACK_INFO carries what a relay keeps of them, so a second copy could only contradict it.
 A message that breaks either rule is malformed.
 
-A relay restates up to five of those from TRACK_INFO, so it forwards at most 59 properties, and it refuses a track with more, from a {{moqt}} publisher or over this extension, as unsupported.
+A relay restates up to four of those from TRACK_INFO, never MAX_CACHE_DURATION, and it forwards at most 59 properties, and it refuses a track with more, from a {{moqt}} publisher or over this extension, as unsupported.
 Dropping those five can widen the delta that spans them, so a relay also refuses a {{moqt}} track whose remaining list would not fit a TRACK_PROPERTIES message beside its Version, as unsupported.
 
-The Immutable Properties may still hold one of those five, which a relay forwards in place of the one it would restate.
-A relay acts on TRACK_INFO, so a sealed value MUST equal the one it restates: MAX_CACHE_DURATION the Max Age in milliseconds, TIMESCALE the Timescale, DEFAULT_PUBLISHER_PRIORITY the priority, and DYNAMIC_GROUPS whether its Refresh is nonzero.
-A sealed DEFAULT_PUBLISHER_GROUP_ORDER is advisory: a relay serves its own order and forwards the sealed value unchanged, whatever it says.
-A relay refuses a track whose sealed value differs, from a {{moqt}} publisher or over this extension, as unsupported.
+The Immutable Properties may still hold one of the properties a relay restates, which it forwards in place of the one it would restate.
+A sealed MAX_CACHE_DURATION has no restated counterpart, so it travels beside none and is never compared.
+A relay acts on TRACK_INFO, so a sealed TIMESCALE MUST equal the Timescale, DEFAULT_PUBLISHER_PRIORITY the priority, and DYNAMIC_GROUPS whether its Refresh is nonzero.
+A sealed DEFAULT_PUBLISHER_GROUP_ORDER or MAX_CACHE_DURATION is advisory: a relay serves its own order and Max Age and forwards the sealed value unchanged, whatever it says.
+A relay refuses a track whose sealed value breaks that rule, from a {{moqt}} publisher or over this extension, as unsupported.
 
 A relay neither processes nor forwards a track with a Mandatory Track Property (0x4000 to 0x7FFF), mutable or inside the Immutable Properties, so a publisher never sends one.
 A receiver refuses such a track as {{moqt}} ingress does, with an unsupported extension error.
@@ -194,6 +200,7 @@ The receiver parses the keys inside the Immutable Properties from its value, whi
 It SHOULD read them from the value when needed rather than hold them beside it, as a list of IDs can cost several times the value.
 
 A TRACKS_ADD ({{moql}} Tracks Stream) embeds TRACK_INFO without TRACK_PROPERTIES, so when the extension is negotiated a subscriber MUST NOT skip the Track Stream for a track it learned from a listing.
+Lacking the Version, a TRACKS_ADD cannot mark a {{moqt}} track's timestamps as unchecked ({{timestamps}}).
 
 
 # Datagrams {#datagrams}
@@ -258,6 +265,8 @@ A high, distinctive value is used to avoid collisions with the low values {{moql
 
 ## Since draft-lcurley-moq-ietf-00 (in progress)
 
+- A relay never restates the Max Age as MAX_CACHE_DURATION, and a sealed MAX_CACHE_DURATION is advisory.
+- Preserve relayed track timestamps and their unchecked MoQ Transport provenance across negotiated hops. Without the extension a relay serves them as native moq-lite timestamps rather than untimed.
 - Initial version.
 
 # Acknowledgments

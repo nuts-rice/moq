@@ -6,6 +6,8 @@ export interface Report {
 	server: string;
 	version: string;
 	bytes: number;
+	/** The subscriber's close error, or null for a clean close. */
+	closed: string | null;
 	peerStates: string[];
 }
 
@@ -50,8 +52,8 @@ window.checkTransport = async () => {
 	const publishing = new Moq.Origin.Producer();
 	const consuming = new Moq.Origin.Producer();
 	const path = Moq.Path.from("peer/data");
-	const broadcast = publishing.createBroadcast(path);
-	broadcast.announce();
+	const broadcastRoute = publishing.route(path);
+	const broadcast = broadcastRoute.broadcast;
 	const track = broadcast.createTrack("data", { timescale: Moq.Time.Timescale.MILLI });
 	let client: Awaited<ReturnType<typeof Moq.Connection.connect>> | undefined;
 	let server: Awaited<ReturnType<typeof Moq.Connection.accept>> | undefined;
@@ -89,17 +91,19 @@ window.checkTransport = async () => {
 				) {
 					throw new Error("data-channel frame payload changed");
 				}
-				const report: Report = {
+				subscriber.close();
+				// Closing both ends at once makes the publisher's drain race the subscriber's
+				// close, so the publisher closes and the subscriber observes its clean close.
+				await server.close();
+				const closed = await client.closed;
+				return {
 					client: client.transport,
 					server: server.transport,
 					version: client.version,
 					bytes: frame.payload.byteLength,
-					peerStates: [],
+					closed: closed?.message ?? null,
+					peerStates: [left.signalingState, right.signalingState],
 				};
-				subscriber.close();
-				await Promise.all([client.close(), server.close()]);
-				report.peerStates = [left.signalingState, right.signalingState];
-				return report;
 			} finally {
 				subscriber.close();
 			}
@@ -110,6 +114,7 @@ window.checkTransport = async () => {
 		client?.abort();
 		server?.abort();
 		transport.close();
+		track.finish();
 		track.close();
 		broadcast.close();
 		publishing.close();

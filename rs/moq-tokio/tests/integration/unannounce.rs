@@ -3,29 +3,27 @@
 
 use std::time::Duration;
 
-use moq_tokio::moq_net;
-
 /// Subscribe to a published track, optionally unannounce (and let the origin
 /// process the retraction), then drop the subscriber and wait for the
 /// publisher's demand to go unused.
 async fn release(unannounce: bool, settle: bool) {
 	let origin = moq_tokio::origin::spawn();
-	let broadcast = origin.publish("a/b", moq_net::origin::Route::default()).unwrap();
-	let track = broadcast.create_track("t", None).unwrap();
-	let consumer = origin.consume().request_broadcast("a/b", None).await.unwrap();
+	let broadcast = origin.route("a/b", moq_net::origin::RouteOptions::default()).unwrap();
+	let track = broadcast.broadcast().create_track("t", None).unwrap();
+	let consumer = origin.consume().request("a/b", None).await.unwrap();
 	let sub = consumer.track("t").unwrap().subscribe(None).await.unwrap();
 	crate::wanted(track.demand()).await.unwrap();
 
 	if unannounce {
-		broadcast.unannounce();
+		broadcast.withdraw();
 		if settle {
-			tokio::time::sleep(Duration::from_secs(1)).await;
+			kio::clock::sleep(Duration::from_secs(1)).await;
 		}
 	}
 
 	drop(sub);
 	drop(consumer);
-	tokio::time::timeout(Duration::from_secs(600), crate::unwanted(track.demand()))
+	kio::clock::timeout(Duration::from_secs(600), crate::unwanted(track.demand()))
 		.await
 		.expect("demand released")
 		.unwrap();

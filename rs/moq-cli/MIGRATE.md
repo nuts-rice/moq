@@ -4,6 +4,30 @@ How to update your invocation and config for each breaking change, newest first.
 
 ## Unreleased
 
+### The iroh transport is removed ([#7345](https://github.com/moq-dev/moq/pull/7345))
+
+The `iroh` Cargo feature and the `--iroh-*` flags are gone, and a `MOQ_IROH_*` variable stops startup like any other unknown `MOQ_*` variable.
+Connect over QUIC or WebTransport instead.
+
+### `--broadcast` refuses empty segments ([#6648](https://github.com/moq-dev/moq/pull/6648))
+
+A broadcast name or prefix with a leading, trailing, or doubled `/` is an error instead of being collapsed: pass `--broadcast room/cam`, not `/room/cam/`.
+
+### Unknown `MOQ_*` environment variables stop startup ([#6633](https://github.com/moq-dev/moq/pull/6633))
+
+A `MOQ_*` variable `moq` does not read, such as a misspelling, a removed name, or one meant for another binary, now stops startup with the variable named instead of being ignored.
+Remove or rename what the error lists.
+
+### `import --linger` sets how long a finished broadcast stays up
+
+A cleanly ended import used to stay up for its `--max-age`; it now stays up for `--linger` (default 30 s), counted from the end, and `--max-age` only sets retention.
+Replace `import --max-age 5s` used to shorten that wait with `import --linger 5s`, or `--linger 0s` to close at once.
+A reconnect at the same path no longer ends the wait. `import rtsp`, `import archive`, `import capture`, and `import rtc --connect` refuse `--linger`.
+
+### The `nvenc` and `nvdec` Cargo features are removed ([#6483](https://github.com/moq-dev/moq/pull/6483))
+
+Enable `nvidia` instead; the old names were aliases for it.
+
 ### `import fmp4` and `import hls` unwrap to Legacy (#6250)
 
 Both now publish one `legacy` frame per sample instead of one `cmaf` frame per fragment.
@@ -11,10 +35,10 @@ Add `--passthrough` to keep publishing CMAF.
 
 ### `export archive` records a prefix (#6160)
 
-`moq export archive <url>` records every broadcast announced at or under `--broadcast`, each instance under `<url>/<broadcast>/@<epoch>`, until the connection ends, instead of one broadcast at `<url>`.
+`moq export archive <url>` records every broadcast announced at or under `--broadcast`, each instance under `<url>/<broadcast>/@<instance>`, until the connection ends, instead of one broadcast at `<url>`.
 Point `<url>` at the root you want recordings under, and drop `--catalog-format`, which it now refuses.
 Untimed tracks record, and `--retention` works on them.
-`import archive` does not read the new layout yet; it still replays recordings made by older `moq` versions.
+`import archive` replays one recorded broadcast in the new layout, `<url>/<broadcast>/@<instance>`, and no longer reads recordings made by older `moq` versions.
 
 ### `--cluster-lan-secret` is a file path only (#5910)
 
@@ -28,8 +52,8 @@ If your auth server can take longer than the handshake timeout allows, raise `--
 
 ### `--epoch` is removed (#5967)
 
-Remove `--epoch` and `MOQ_EPOCH`: `--epoch` is now an unknown flag, and `MOQ_EPOCH` is ignored.
-Every `moq` run mints its own epoch, so two importers fed one stream publish two instances, and the newest wins new requests.
+Remove `--epoch` and `MOQ_EPOCH`: either stops startup as an unknown flag or environment variable.
+Every `moq` run mints its own instance, so two importers fed one stream publish two instances. `moq` has no flag to name a stable one.
 To fail over between them, follow restarts: `export ts --stitch` switches programs, and players follow the announced restart.
 Other consumers, such as `export ts --passthrough`, end with the instance they read.
 
@@ -65,13 +89,14 @@ Rename `--max-age` to `--max-delay` on those exports.
 Each frame is written that long after its decode time; the older staleness spellings are refused with `--delay` named.
 Rename `--max-age` to `--delay`.
 
-### `moq export ts --linger` follows only the same publisher instance
+### `moq export ts --linger` is `--follow`, and follows only the same publisher instance
 
-A restarted publisher exits 1 unless `--stitch` follows it as a program switch.
-`moq export srt` takes the same two flags.
+Rename `export ts --linger` to `--follow`; the old spelling stops the run naming it. `export srt` takes the same `--follow`.
+A restarted publisher exits 1 unless `--stitch` follows it as a program switch, and a stitched replacement's first catalog is awaited until it arrives or the replacement goes, so `--follow 0s` no longer refuses a cold one.
+A failure other than the publisher leaving, such as a codec TS cannot carry, exits at once rather than after a 1 s grace.
 
 ```bash
-moq export ts --linger 10s --stitch ...
+moq export ts --follow 10s --stitch ...
 ```
 
 ### `moq export fmp4` fixes its track set at the init segment
@@ -87,7 +112,7 @@ Pass `--delay 100ms` to keep the old fixed delay.
 
 ### `--hop` is removed (#4969)
 
-Remove `--hop` and `MOQ_HOP`: each independent publisher now mints its own epoch.
+Remove `--hop` and `MOQ_HOP`: each independent publisher now mints its own instance.
 Redundant importers switch as a restart; use `export ts --stitch` to follow them.
 A node that pinned its cluster id with `--hop` passes `--cluster-id` instead.
 
@@ -132,7 +157,7 @@ A renamed flag or environment variable is refused with its replacement named.
 | --- | --- |
 | `moq publish`, `moq subscribe` | `moq import`, `moq export` |
 | `moq token`, the `moq-token` binary | `moq auth` |
-| `--origin` | Removed; publishers mint their own epoch |
+| `--origin` | Removed; publishers mint their own instance |
 | `--name` | `--broadcast` |
 | `--latency-max` | `--max-age` |
 | `--server-bind` | `--listen` |

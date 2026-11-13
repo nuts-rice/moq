@@ -6,7 +6,7 @@
 //! encode and the avc3 publish; this module keeps moq-boy's threading,
 //! frame-dropping, force-keyframe and timing-stats behavior.
 
-use moq_clock::Instant;
+use kio::clock::Instant;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -50,17 +50,19 @@ impl VideoEncoder {
 
 		// Game Boy is 160x144; force the openh264 software encoder since hardware
 		// encoders can reject such tiny resolutions.
-		let mut config = moq_video::encode::Config::new(WIDTH, HEIGHT, moq_video::Rate::new(FRAMERATE, 1).unwrap());
+		let mut config =
+			moq_video::encode::Config::new(WIDTH, HEIGHT, moq_video::FrameRate::new(FRAMERATE, 1).unwrap());
 		config.kind = moq_video::encode::Kind::Software;
 
 		// Probed from a throwaway encoder, before the emulator has run a frame, so a
 		// viewer can discover (and unpause) a moq-boy that has published nothing.
 		let rendition = config.probe().await.expect("failed to probe the H.264 encoder");
-		let reserved = catalog
-			.reserve()
-			.with_timeline_hint(config.gop.duration(config.framerate));
+		let reserved = catalog.reserve().with_interval(config.effective_join());
+		let track = broadcast
+			.unique_track(".avc3", reserved.track_info(hang::catalog::PRIORITY.video))
+			.expect("failed to create the avc3 track");
 		let producer =
-			moq_video::encode::Producer::new(broadcast, reserved, rendition).expect("failed to create avc3 producer");
+			moq_video::encode::Producer::new(track, reserved, rendition).expect("failed to create avc3 producer");
 		let demand = producer.demand();
 
 		let force_keyframe = Arc::new(AtomicBool::new(false));
@@ -167,17 +169,26 @@ fn encoder_thread(
 				continue;
 			}
 		};
-		match enc.encode(&moq_video::Frame::new(surface, ts)) {
-			Ok(encoded) => {
-				if let Err(e) = producer.publish(&encoded) {
-					// Publish only fails once the track/broadcast is gone, which
-					// is terminal -- stop rather than flooding logs every frame.
-					tracing::error!(error = %e, "video publish failed; stopping encoder");
-					return;
+		// A single bad frame is tolerable; keep going.
+		if let Err(e) = enc.encode(&moq_video::Frame::new(surface, ts)) {
+			tracing::error!(error = %e, "H.264 encode error");
+		}
+		loop {
+			match enc.receive() {
+				Ok(Some(encoded)) => {
+					if let Err(e) = producer.publish(&encoded) {
+						// Publish only fails once the track/broadcast is gone, which
+						// is terminal -- stop rather than flooding logs every frame.
+						tracing::error!(error = %e, "video publish failed; stopping encoder");
+						return;
+					}
+				}
+				Ok(None) => break,
+				Err(e) => {
+					tracing::error!(error = %e, "H.264 encode error");
+					break;
 				}
 			}
-			// A single bad frame is tolerable; keep going.
-			Err(e) => tracing::error!(error = %e, "H.264 encode error"),
 		}
 		encode_duration.store(start.elapsed().as_micros() as u64, Ordering::Relaxed);
 	}

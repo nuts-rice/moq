@@ -2,10 +2,14 @@
 # Plays a tone in headless Chromium and in the native `moq play` over a seeded, impaired UDP path,
 # and grades what each heard.
 #
-# One row is one player playing one codec through one shaper profile on one ring, for --duration
-# seconds of audio. The `pulse` ring is the native player on a private null sink; the others are
-# the browser's. See README.md for the profiles, the metric contract, and the void rules.
+# One row is one player playing one codec through one shaper profile, for --duration seconds of
+# audio. The `native` runtime plays on a private null sink; `chromium` is the browser's. See
+# README.md for the profiles, the metric contract, and the void rules.
 set -euo pipefail
+
+if [[ "${GITHUB_ACTIONS:-}" != true && "${LOCAL_SUPERVISED:-}" != 1 ]]; then
+    exec bash "$(dirname "$0")/../../sh/local.sh" bash "$0" "$@"
+fi
 
 AQ_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 WORKSPACE=$(cd "$AQ_DIR/../.." && pwd)
@@ -17,18 +21,18 @@ source "$AQ_DIR/../lib/harness.sh"
 # Captured before the parse consumes it, so the rerun command carries every flag.
 RERUN="$(harness_env AQ_PROFILE RELAY_BIN)just test audio-quality$(harness_argv "$@")"
 
-ALL_PROFILES=(near-zero mild wide bursty step fixed-250)
-ALL_RINGS=(isolated plain pulse)
+ALL_PROFILES=(near-zero mild wide bursty step congestion fixed-250)
+ALL_RUNTIMES=(chromium native)
 ALL_CODECS=(opus aac)
 
-# Every recorded trace is a profile too, replayed through the rings instead of played in a browser.
+# Every recorded trace is a profile too, replayed through the ring instead of played in a browser.
 ALL_TRACES=()
 for trace in "$AQ_DIR"/traces/*.json; do
     ALL_TRACES+=("$(basename "$trace" .json)")
 done
 
 PROFILES=("${ALL_PROFILES[@]}" "${ALL_TRACES[@]}")
-RINGS=("${ALL_RINGS[@]}")
+RUNTIMES=("${ALL_RUNTIMES[@]}")
 CODECS=("${ALL_CODECS[@]}")
 DURATION=60
 SEED=7
@@ -65,10 +69,10 @@ while [[ $# -gt 0 ]]; do
             PROFILES=("${ALL_TRACES[@]}")
             shift
             ;;
-        --rings)
+        --runtimes)
             need "$1" $# "${2:-}"
             split "$2"
-            RINGS=("${SPLIT[@]}")
+            RUNTIMES=("${SPLIT[@]}")
             shift 2
             ;;
         --codecs)
@@ -137,12 +141,12 @@ valid() {
 }
 for p in "${PROFILES[@]}"; do
     valid "$p" profile "${ALL_PROFILES[@]}" "${ALL_TRACES[@]}"
-    if [[ "$p" == step ]] && ((DURATION <= 30)); then
-        echo "error: --duration must exceed the step at 30s" >&2
+    if [[ "$p" == step || "$p" == congestion ]] && ((DURATION <= 30)); then
+        echo "error: --duration must exceed $p's change, which ends by 30s" >&2
         exit 2
     fi
 done
-for r in "${RINGS[@]}"; do valid "$r" ring "${ALL_RINGS[@]}"; done
+for r in "${RUNTIMES[@]}"; do valid "$r" runtime "${ALL_RUNTIMES[@]}"; done
 for c in "${CODECS[@]}"; do valid "$c" codec "${ALL_CODECS[@]}"; done
 
 if [[ $LIST -eq 0 && -n "$OUT" && -d "$OUT" ]] && [[ -n "$(ls -A "$OUT" 2>/dev/null)" ]]; then
@@ -158,14 +162,6 @@ rate_of() {
     esac
 }
 
-# The native player owns one ring; the browser's two are both Chromium.
-runtime_of() {
-    case "$1" in
-        pulse) echo native ;;
-        *) echo chromium ;;
-    esac
-}
-
 # Every profile but the control adapts. The element and the player require a unit on a fixed delay.
 delay_of() {
     case "$1" in
@@ -174,14 +170,15 @@ delay_of() {
     esac
 }
 
-# The path treatment, as moq-shaper flags. Loss, reorder, and rate limits stay off: the buffer's job
-# is absorbing arrival spread, and congestion response would make a failure hard to attribute.
+# The path treatment, as moq-shaper flags. Loss, reorder, and rate limits stay off but for
+# `congestion`: the buffer's job is absorbing arrival spread, and congestion response would make a
+# failure hard to attribute, so one profile holds the stall a congested queue causes on its own.
 shaper_of() {
     case "$1" in
         near-zero | fixed-250) ;;
         mild) echo "--delay 5ms --jitter 5ms --jitter-model gaussian --shared" ;;
         wide) echo "--delay 40ms --jitter 40ms --jitter-model gaussian --shared" ;;
-        bursty | step) echo "--profile $1" ;;
+        bursty | step | congestion) echo "--profile $1" ;;
     esac
 }
 
@@ -193,8 +190,8 @@ for profile in "${PROFILES[@]}"; do
         continue
     fi
     for codec in "${CODECS[@]}"; do
-        for ring in "${RINGS[@]}"; do
-            ROWS+=("$(runtime_of "$ring")-$codec-$(rate_of "$codec")-$profile-$ring")
+        for runtime in "${RUNTIMES[@]}"; do
+            ROWS+=("$runtime-$codec-$(rate_of "$codec")-$profile")
         done
     done
 done
@@ -209,12 +206,8 @@ for tag in "${ROWS[@]}"; do
     esac
 done
 
-# Replays run the browser player's rings, so the native ring has nothing to replay.
-REPLAY_RINGS=()
-for ring in "${RINGS[@]}"; do
-    [[ "$ring" == pulse ]] || REPLAY_RINGS+=("$ring")
-done
-[[ ${#REPLAY_RINGS[@]} -gt 0 ]] || TRACES=()
+# Replays run the browser player's ring, so the native runtime has nothing to replay.
+[[ " ${RUNTIMES[*]} " == *" chromium "* ]] || TRACES=()
 
 # A trace's codec and rate are its recording's, so replay.ts names those rows.
 joined() {
@@ -222,7 +215,7 @@ joined() {
     echo "$*"
 }
 replay=(bun "$CLIENT/replay.ts" --traces "$AQ_DIR/traces" --profiles "$(joined "${TRACES[@]}")")
-replay+=(--rings "$(joined "${REPLAY_RINGS[@]}")" --codecs "$(joined "${CODECS[@]}")")
+replay+=(--codecs "$(joined "${CODECS[@]}")")
 REPLAYS=()
 if [[ ${#TRACES[@]} -gt 0 ]]; then
     listed=$("${replay[@]}" --list)
@@ -249,7 +242,7 @@ done
 harness_begin audio-quality "$RERUN"
 
 echo "installing the workspace..."
-(cd "$CLIENT" && bun install --frozen-lockfile)
+(cd "$CLIENT" && uv run --no-project python "$WORKSPACE/sh/js/install.py" frozen)
 
 failed=0
 
@@ -331,9 +324,7 @@ if [[ ${#ROWS[@]} -gt 0 ]]; then
     row=0
     for tag in "${ROWS[@]}"; do
         row=$((row + 1))
-        IFS=- read -r _ codec _ rest <<<"$tag"
-        ring="${rest##*-}"
-        profile="${rest%-*}"
+        IFS=- read -r _ codec _ profile <<<"$tag"
         echo ""
         echo "── $tag ──"
 
@@ -375,7 +366,6 @@ if [[ ${#ROWS[@]} -gt 0 ]]; then
                 --fingerprint "$RELAY_URL/certificate.sha256" \
                 --broadcast "tone-$codec.hang" \
                 --page "$HARNESS_RUN/page" \
-                --ring "$ring" \
                 --delay "$(delay_of "$profile")" \
                 --duration "$DURATION" \
                 --tag "$tag" \

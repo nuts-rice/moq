@@ -42,9 +42,9 @@ mod preset;
 pub use preset::Preset;
 
 use anyhow::Context;
+use kio::clock::Instant;
 #[cfg(test)]
 use mem::UdpSocket;
-use moq_clock::Instant;
 use rand::{RngExt, SeedableRng, rngs::Xoshiro256PlusPlus};
 use serde::{Deserialize, Serialize};
 #[cfg(not(test))]
@@ -144,9 +144,9 @@ pub struct Batch {
 /// A change to one direction's profile once the run reaches `at`.
 ///
 /// A step changes only what it names, so a later step puts one knob back
-/// without restating the rest. The rate limit never steps: datagrams already
-/// queued behind it keep the old rate's departures, so a new rate would
-/// reorder them.
+/// without restating the rest. A rate step keeps the order: datagrams already
+/// queued keep their departures, and those after the step queue behind them at
+/// the new rate.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Step {
@@ -165,6 +165,9 @@ pub struct Step {
 	/// The reorder from then on.
 	#[serde(default)]
 	pub reorder: Option<f64>,
+	/// The rate limit's sustained rate from then on, which needs a rate limit to change.
+	#[serde(default)]
+	pub bits_per_second: Option<u64>,
 }
 
 impl Step {
@@ -181,6 +184,9 @@ impl Step {
 		}
 		if let Some(reorder) = self.reorder {
 			profile.reorder = reorder;
+		}
+		if let (Some(bits_per_second), Some(rate)) = (self.bits_per_second, &mut profile.rate) {
+			rate.bits_per_second = bits_per_second;
 		}
 	}
 }
@@ -220,6 +226,11 @@ impl Options {
 			anyhow::ensure!(
 				previous.is_none_or(|previous| step.at > previous),
 				"the step at {:?} comes after the one at {previous:?}; steps go in order",
+				step.at
+			);
+			anyhow::ensure!(
+				step.bits_per_second.is_none() || profile.rate.is_some(),
+				"the step at {:?} changes a rate limit the direction does not have",
 				step.at
 			);
 			// A step that leaves the profile as it was thinks it changes and does not.
@@ -333,6 +344,21 @@ impl Rate {
 	/// How long `bytes` takes at this rate.
 	fn cost(&self, bytes: u64) -> Duration {
 		Duration::from_secs_f64(bytes as f64 * 8.0 / self.bits_per_second as f64)
+	}
+
+	/// When a bucket that would be full at `full_at` is full again once its rate
+	/// changes to `new`'s at `at`.
+	///
+	/// The bucket keeps its level in bytes, taken once the datagrams queued at
+	/// the old rate have left, or at the step if that is later, and refills the
+	/// rest at the new rate. A throttled datagram leaves with the bucket empty, so
+	/// the next one, at any rate, cannot leave before it.
+	fn rerate(&self, full_at: Instant, at: Instant, new: &Rate) -> Instant {
+		let drained = full_at
+			.checked_sub(self.cost(self.burst))
+			.map_or(at, |drained| drained.max(at));
+		let owed = full_at.saturating_duration_since(drained);
+		drained.saturating_add(owed.mul_f64(self.bits_per_second as f64 / new.bits_per_second as f64))
 	}
 }
 
@@ -898,7 +924,7 @@ async fn deliver(
 					None => ready.push(parcel),
 				}
 			}
-			_ = moq_clock::sleep_until(wake.unwrap_or_else(Instant::now)), if wake.is_some() => {
+			_ = kio::clock::sleep_until(wake.unwrap_or_else(Instant::now)), if wake.is_some() => {
 				// The window closes a batch that never filled.
 				if let Some(closes) = held.closes.filter(|&closes| closes <= Instant::now()) {
 					held.release(closes, &mut ready, &tally[direction]);
@@ -944,7 +970,7 @@ impl Held {
 		if let Some(closes) = self.closes.filter(|&closes| closes <= arrived) {
 			self.release(closes, ready, tally);
 		}
-		self.closes.get_or_insert(arrived + batch.window);
+		self.closes.get_or_insert(arrived.saturating_add(batch.window));
 		self.parcels.push(parcel);
 		if self.parcels.len() >= batch.count {
 			self.release(arrived, ready, tally);
@@ -1055,10 +1081,16 @@ impl Link {
 	fn step(&mut self, now: Instant, tally: &Tally, exempt: bool) {
 		while let Some(step) = self.steps.get(self.stepped) {
 			// A step past what the clock can hold is one the run never reaches.
-			if self.start.checked_add(step.at).is_none_or(|at| at > now) {
+			let Some(at) = self.start.checked_add(step.at).filter(|&at| at <= now) else {
 				break;
-			}
+			};
+			let old = self.profile.rate.clone();
 			step.apply(&mut self.profile);
+			if let (Some(old), Some(new)) = (old, &self.profile.rate)
+				&& old != *new
+			{
+				self.full_at = old.rerate(self.full_at, at, new);
+			}
 			self.stepped += 1;
 		}
 		// Applying a step is no evidence it acted, so count the datagrams each phase treated.
@@ -1188,7 +1220,7 @@ impl Link {
 		if let Some(rate) = &self.profile.rate {
 			// GCRA: a datagram may leave once the backlog, itself included, is
 			// within the burst allowance.
-			let full_at = self.full_at.max(now) + rate.cost(size as u64);
+			let full_at = self.full_at.max(now).saturating_add(rate.cost(size as u64));
 			let start = full_at
 				.checked_sub(rate.cost(rate.burst))
 				.map_or(now, |start| start.max(now));
@@ -1210,7 +1242,9 @@ impl Link {
 		} else if self.jitter == Jitter::Gaussian {
 			// A queue: nothing leaves before the datagram in front of it.
 			let wait = self.profile.delay.as_secs_f64() + self.profile.jitter.as_secs_f64() * spread;
-			let leave = (depart + Duration::from_secs_f64(wait.max(0.0))).max(self.floor);
+			let leave = depart
+				.saturating_add(Duration::from_secs_f64(wait.max(0.0)))
+				.max(self.floor);
 			// Counted like the uniform model whenever a delay is configured, so
 			// the chance `verify` holds it to is the same.
 			delayed = !self.profile.delay.is_zero() || leave > depart;
@@ -1218,7 +1252,7 @@ impl Link {
 			depart = leave;
 		} else if !self.profile.delay.is_zero() {
 			let jitter = self.profile.jitter.as_secs_f64() * spread;
-			depart += Duration::from_secs_f64(self.profile.delay.as_secs_f64() + jitter);
+			depart = depart.saturating_add(Duration::from_secs_f64(self.profile.delay.as_secs_f64() + jitter));
 			delayed = true;
 		}
 		if delayed {
@@ -1238,7 +1272,6 @@ fn gaussian(rng: &mut Xoshiro256PlusPlus) -> f64 {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
 	use super::*;
 
@@ -1262,7 +1295,7 @@ mod tests {
 		let tally = Tally::default();
 		for index in 0..3 {
 			link.push(
-				start + Duration::from_secs(index * 10),
+				start.saturating_add(Duration::from_secs(index * 10)),
 				vec![0; 1000],
 				&socket,
 				LOCALHOST,
@@ -1276,7 +1309,10 @@ mod tests {
 		);
 		burst.completed().await.unwrap();
 		for _ in 0..2 {
-			assert_eq!(received.try_recv().unwrap().arrived, start + Duration::from_secs(20));
+			assert_eq!(
+				received.try_recv().unwrap().arrived,
+				start.saturating_add(Duration::from_secs(20))
+			);
 		}
 		assert!(received.try_recv().is_err());
 	}
@@ -1329,7 +1365,7 @@ mod tests {
 		for _ in 0..3 {
 			link.push(start, vec![0; 1000], &socket, LOCALHOST, &tally);
 		}
-		tokio::time::timeout(Duration::from_secs(1), burst.completed())
+		kio::clock::timeout(Duration::from_secs(1), burst.completed())
 			.await
 			.expect("the gate never opened")
 			.unwrap();
@@ -1390,7 +1426,7 @@ mod tests {
 		let a = Tally::default();
 		let b = Tally::default();
 		for index in 0..32 {
-			let now = start + Duration::from_secs(index * 10);
+			let now = start.saturating_add(Duration::from_secs(index * 10));
 			gated.push(now, vec![0; 1000], &socket, LOCALHOST, &a);
 			plain.push(now, vec![0; 1000], &socket, LOCALHOST, &b);
 		}
@@ -1478,7 +1514,7 @@ mod tests {
 		}
 		let mut got = Vec::new();
 		let mut buf = [0u8; 4];
-		while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(200), client.recv(&mut buf)).await {
+		while let Ok(Ok(_)) = kio::clock::timeout(Duration::from_millis(200), client.recv(&mut buf)).await {
 			got.push(u32::from_be_bytes(buf));
 		}
 		got
@@ -1506,7 +1542,7 @@ mod tests {
 		let (shaper, client) = setup(1, delayed, Profile::default()).await;
 		client.send(b"held").await.unwrap();
 		while shaper.stats().up.packets == 0 {
-			tokio::time::sleep(Duration::from_millis(1)).await;
+			kio::clock::sleep(Duration::from_millis(1)).await;
 		}
 
 		let outage = shaper.cut();
@@ -1581,18 +1617,18 @@ mod tests {
 		drop(dead);
 		client.send(b"lost").await.unwrap();
 		while shaper.stats().up.packets < 2 {
-			tokio::time::sleep(Duration::from_millis(1)).await;
+			kio::clock::sleep(Duration::from_millis(1)).await;
 		}
 
 		shaper.retarget(next.local_addr().unwrap()).unwrap();
 		client.send(b"after").await.unwrap();
-		let (size, flow) = tokio::time::timeout(Duration::from_secs(1), next.recv_from(&mut buf))
+		let (size, flow) = kio::clock::timeout(Duration::from_secs(1), next.recv_from(&mut buf))
 			.await
 			.expect("the retarget never forwarded")
 			.unwrap();
 		assert_eq!(&buf[..size], b"after");
 		next.send_to(b"reply", flow).await.unwrap();
-		let size = tokio::time::timeout(Duration::from_secs(1), client.recv(&mut buf))
+		let size = kio::clock::timeout(Duration::from_secs(1), client.recv(&mut buf))
 			.await
 			.expect("the reply never arrived")
 			.unwrap();
@@ -1610,7 +1646,7 @@ mod tests {
 		gone.send(b"gone").await.unwrap();
 		drop(gone);
 		while shaper.stats().down.packets < 1 {
-			tokio::time::sleep(Duration::from_millis(1)).await;
+			kio::clock::sleep(Duration::from_millis(1)).await;
 		}
 
 		let got = round_trip(&client, 10).await;
@@ -1942,7 +1978,7 @@ mod tests {
 		let mut link = Link::new(profile, options, 7, 0, now, queue);
 		let tally = Tally::default();
 		let mut sent: Vec<(u32, Instant)> = (0..count)
-			.filter_map(|id| Some((id, link.treat(now + spacing * id, 4, &tally)?.0)))
+			.filter_map(|id| Some((id, link.treat(now.saturating_add(spacing * id), 4, &tally)?.0)))
 			.collect();
 		// Ties leave in arrival order, which is id order here.
 		sent.sort_by_key(|&(id, at)| (at, id));
@@ -2138,7 +2174,7 @@ mod tests {
 
 		let mut got = Vec::new();
 		let mut buf = [0u8; 4];
-		while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(500), target.recv_from(&mut buf)).await {
+		while let Ok(Ok(_)) = kio::clock::timeout(Duration::from_millis(500), target.recv_from(&mut buf)).await {
 			got.push((u32::from_be_bytes(buf), start.elapsed()));
 		}
 		got
@@ -2195,14 +2231,14 @@ mod tests {
 			for id in 0..count {
 				sent.push(Instant::now());
 				client.send(&id.to_be_bytes()).await.unwrap();
-				tokio::time::sleep(spacing).await;
+				kio::clock::sleep(spacing).await;
 			}
 			sent
 		};
 		let receive = async {
 			let mut got = Vec::new();
 			let mut buf = [0u8; 4];
-			while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_millis(500), client.recv(&mut buf)).await {
+			while let Ok(Ok(_)) = kio::clock::timeout(Duration::from_millis(500), client.recv(&mut buf)).await {
 				got.push((u32::from_be_bytes(buf), Instant::now()));
 			}
 			got
@@ -2239,19 +2275,19 @@ mod tests {
 		let mut ready = Vec::new();
 
 		held.hold(batch, parcel(now), &mut ready, &tally);
-		held.hold(batch, parcel(now + ms(10)), &mut ready, &tally);
+		held.hold(batch, parcel(now.saturating_add(ms(10))), &mut ready, &tally);
 		assert!(ready.is_empty(), "a partial batch leaked");
 		assert_eq!(
 			held.closes,
-			Some(now + ms(160)),
+			Some(now.saturating_add(ms(160))),
 			"the window counts from the first arrival"
 		);
 
-		held.hold(batch, parcel(now + ms(20)), &mut ready, &tally);
+		held.hold(batch, parcel(now.saturating_add(ms(20))), &mut ready, &tally);
 		let leaves: Vec<Instant> = ready.drain(..).map(|parcel| parcel.at).collect();
 		assert_eq!(
 			leaves,
-			[now + ms(20); 3],
+			[now.saturating_add(ms(20)); 3],
 			"a full batch leaves together, as the latest would"
 		);
 		assert_eq!(
@@ -2261,9 +2297,9 @@ mod tests {
 		);
 
 		// The window closes a batch that never fills, and nothing in it leaves sooner.
-		held.hold(batch, parcel(now + ms(30)), &mut ready, &tally);
+		held.hold(batch, parcel(now.saturating_add(ms(30))), &mut ready, &tally);
 		let closes = held.closes.unwrap();
-		assert_eq!(closes, now + ms(190));
+		assert_eq!(closes, now.saturating_add(ms(190)));
 		held.release(closes, &mut ready, &tally);
 		assert_eq!(ready.iter().map(|parcel| parcel.at).collect::<Vec<_>>(), [closes]);
 		assert_eq!(tally.snapshot().delayed, 3);
@@ -2271,12 +2307,12 @@ mod tests {
 
 		// A datagram that arrives after the window closed, before its timer fired,
 		// starts the next batch rather than joining the closed one.
-		held.hold(batch, parcel(now + ms(200)), &mut ready, &tally);
+		held.hold(batch, parcel(now.saturating_add(ms(200))), &mut ready, &tally);
 		let closes = held.closes.unwrap();
-		held.hold(batch, parcel(closes + ms(1)), &mut ready, &tally);
+		held.hold(batch, parcel(closes.saturating_add(ms(1))), &mut ready, &tally);
 		assert_eq!(ready.iter().map(|parcel| parcel.at).collect::<Vec<_>>(), [closes]);
 		assert_eq!(held.parcels.len(), 1, "the late datagram joined the closed batch");
-		assert_eq!(held.closes, Some(closes + ms(1) + ms(160)));
+		assert_eq!(held.closes, Some(closes.saturating_add(ms(1)).saturating_add(ms(160))));
 		assert_eq!(tally.snapshot().delayed, 4);
 		assert_eq!(tally.batched.load(Ordering::Relaxed), 4);
 
@@ -2286,13 +2322,13 @@ mod tests {
 		let mut held = Held::default();
 		let tally = Tally::default();
 		let late = Parcel {
-			at: now + ms(1000),
+			at: now.saturating_add(ms(1000)),
 			delayed: true,
 			..parcel(now)
 		};
 		held.hold(batch, late, &mut ready, &tally);
 		held.release(held.closes.unwrap(), &mut ready, &tally);
-		assert_eq!(ready[0].at, now + ms(1000));
+		assert_eq!(ready[0].at, now.saturating_add(ms(1000)));
 		assert_eq!(tally.batched.load(Ordering::Relaxed), 0);
 	}
 
@@ -2468,9 +2504,9 @@ mod tests {
 		let mut link = Link::new(&profile, &options, 7, 0, start, queue);
 
 		assert_eq!(owed(&mut link, start, &[16]), [ms(5)]);
-		assert_eq!(owed(&mut link, start + ms(100), &[16]), [ms(60)]);
+		assert_eq!(owed(&mut link, start.saturating_add(ms(100)), &[16]), [ms(60)]);
 		// The step back restores what the run opened with.
-		assert_eq!(owed(&mut link, start + ms(200), &[16]), [ms(5)]);
+		assert_eq!(owed(&mut link, start.saturating_add(ms(200)), &[16]), [ms(5)]);
 	}
 
 	#[test]
@@ -2495,8 +2531,8 @@ mod tests {
 		let mut lost = |at: Instant| (0..100).filter(|_| link.treat(at, 16, &tally).is_none()).count();
 
 		assert_eq!(lost(start), 0, "the profile opens clean");
-		assert_eq!(lost(start + secs(30)), 100, "the step lost nothing");
-		assert_eq!(lost(start + secs(60)), 0, "the step back never cleared");
+		assert_eq!(lost(start.saturating_add(secs(30))), 100, "the step lost nothing");
+		assert_eq!(lost(start.saturating_add(secs(60))), 0, "the step back never cleared");
 	}
 
 	#[tokio::test(start_paused = true)]
@@ -2585,7 +2621,7 @@ mod tests {
 		let mut buf = [0u8; 4];
 		client.send(&0u32.to_be_bytes()).await.unwrap();
 		client.recv(&mut buf).await.unwrap();
-		tokio::time::sleep(ms(250)).await;
+		kio::clock::sleep(ms(250)).await;
 		client.send(&1u32.to_be_bytes()).await.unwrap();
 		client.recv(&mut buf).await.unwrap();
 
@@ -2616,7 +2652,7 @@ mod tests {
 		.await;
 
 		// The first datagram comes after the step, so the 5ms phase passes with nothing in it.
-		tokio::time::sleep(ms(250)).await;
+		kio::clock::sleep(ms(250)).await;
 		let mut buf = [0u8; 4];
 		client.send(&0u32.to_be_bytes()).await.unwrap();
 		client.recv(&mut buf).await.unwrap();
@@ -2625,6 +2661,73 @@ mod tests {
 		let err = format!("{err:#}");
 		assert!(err.contains("the up profile before its step at 100ms"), "{err}");
 		assert!(!err.contains("the up step at"), "{err}");
+	}
+
+	#[test]
+	fn a_rate_step_keeps_the_order_and_serves_the_new_rate() {
+		let ms = Duration::from_millis;
+		let secs = Duration::from_secs;
+		// 1000 bytes take a second at the start and two after the step, and the
+		// burst lets three out at once.
+		let profile = Profile {
+			rate: Some(Rate {
+				bits_per_second: 8000,
+				burst: 3000,
+				queue: secs(6),
+			}),
+			..Default::default()
+		};
+		let options = stepped(vec![Step {
+			at: ms(500),
+			bits_per_second: Some(4000),
+			..Default::default()
+		}]);
+		let (queue, _) = mpsc::unbounded_channel();
+		let start = Instant::now();
+		let mut link = Link::new(&profile, &options, 7, 0, start, queue);
+		let tally = Tally::default();
+		let mut leave = |at: Duration| {
+			link.treat(start.saturating_add(at), 1000, &tally)
+				.map(|(at, _)| at - start)
+		};
+
+		let queued: Vec<_> = (0..6).map(|_| leave(Duration::ZERO).unwrap()).collect();
+		assert_eq!(queued, [secs(0), secs(0), secs(0), secs(1), secs(2), secs(3)]);
+
+		// The bucket is empty once the last queued datagram leaves at 3s, so the
+		// next refills at the new rate behind it rather than inside the old burst.
+		assert_eq!(leave(ms(500)), Some(secs(5)));
+		assert_eq!(leave(ms(500)), None, "a 6.5s wait fit the 6s queue");
+		assert_eq!(leave(secs(2)), Some(secs(7)));
+		assert_eq!(tally.overflowed.load(Ordering::Relaxed), 1);
+	}
+
+	#[test]
+	fn a_rate_step_up_never_overtakes_the_queue() {
+		let ms = Duration::from_millis;
+		let secs = Duration::from_secs;
+		let profile = Profile {
+			rate: Some(Rate {
+				bits_per_second: 8000,
+				burst: 1000,
+				queue: secs(10),
+			}),
+			..Default::default()
+		};
+		let options = stepped(vec![Step {
+			at: ms(500),
+			bits_per_second: Some(16000),
+			..Default::default()
+		}]);
+		let (queue, _) = mpsc::unbounded_channel();
+		let start = Instant::now();
+		let mut link = Link::new(&profile, &options, 7, 0, start, queue);
+
+		assert_eq!(owed(&mut link, start, &[1000; 3]), [secs(0), secs(1), secs(2)]);
+		// Behind the one leaving at 2s, then half a second apart at the new rate.
+		let after = start.saturating_add(ms(500));
+		let owed = owed(&mut link, after, &[1000; 2]);
+		assert_eq!(owed, [ms(2000), ms(2500)]);
 	}
 
 	#[test]
@@ -2637,7 +2740,10 @@ mod tests {
 		let (queue, _) = mpsc::unbounded_channel();
 		let start = Instant::now();
 		let mut link = Link::new(&Profile::default(), &options, 7, 0, start, queue);
-		assert_eq!(owed(&mut link, start + Duration::from_secs(1), &[16]), [Duration::ZERO]);
+		assert_eq!(
+			owed(&mut link, start.saturating_add(Duration::from_secs(1)), &[16]),
+			[Duration::ZERO]
+		);
 	}
 
 	#[tokio::test(start_paused = true)]
@@ -2689,6 +2795,16 @@ mod tests {
 				},
 			],
 			"the step at 60s changes nothing",
+		)
+		.await;
+		// The down direction has no rate limit for a step to change.
+		refused(
+			vec![Step {
+				at: Duration::from_secs(30),
+				bits_per_second: Some(1_000_000),
+				..Default::default()
+			}],
+			"a rate limit the direction does not have",
 		)
 		.await;
 		// Uniform jitter past the delay, reached by a step rather than at the start.

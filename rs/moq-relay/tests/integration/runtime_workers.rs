@@ -9,7 +9,6 @@
 use std::time::Duration;
 
 use moq_relay::{Config, Relay};
-use moq_tokio::moq_net;
 
 /// A millisecond track: the frames written here carry timestamps.
 fn timed() -> moq_net::track::Info {
@@ -22,13 +21,22 @@ const WORKERS: u16 = 4;
 /// A self-signed certificate on disk. Workers refuse `listen.tls.generate`,
 /// since each would generate one of its own and serve a different identity.
 fn certificate(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
-	let key = rcgen::KeyPair::generate().expect("keypair");
-	let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
+	let key = rind_rcgen::KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).expect("keypair");
+	let params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+		.map(|mut params| {
+			params.serial_number = Some(1u64.into());
+			params
+		})
+		.expect("cert params");
 	let cert = params.self_signed(&key).expect("self-signed cert");
 	let cert_path = dir.join("cert.pem");
 	let key_path = dir.join("key.pem");
 	std::fs::write(&cert_path, cert.pem()).expect("write cert");
-	std::fs::write(&key_path, key.serialize_pem()).expect("write key");
+	std::fs::write(
+		&key_path,
+		pem::encode(&pem::Pem::new("PRIVATE KEY", key.to_pkcs8().secret_pkcs8_der())),
+	)
+	.expect("write key");
 	(cert_path, key_path)
 }
 
@@ -41,7 +49,7 @@ fn worker_config(cert: &std::path::Path, key: &std::path::Path, workers: u16) ->
 	config.listen.bind = Some("127.0.0.1:0".parse().unwrap());
 	config.listen.tls.cert = vec![cert.to_path_buf()];
 	config.listen.tls.key = vec![key.to_path_buf()];
-	config.runtime.workers = Some(workers);
+	config.runtime.workers = moq_relay::runtime::Workers::Count(std::num::NonZeroU16::new(workers).unwrap());
 	config.runtime.pin = false;
 	config.auth.public = vec![moq_auth::Pattern::all()];
 	config
@@ -50,13 +58,15 @@ fn worker_config(cert: &std::path::Path, key: &std::path::Path, workers: u16) ->
 fn client() -> moq_tokio::Client {
 	let mut config = moq_tokio::connect::Config::default();
 	config.tls.insecure = Some(true);
-	config.once = Some(true);
 	config.bind = Some("127.0.0.1:0".parse().expect("parse bind"));
-	config.init(Default::default()).expect("client init")
+	config
+		.init(Default::default())
+		.expect("client init")
+		.with_reconnect(false)
 }
 
 async fn connect(client: moq_tokio::Client, url: url::Url) -> moq_tokio::Connection {
-	tokio::time::timeout(TIMEOUT, client.with_reconnect(false).connect(url).established())
+	kio::clock::timeout(TIMEOUT, client.with_reconnect(false).connect(url).established())
 		.await
 		.expect("connect timeout")
 		.expect("connect failed")
@@ -71,13 +81,13 @@ async fn connect(client: moq_tokio::Client, url: url::Url) -> moq_tokio::Connect
 /// it is what this asserts, whichever way the placement lands.
 #[tokio::test]
 async fn workers_serve_quic_and_share_one_origin() {
-	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+	let _ = rind_rustls::default_provider().unwrap().install_default();
 
 	let dir = tempfile::tempdir().expect("tempdir");
 	let (cert, key) = certificate(dir.path());
 	let config = worker_config(&cert, &key, WORKERS);
 
-	let relay = Relay::load(config).await.expect("load relay");
+	let relay = Relay::load(config).await.expect("load relay").with_signals(false);
 	let port = relay.addr().expect("workers bound an address").port();
 
 	// The owner keeps the worker group; aborting this task is what joins them.
@@ -87,9 +97,13 @@ async fn workers_serve_quic_and_share_one_origin() {
 
 	// ── publisher ───────────────────────────────────────────────────
 	let origin = moq_tokio::origin::spawn();
-	let broadcast = origin.create_broadcast("test").expect("create broadcast");
-	broadcast.announce(Default::default()).expect("create broadcast");
-	let track = broadcast.create_track("video", timed()).expect("create track");
+	let broadcast = origin
+		.route("test", moq_net::origin::RouteOptions::default())
+		.expect("create broadcast");
+	let track = broadcast
+		.broadcast()
+		.create_track("video", timed())
+		.expect("create track");
 	let mut group = track.append_group().expect("append group");
 	group
 		.write_frame(moq_net::Timestamp::ZERO, b"hello".as_ref())
@@ -103,19 +117,19 @@ async fn workers_serve_quic_and_share_one_origin() {
 	for _ in 0..WORKERS {
 		let origin = moq_tokio::origin::spawn();
 		let consumer = origin.consume();
-		let announced = consumer.announced();
+		let announced = consumer.routes();
 		let connection = connect(client().with_subscriber(origin), url.clone()).await;
 		subscribers.push((connection, consumer, announced));
 	}
 
 	for (index, (_connection, consumer, announced)) in subscribers.iter_mut().enumerate() {
-		let (update, active) = tokio::time::timeout(TIMEOUT, next_update(announced))
+		let (update, active) = kio::clock::timeout(TIMEOUT, next_update(announced))
 			.await
 			.unwrap_or_else(|_| panic!("subscriber {index} announcement timeout"))
 			.expect("origin closed");
 		assert_eq!(update.prefix.as_str(), "test");
 		assert!(active, "expected announce, got retraction");
-		let broadcast = tokio::time::timeout(TIMEOUT, consumer.request_broadcast("test", None))
+		let broadcast = kio::clock::timeout(TIMEOUT, consumer.request("test", None))
 			.await
 			.unwrap_or_else(|_| panic!("subscriber {index} request timeout"))
 			.expect("announced broadcast resolves");
@@ -126,12 +140,12 @@ async fn workers_serve_quic_and_share_one_origin() {
 			.subscribe(None)
 			.await
 			.expect("subscribe");
-		let mut group = tokio::time::timeout(TIMEOUT, subscription.recv_group())
+		let mut group = kio::clock::timeout(TIMEOUT, subscription.recv_group())
 			.await
 			.unwrap_or_else(|_| panic!("subscriber {index} recv_group timeout"))
 			.expect("recv_group failed")
 			.expect("track closed prematurely");
-		let frame = tokio::time::timeout(TIMEOUT, group.read_frame())
+		let frame = kio::clock::timeout(TIMEOUT, group.read_frame())
 			.await
 			.unwrap_or_else(|_| panic!("subscriber {index} read_frame timeout"))
 			.expect("read_frame failed")
@@ -150,11 +164,16 @@ async fn workers_serve_quic_and_share_one_origin() {
 }
 
 /// The next route and whether it is active.
-async fn next_update(announced: &mut moq_net::announce::Consumer) -> Option<(moq_net::announce::Announce, bool)> {
+async fn next_update(announced: &mut moq_net::origin::Routes) -> Option<(moq_net::announce::Announce, bool)> {
 	match announced.next().await? {
-		moq_net::announce::Event::Start(route)
-		| moq_net::announce::Event::Update(route)
-		| moq_net::announce::Event::Restart(route) => Some((route, true)),
-		moq_net::announce::Event::End(route) => Some((route, false)),
+		moq_net::origin::RouteEvent {
+			kind:
+				moq_net::origin::RouteKind::Start | moq_net::origin::RouteKind::Update | moq_net::origin::RouteKind::Restart,
+			announce: route,
+		} => Some((route, true)),
+		moq_net::origin::RouteEvent {
+			kind: moq_net::origin::RouteKind::End | moq_net::origin::RouteKind::Offline,
+			announce: route,
+		} => Some((route, false)),
 	}
 }

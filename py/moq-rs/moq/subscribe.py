@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import TYPE_CHECKING
 
 from moq_ffi import (
     MoqBroadcastConsumer,
@@ -14,12 +15,15 @@ from moq_ffi import (
 from ._records import _subscription
 from ._stream import _Stream
 from .types import (
-    Datagram,
     FetchGroupOptions,
     Frame,
     Subscription,
     TrackInfo,
 )
+
+if TYPE_CHECKING:
+    from .datagram import DatagramConsumer
+    from .media import Audio, Video
 
 
 def _frame(frame: MoqFrame | None) -> Frame | None:
@@ -112,15 +116,6 @@ class TrackConsumer(_Stream[GroupConsumer]):
         """
         return _frame(await self._inner.read_frame())
 
-    async def recv_datagram(self) -> Datagram | None:
-        """Receive the next best-effort datagram in arrival order.
-
-        Returns ``None`` when the track ends. Datagrams are unavailable over stream-only
-        transports and older wire versions.
-        """
-        datagram = await self._inner.recv_datagram()
-        return None if datagram is None else Datagram._from_ffi(datagram)
-
     def info(self) -> TrackInfo:
         """Return the publisher-side track properties."""
         return TrackInfo._from_ffi(self._inner.info())
@@ -147,6 +142,16 @@ class BroadcastConsumer:
     def __init__(self, inner: MoqBroadcastConsumer) -> None:
         self._inner = inner
 
+    def datagrams(self, name: str) -> DatagramConsumer:
+        """Subscribe to a live datagram track from now on, without a stream subscription."""
+        from .datagram import DatagramConsumer
+
+        return DatagramConsumer(self._inner.datagrams(name))
+
+    async def closed(self) -> None:
+        """Wait until the broadcast ends: its publisher closed it, or every producer left."""
+        await self._inner.closed()
+
     async def subscribe_track(self, name: str, subscription: Subscription | None = None) -> TrackConsumer:
         """Subscribe to a track and receive arbitrary byte payloads.
 
@@ -167,22 +172,22 @@ class BroadcastConsumer:
         """
         return GroupConsumer(await self._inner.fetch_group(name, sequence, options))
 
-    async def resolve(self, reference: str | None, epoch: str | None) -> "BroadcastConsumer":
-        """Resolve a catalog rendition's ``broadcast`` reference to the broadcast
-        serving its track.
+    async def resolve(self, id: str, rendition: Video | Audio) -> "BroadcastConsumer":
+        """Resolve the catalog rendition ``id`` to the broadcast serving its track.
 
-        ``reference`` is ``catalog.video[name].broadcast`` /
-        ``catalog.audio[name].broadcast``: ``None`` or empty names this broadcast,
-        anything else names a sibling relative to it (e.g. ``./source``). ``epoch`` is
-        the same rendition's ``epoch``: a broadcast proven to serve another instance
-        raises instead of resolving, and a route without an epoch cannot prove one, so
-        there it is best effort. Call it on a rendition that carries a reference before
-        :meth:`subscribe_track` or :meth:`fetch_group`, which take a track name rather
-        than a rendition: the rendition's ``track``, or its ID when unset. The
-        rendition-based consumers in the media, audio, and video namespaces resolve
-        both themselves.
+        The rendition's ``broadcast`` reference, ``None`` or empty, names this
+        broadcast; anything else names a sibling relative to it (e.g. ``./source``).
+        Its ``instance`` is the stream the reference names: a broadcast proven to
+        serve another one raises instead of resolving, while a route over a wire
+        that carries no instance cannot prove one, so there it is best effort. Call it on a
+        rendition that carries a reference before :meth:`subscribe_track` or
+        :meth:`fetch_group`, which take a track name rather than a rendition: the
+        rendition's ``track``, or ``id`` when unset. The rendition-based consumers in
+        the media, audio, and video namespaces resolve it themselves.
 
         Raises if this broadcast came from a local producer rather than an origin,
         since a standalone broadcast has no sibling to name.
         """
-        return BroadcastConsumer(await self._inner.resolve(reference, epoch))
+        from .media import _rendition
+
+        return BroadcastConsumer(await self._inner.resolve(_rendition(id, rendition)))

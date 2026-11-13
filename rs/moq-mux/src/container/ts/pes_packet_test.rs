@@ -182,7 +182,7 @@ struct Imported {
 fn import(data: &[u8], captured: bool) -> anyhow::Result<Imported> {
 	let mut import = start(captured);
 	import.import.decode(data)?;
-	import.import.finish()?;
+	import.import.finish_in_place()?;
 	Ok(import)
 }
 
@@ -238,7 +238,8 @@ async fn read_until(
 	consumer: &moq_net::broadcast::Consumer,
 	name: &str,
 ) -> (Vec<crate::container::Frame>, Result<bool, String>) {
-	let subscription = moq_net::track::Subscription::default().with_max_delay(Duration::from_secs(3600));
+	let subscription = moq_net::track::Subscription::default()
+		.with_delay(moq_net::track::Delay::default().with_max(Duration::from_secs(3600)));
 	let track = consumer.track(name).unwrap().subscribe(subscription).await.unwrap();
 	let mut reader = crate::container::Consumer::new(
 		track,
@@ -246,7 +247,7 @@ async fn read_until(
 	);
 	let mut frames = Vec::new();
 	loop {
-		match tokio::time::timeout(Duration::from_millis(50), reader.read_frame()).await {
+		match kio::clock::timeout(Duration::from_millis(50), reader.read_frame()).await {
 			Ok(Ok(Some(frame))) => frames.push(frame),
 			Ok(Ok(None)) => return (frames, Ok(true)),
 			Err(_) => return (frames, Ok(false)),
@@ -575,7 +576,7 @@ async fn a_pes_with_a_field_no_rebase_reaches_refuses_its_stream() {
 			tokio::task::yield_now().await;
 		}
 		imported.import.decode(&feed.bytes()[head.len()..]).unwrap();
-		imported.import.finish().unwrap();
+		imported.import.finish_in_place().unwrap();
 
 		let (frames, err) = reader.await.unwrap();
 		assert_eq!(frames.len(), 1, "{why}: the PES placed before it stays published");
@@ -741,7 +742,7 @@ async fn a_pcr_pid_switch_places_each_side_on_its_own_timebase() {
 /// flood of tiny ones refuses the import long before their bookkeeping outgrows the byte bound.
 #[test]
 fn tiny_whole_pes_held_for_a_timestamp_are_bounded_by_count() {
-	let units = moq_net::group::MAX_GROUP_FRAMES / 2;
+	let units = super::passthrough::GROUP_OBJECTS_MAX;
 	let mut feed = Feed::new(0x06, KLVA);
 	feed.pcr(1_000 * MS);
 	for _ in 0..=units {
@@ -750,7 +751,8 @@ fn tiny_whole_pes_held_for_a_timestamp_are_bounded_by_count() {
 	let mut imported = start(false);
 	let err = imported.import.decode(&feed.bytes()).expect_err("the flood is refused");
 	assert!(
-		err.to_string().contains("whole PES while waiting for a timestamp"),
+		err.to_string()
+			.contains(&format!("TS staging exceeds {units} buffered units")),
 		"{err:#}"
 	);
 }
@@ -836,7 +838,7 @@ async fn a_pmt_naming_or_dropping_the_pcr_reroutes_private_pes() {
 		tokio::task::yield_now().await;
 	}
 	imported.import.decode(&feed.bytes()[head.len()..]).unwrap();
-	imported.import.finish().unwrap();
+	imported.import.finish_in_place().unwrap();
 
 	let (frames, err) = reader.await.unwrap();
 	assert_eq!(frames.len(), 1, "the PES placed while the PCR was named");
@@ -921,7 +923,7 @@ async fn a_revised_private_stream_publishes_under_a_fresh_name() {
 		assert_eq!(recorded(entry), descriptor_loop(revised));
 
 		let name = name.clone();
-		imported.import.finish().unwrap();
+		imported.import.finish_in_place().unwrap();
 		let (frames, err) = read(&imported.consumer, &name).await;
 		assert!(err.is_none(), "{err:?}");
 		assert_eq!(frames.len(), 1);
@@ -957,7 +959,7 @@ async fn a_dropped_private_stream_finishes_and_its_reused_pid_opens_a_new_track(
 	assert_eq!(imported.stats().quiet, None, "a PID the PMT dropped is not silent");
 
 	imported.import.decode(&feed.bytes()[dropped.len()..]).unwrap();
-	imported.import.finish().unwrap();
+	imported.import.finish_in_place().unwrap();
 	let (name, _) = imported.entry().expect("the PID is carried again");
 	assert_ne!(name, old, "a reused PID gets a new name");
 	let (frames, err) = read(&imported.consumer, &name).await;

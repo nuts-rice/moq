@@ -1,4 +1,4 @@
-import type { Hang } from "@moq/watch";
+import { type Hang, Signals } from "@moq/watch";
 import * as THREE from "three";
 import { VRButton } from "three/addons/webxr/VRButton.js";
 import type { Spatial } from "./audio";
@@ -8,6 +8,14 @@ type Projection = Hang.Catalog.Projection;
 const EYE = 1.6;
 const SCREEN_HEIGHT = 1.8;
 const SPHERE_RADIUS = 10;
+const HUD_WIDTH = 0.9;
+const HUD_LINES = 4;
+const HUD_LINE = 56;
+// Where the panel sits relative to the head: below the line of sight, at arm's length.
+const HUD_OFFSET = new THREE.Vector3(0, -0.55, -1.2);
+// How far the head turns from the panel before it swings back in front.
+const HUD_FOLLOW = THREE.MathUtils.degToRad(35);
+const UP = new THREE.Vector3(0, 1, 0);
 
 // Each eye's [u, v, width, height] in the frame.
 const PACKING: Record<string, [THREE.Vector4Tuple, THREE.Vector4Tuple]> = {
@@ -27,17 +35,36 @@ const PACKING: Record<string, [THREE.Vector4Tuple, THREE.Vector4Tuple]> = {
 
 // Paints decoded frames onto a screen or sphere according to projection
 export class Scene {
+	// Screen centre in content space, shared as the point-audio source.
 	readonly speaker = new THREE.Vector3(0, EYE, -2);
 
-	// follow viewer's head per-frame
+	// Toggled by a controller squeeze or the M key.
+	readonly muted = new Signals.Signal(false);
+
+	// Rendered and decoded frames per second, updated once a second.
+	readonly fps = new Signals.Signal({ render: 0, video: 0 });
+
+	// Posed in content space each frame, so audio turns with the picture on a recentre.
 	listener?: Spatial;
 
 	#renderer: THREE.WebGLRenderer;
 	#scene = new THREE.Scene();
+	#content = new THREE.Group();
 	#camera: THREE.PerspectiveCamera;
 	#texture = new THREE.VideoFrameTexture();
 	#frame?: VideoFrame;
 	#eyes: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial>[];
+	#hud: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshBasicMaterial>;
+	#hudCanvas = document.createElement("canvas");
+	// The panel's current and target yaw; unset snaps it in front on the next frame.
+	#hudYaw?: number;
+	#hudTarget = 0;
+	#headPosition = new THREE.Vector3();
+	#headDirection = new THREE.Vector3();
+	#relative = new THREE.Matrix4();
+	#renders = 0;
+	#frames = 0;
+	#since = performance.now();
 
 	#projection?: Projection;
 	#stereo = "mono";
@@ -56,6 +83,7 @@ export class Scene {
 		this.#camera.layers.enable(1);
 
 		this.#scene.background = new THREE.Color(0x111111);
+		this.#scene.add(this.#content);
 		this.#texture.colorSpace = THREE.SRGBColorSpace;
 
 		this.#eyes = [1, 2].map((layer) => {
@@ -66,22 +94,48 @@ export class Scene {
 			);
 			mesh.layers.set(layer);
 			mesh.visible = false;
-			this.#scene.add(mesh);
+			this.#content.add(mesh);
 			return mesh;
 		});
 		this.#build();
 
+		this.#hudCanvas.width = 1024;
+		this.#hudCanvas.height = HUD_LINES * HUD_LINE + 32;
+		const hudMap = new THREE.CanvasTexture(this.#hudCanvas);
+		hudMap.colorSpace = THREE.SRGBColorSpace;
+		this.#hud = new THREE.Mesh(
+			new THREE.PlaneGeometry(HUD_WIDTH, (HUD_WIDTH * this.#hudCanvas.height) / this.#hudCanvas.width),
+			new THREE.MeshBasicMaterial({ map: hudMap, transparent: true, toneMapped: false }),
+		);
+		// Outside the content, since it follows the head rather than the picture.
+		this.#scene.add(this.#hud);
+		this.#renderer.xr.addEventListener("sessionstart", () => {
+			this.#hudYaw = undefined;
+		});
+
+		// Trigger or pinch recentres; grip toggles mute.
+		for (const index of [0, 1]) {
+			const controller = this.#renderer.xr.getController(index);
+			controller.addEventListener("select", this.#recentre);
+			controller.addEventListener("squeeze", this.#toggleMute);
+		}
+
 		window.addEventListener("resize", this.#resize);
+		window.addEventListener("keydown", this.#key);
 		this.#look(this.#renderer.domElement);
 
 		this.#renderer.setAnimationLoop(() => {
+			this.#follow();
 			this.#renderer.render(this.#scene, this.#camera);
-			const head = this.#renderer.xr.isPresenting ? this.#renderer.xr.getCamera() : this.#camera;
-			this.listener?.pose(head.matrixWorld);
+			this.#relative.copy(this.#content.matrixWorld).invert().multiply(this.#head().matrixWorld);
+			this.listener?.pose(this.#relative);
+			this.#renders++;
+			this.#count();
 		});
 	}
 
 	frame(frame: VideoFrame) {
+		this.#frames++;
 		this.#texture.setFrame(frame);
 		for (const mesh of this.#eyes) {
 			if (mesh.material.map) mesh.material.map.needsUpdate = true;
@@ -103,6 +157,73 @@ export class Scene {
 		this.#stereo = stereo && stereo in PACKING ? stereo : "mono";
 		this.#build();
 	}
+
+	// Up to HUD_LINES lines on the in-headset panel.
+	status(lines: string[]) {
+		const context = this.#hudCanvas.getContext("2d");
+		if (!context) return;
+		const { width, height } = this.#hudCanvas;
+		context.clearRect(0, 0, width, height);
+		context.fillStyle = "rgba(0, 0, 0, 0.6)";
+		context.beginPath();
+		context.roundRect(0, 0, width, height, 24);
+		context.fill();
+		context.fillStyle = "#fff";
+		context.font = "40px monospace";
+		context.textBaseline = "middle";
+		for (const [index, line] of lines.slice(0, HUD_LINES).entries()) {
+			context.fillText(line, 32, 16 + HUD_LINE * (index + 0.5), width - 64);
+		}
+		if (this.#hud.material.map) this.#hud.material.map.needsUpdate = true;
+	}
+
+	// Hold the panel still through a glance, then glide it back in front once the head turns away.
+	#follow() {
+		const head = this.#head();
+		head.getWorldPosition(this.#headPosition);
+		head.getWorldDirection(this.#headDirection);
+		const yaw = Math.atan2(-this.#headDirection.x, -this.#headDirection.z);
+		const wrap = (angle: number) => Math.atan2(Math.sin(angle), Math.cos(angle));
+
+		if (this.#hudYaw === undefined) this.#hudYaw = this.#hudTarget = yaw;
+		if (Math.abs(wrap(yaw - this.#hudTarget)) > HUD_FOLLOW) this.#hudTarget = yaw;
+		this.#hudYaw += wrap(this.#hudTarget - this.#hudYaw) * 0.1;
+
+		this.#hud.position.copy(HUD_OFFSET).applyAxisAngle(UP, this.#hudYaw).add(this.#headPosition);
+		// Turned to face the head, then tilted up toward the eyes.
+		this.#hud.rotation.set(-0.4, this.#hudYaw, 0, "YXZ");
+	}
+
+	#count() {
+		const now = performance.now();
+		const elapsed = now - this.#since;
+		if (elapsed < 1000) return;
+		const rate = (count: number) => Math.round((count * 1000) / elapsed);
+		this.fps.set({ render: rate(this.#renders), video: rate(this.#frames) });
+		this.#renders = 0;
+		this.#frames = 0;
+		this.#since = now;
+	}
+
+	#head(): THREE.Camera {
+		return this.#renderer.xr.isPresenting ? this.#renderer.xr.getCamera() : this.#camera;
+	}
+
+	// Turn the content to face wherever the viewer is looking.
+	#recentre = () => {
+		const head = this.#head();
+		// TODO(human)
+		this.#content.updateMatrixWorld();
+	};
+
+	#toggleMute = () => {
+		this.muted.set(!this.muted.peek());
+	};
+
+	#key = (event: KeyboardEvent) => {
+		if (event.key === "r") this.#recentre();
+		if (event.key === "m") this.#toggleMute();
+	};
 
 	#build() {
 		const packing = PACKING[this.#stereo];
@@ -137,7 +258,7 @@ export class Scene {
 		this.#renderer.setSize(window.innerWidth, window.innerHeight);
 	};
 
-// Looking around is dragging on desktop, on headset its tracked
+	// Looking around is dragging on desktop; a headset tracks it.
 	#look(element: HTMLElement) {
 		const euler = new THREE.Euler(0, 0, 0, "YXZ");
 		element.addEventListener("pointermove", (event) => {
@@ -152,7 +273,13 @@ export class Scene {
 	close() {
 		this.#renderer.setAnimationLoop(null);
 		window.removeEventListener("resize", this.#resize);
-		for (const mesh of this.#eyes) {
+		window.removeEventListener("keydown", this.#key);
+		for (const index of [0, 1]) {
+			const controller = this.#renderer.xr.getController(index);
+			controller.removeEventListener("select", this.#recentre);
+			controller.removeEventListener("squeeze", this.#toggleMute);
+		}
+		for (const mesh of [...this.#eyes, this.#hud]) {
 			mesh.geometry.dispose();
 			mesh.material.map?.dispose();
 			mesh.material.dispose();

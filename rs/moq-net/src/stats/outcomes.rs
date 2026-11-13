@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// The reason a session was refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Refusal {
+pub enum RefusalKind {
 	/// The admission decider refused the session.
 	Refused,
 	/// The admission decider could not answer.
@@ -15,20 +15,20 @@ pub enum Refusal {
 	Request,
 	/// The grant covers none of the requested operations.
 	Forbidden,
-	/// The LAN membership proof was missing or invalid.
-	Lan,
+	/// A membership proof was missing or invalid.
+	Membership,
 	/// The verified credential expired before admission.
 	Expired,
 }
 
-impl Refusal {
+impl RefusalKind {
 	/// Every currently defined kind, in display order.
 	pub const ALL: &'static [Self] = &[
 		Self::Refused,
 		Self::Unavailable,
 		Self::Request,
 		Self::Forbidden,
-		Self::Lan,
+		Self::Membership,
 		Self::Expired,
 	];
 	/// The stable stats and metrics name.
@@ -38,7 +38,7 @@ impl Refusal {
 			Self::Unavailable => "unavailable",
 			Self::Request => "request",
 			Self::Forbidden => "forbidden",
-			Self::Lan => "lan",
+			Self::Membership => "membership",
 			Self::Expired => "expired",
 		}
 	}
@@ -57,22 +57,22 @@ pub struct Refusals {
 	pub request: u64,
 	/// The grant covers none of the requested operations.
 	pub forbidden: u64,
-	/// The LAN membership proof was missing or invalid.
-	pub lan: u64,
+	/// A membership proof was missing or invalid.
+	pub membership: u64,
 	/// The verified credential expired before admission.
 	pub expired: u64,
 }
 
 impl Refusals {
 	/// The cumulative count for this kind.
-	pub fn count(&self, kind: Refusal) -> u64 {
+	pub fn count(&self, kind: RefusalKind) -> u64 {
 		match kind {
-			Refusal::Refused => self.refused,
-			Refusal::Unavailable => self.unavailable,
-			Refusal::Request => self.request,
-			Refusal::Forbidden => self.forbidden,
-			Refusal::Lan => self.lan,
-			Refusal::Expired => self.expired,
+			RefusalKind::Refused => self.refused,
+			RefusalKind::Unavailable => self.unavailable,
+			RefusalKind::Request => self.request,
+			RefusalKind::Forbidden => self.forbidden,
+			RefusalKind::Membership => self.membership,
+			RefusalKind::Expired => self.expired,
 		}
 	}
 	/// Add every kind from another readout.
@@ -81,7 +81,7 @@ impl Refusals {
 		self.unavailable += other.unavailable;
 		self.request += other.request;
 		self.forbidden += other.forbidden;
-		self.lan += other.lan;
+		self.membership += other.membership;
 		self.expired += other.expired;
 	}
 	/// Whether any cumulative count went backwards.
@@ -90,7 +90,7 @@ impl Refusals {
 			|| self.unavailable < previous.unavailable
 			|| self.request < previous.request
 			|| self.forbidden < previous.forbidden
-			|| self.lan < previous.lan
+			|| self.membership < previous.membership
 			|| self.expired < previous.expired
 	}
 }
@@ -101,19 +101,19 @@ pub(super) struct RefusalCounters {
 	unavailable: AtomicU64,
 	request: AtomicU64,
 	forbidden: AtomicU64,
-	lan: AtomicU64,
+	membership: AtomicU64,
 	expired: AtomicU64,
 }
 
 impl RefusalCounters {
-	pub(super) fn counter(&self, kind: Refusal) -> &AtomicU64 {
+	pub(super) fn counter(&self, kind: RefusalKind) -> &AtomicU64 {
 		match kind {
-			Refusal::Refused => &self.refused,
-			Refusal::Unavailable => &self.unavailable,
-			Refusal::Request => &self.request,
-			Refusal::Forbidden => &self.forbidden,
-			Refusal::Lan => &self.lan,
-			Refusal::Expired => &self.expired,
+			RefusalKind::Refused => &self.refused,
+			RefusalKind::Unavailable => &self.unavailable,
+			RefusalKind::Request => &self.request,
+			RefusalKind::Forbidden => &self.forbidden,
+			RefusalKind::Membership => &self.membership,
+			RefusalKind::Expired => &self.expired,
 		}
 	}
 	pub(super) fn snapshot(&self) -> Refusals {
@@ -122,7 +122,7 @@ impl RefusalCounters {
 			unavailable: self.unavailable.load(Ordering::Relaxed),
 			request: self.request.load(Ordering::Relaxed),
 			forbidden: self.forbidden.load(Ordering::Relaxed),
-			lan: self.lan.load(Ordering::Relaxed),
+			membership: self.membership.load(Ordering::Relaxed),
 			expired: self.expired.load(Ordering::Relaxed),
 		}
 	}
@@ -143,6 +143,23 @@ pub enum Failure {
 }
 
 impl Failure {
+	/// How a session that ended with `err` failed, or `None` for a clean end: anything the
+	/// peer is told is "no error", by either side, and a drain that reached its deadline,
+	/// which is the draining side ending it on purpose.
+	#[cfg(any(feature = "async", test))]
+	pub(crate) fn of(err: &crate::Error) -> Option<Self> {
+		use crate::{Error, SessionError};
+		match err {
+			Error::IdleTimeout => Some(Self::IdleTimeout),
+			Error::Transport(_) => Some(Self::Transport),
+			_ => match SessionError::from(err) {
+				SessionError::Cancel | SessionError::GoawayTimeout => None,
+				SessionError::Expired => Some(Self::Expired),
+				_ => Some(Self::Application),
+			},
+		}
+	}
+
 	/// Every currently defined kind, in display order.
 	pub const ALL: &'static [Self] = &[Self::IdleTimeout, Self::Transport, Self::Application, Self::Expired];
 	/// The stable stats and metrics name.

@@ -7,17 +7,20 @@
  * @module
  */
 
-/** Re-export of {@link https://jsr.io/@moq/hang | @moq/hang}, the media layer. */
+/** Re-export of {@link https://www.npmjs.com/package/@moq/clock | @moq/clock}, the time units this package's signatures take. */
+export * as Clock from "@moq/clock";
+/** Re-export of {@link https://www.npmjs.com/package/@moq/hang | @moq/hang}, the media layer. */
 export * as Hang from "@moq/hang";
-/** Re-export of {@link https://jsr.io/@moq/net | @moq/net}, the transport. */
+/** Re-export of {@link https://www.npmjs.com/package/@moq/net | @moq/net}, the transport. */
 export * as Net from "@moq/net";
-/** Re-export of {@link https://jsr.io/@moq/signals | @moq/signals}, the reactive primitives used throughout this package. */
+/** Re-export of {@link https://www.npmjs.com/package/@moq/signals | @moq/signals}, the reactive primitives used throughout this package. */
 export * as Signals from "@moq/signals";
 export { assets } from "./assets";
 /** Audio capture and encoding. */
 export * as Audio from "./audio";
 export * from "./broadcast";
 export * from "./catalog";
+export type { Fanout } from "./fanout";
 /** The local canvas preview. */
 export * as Preview from "./preview";
 export * from "./rendition";

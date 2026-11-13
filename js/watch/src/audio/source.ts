@@ -1,7 +1,9 @@
-import { Milli } from "@moq/clock";
+import { Duration } from "@moq/clock";
 import type * as Catalog from "@moq/hang/catalog";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import type { Broadcast } from "../broadcast";
+import { SupportProbe } from "../support-probe";
+import { supported as decoderSupported } from "./supported";
 
 /** What the viewer wants from the audio rendition. */
 export type Target = {
@@ -24,18 +26,28 @@ export type SourceInput = {
 	target: Getter<Target | undefined>;
 
 	// A function that checks if an audio configuration can be played. Renditions that fail the
-	// probe are filtered out. Nothing is selected until one is provided.
+	// probe are filtered out. Defaults to `Decoder.supported`, the WebCodecs probe.
 	supported: Getter<Supported | undefined>;
 };
 
-type SourceOutput = {
+/** Signals the source derives. */
+export type SourceOutput = {
 	catalog: Signal<Catalog.Audio | undefined>;
 	available: Signal<Record<string, Catalog.AudioConfig>>;
+
+	// Why no rendition can be chosen, or undefined while healthy or still probing. A
+	// `NotSupportedError` means the browser can decode none of the catalog's renditions.
+	error: Signal<Error | undefined>;
+
 	track: Signal<string | undefined>;
 	config: Signal<Catalog.AudioConfig | undefined>;
 
-	// The jitter the selected rendition advertises (ms): a floor on the decoder's playout target.
-	jitter: Signal<Milli | undefined>;
+	/**
+	 * The jitter the selected rendition advertises: a floor on the decoder's playout target.
+	 *
+	 * @internal Feeds the decoder.
+	 */
+	jitter: Signal<Duration | undefined>;
 };
 
 /**
@@ -46,15 +58,20 @@ export class Source {
 	/** The wired inputs, read-only. */
 	readonly in: Readonlys<SourceInput>;
 
+	#probe = new SupportProbe<Catalog.AudioConfig>("audio");
+
 	readonly #out: SourceOutput = {
 		catalog: new Signal<Catalog.Audio | undefined>(undefined),
 		available: new Signal<Record<string, Catalog.AudioConfig>>({}),
+		error: this.#probe.error,
 		track: new Signal<string | undefined>(undefined),
 		config: new Signal<Catalog.AudioConfig | undefined>(undefined),
-		jitter: new Signal<Milli | undefined>(undefined),
+		jitter: new Signal<Duration | undefined>(undefined),
 	};
 	/** The derived outputs, read-only. */
 	readonly out = readonlys(this.#out);
+	/** Whether rendition support is still being resolved. @internal */
+	readonly pending: Getter<boolean> = this.#probe.pending;
 
 	#signals = new Effect();
 
@@ -81,86 +98,39 @@ export class Source {
 	}
 
 	#runSupported(effect: Effect): void {
-		const renditions = effect.get(this.#out.catalog)?.renditions ?? {};
-		const supported = effect.get(this.in.supported);
-		if (!supported) return;
-
-		effect.spawn(async () => {
-			const available: Record<string, Catalog.AudioConfig> = {};
-
-			for (const [name, config] of Object.entries(renditions)) {
-				// `supported` comes from the consumer, so we cannot assume it ever settles. A rerun
-				// waits for the tasks it spawned, so an unraced probe would hold the next run shut.
-				const isSupported = await effect.race(supported(config));
-
-				// Torn down: stop probing and publish nothing, since the rerun redoes this.
-				if (effect.abort.aborted) return;
-
-				if (isSupported) available[name] = config;
-			}
-
-			if (Object.keys(available).length === 0 && Object.keys(renditions).length > 0) {
-				console.warn("no supported audio renditions found:", renditions);
-			}
-
-			this.#out.available.set(available);
-		});
+		const supported = effect.get(this.in.supported) ?? decoderSupported;
+		// Read the catalog from the broadcast itself, so the probe result is tagged with the right one.
+		const broadcast = effect.get(this.in.broadcast);
+		const renditions = (broadcast && effect.get(broadcast.out.catalog)?.audio?.renditions) ?? {};
+		this.#probe.run(effect, supported, renditions, (available) => this.#out.available.set(available));
 	}
 
 	#runSelected(effect: Effect): void {
+		const target = effect.get(this.in.target);
+
 		// A disabled rendition has no frames coming, so it is never selected, even by name.
 		const available = Object.fromEntries(
 			Object.entries(effect.get(this.#out.available)).filter(([, config]) => config.enabled !== false),
 		);
-		if (Object.keys(available).length === 0) return;
 
-		const target = effect.get(this.in.target);
+		const track = target?.name && target.name in available ? target.name : this.#select(available);
+		if (!track) return;
 
-		let selected: { track: string; config: Catalog.AudioConfig } | undefined;
-
-		// Manual selection by name
-		if (target?.name && target.name in available) {
-			selected = { track: target.name, config: available[target.name] };
-		} else {
-			// Automatic selection
-			selected = this.#select(available);
-			if (!selected) return;
-		}
-
-		effect.set(this.#out.track, selected.track);
-		effect.set(this.#out.config, selected.config);
-
-		const jitter = selected.config.jitter;
-		effect.set(this.#out.jitter, jitter !== undefined ? Milli(jitter) : undefined);
+		const config = available[track];
+		effect.set(this.#out.track, track);
+		effect.set(this.#out.config, config);
+		effect.set(this.#out.jitter, config.jitter !== undefined ? Duration.millis(config.jitter) : undefined);
 	}
 
 	/**
 	 * Select rendition based on the configured strategy.
 	 */
-	#select(
-		renditions: Record<string, Catalog.AudioConfig>,
-	): { track: string; config: Catalog.AudioConfig } | undefined {
+	#select(renditions: Record<string, Catalog.AudioConfig>): string | undefined {
 		const entries = Object.entries(renditions);
-		if (entries.length === 0) return undefined;
-
-		for (const [track, config] of entries) {
-			if (config.container.kind === "legacy") {
-				return { track, config };
-			}
+		for (const kind of ["legacy", "loc", "cmaf"]) {
+			const found = entries.find(([, config]) => config.container.kind === kind);
+			if (found) return found[0];
 		}
-
-		for (const [track, config] of entries) {
-			if (config.container.kind === "loc") {
-				return { track, config };
-			}
-		}
-
-		for (const [track, config] of entries) {
-			if (config.container.kind === "cmaf") {
-				return { track, config };
-			}
-		}
-
 		return undefined;
 	}
 

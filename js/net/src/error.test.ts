@@ -222,6 +222,7 @@ test("session codes match the draft's Session Error Codes table", () => {
 		Timeout: 0x11,
 		AuthTokenCacheOverflow: 0x13,
 		Version: 0x15,
+		MalformedAuthToken: 0x16,
 		UnknownAuthTokenAlias: 0x17,
 		Expired: 0x18,
 		InvalidAuthority: 0x19,
@@ -248,6 +249,7 @@ test("stream codes match the draft's Stream Error Codes table", () => {
 		FrameTooLarge: 0x38,
 		TimestampMismatch: 0x39,
 		Unauthorized: 0x3b,
+		Yielded: 0x3c,
 	});
 });
 
@@ -274,6 +276,7 @@ test("the code tables keep their registry ranges", () => {
 		StreamCode.FrameTooLarge,
 		StreamCode.TimestampMismatch,
 		StreamCode.Unauthorized,
+		StreamCode.Yielded,
 	];
 	for (const code of Object.values(StreamCode)) {
 		if (assignedLite.includes(code)) {
@@ -374,17 +377,7 @@ test("toStreamCode: a control timeout keeps its own code", () => {
 	expect(toStreamCode(timeout)).toBe(StreamCode.ControlTimeout);
 
 	// The moq-transport registry has no value for it, so every draft reads it as INTERNAL_ERROR.
-	for (const version of [
-		Version.DRAFT_14,
-		Version.DRAFT_15,
-		Version.DRAFT_16,
-		Version.DRAFT_17,
-		Version.DRAFT_18,
-		Version.DRAFT_19,
-		Version.DRAFT_20,
-		Version.DRAFT_21,
-		Version.DRAFT_22,
-	]) {
+	for (const version of [Version.DRAFT_18, Version.DRAFT_20, Version.DRAFT_22]) {
 		expect(toStreamCode(timeout, { version })).toBe(StreamCode.Internal);
 	}
 
@@ -410,6 +403,8 @@ test("toStreamCode and fromTransport agree on what a code means", () => {
 		StreamCode.Evicted,
 		StreamCode.Unroutable,
 		StreamCode.FrameTooLarge,
+		StreamCode.Unauthorized,
+		StreamCode.Yielded,
 		StreamCode(70),
 	]) {
 		expect(toStreamCode(fromTransport(toTransport(code, "reset")))).toBe(code);
@@ -443,7 +438,8 @@ test("toStreamCode: lite-only codes do not reach an IETF peer", () => {
 		StreamCode.GroupTooLarge,
 		StreamCode.Unroutable,
 		StreamCode.FrameTooLarge,
+		StreamCode.Yielded,
 	]) {
-		expect(toStreamCode(new StreamError(code), { version: Version.DRAFT_20 })).toBe(StreamCode.Internal);
+		expect(toStreamCode(new StreamError(code), { version: Version.DRAFT_22 })).toBe(StreamCode.Internal);
 	}
 });

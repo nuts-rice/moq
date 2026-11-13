@@ -1,8 +1,10 @@
 import { expect, test } from "bun:test";
-import { Manual, Milli, Nano } from "@moq/clock";
+import { Duration, Manual } from "@moq/clock";
+import { Stats } from "@moq/hang";
 import * as Catalog from "@moq/hang/catalog";
+import * as Container from "@moq/hang/container";
 import * as Json from "@moq/json";
-import { Origin, Path, Time, Track } from "@moq/net";
+import { Origin, Path, Track } from "@moq/net";
 import { Effect, Signal } from "@moq/signals";
 import { Broadcast } from "./broadcast.ts";
 
@@ -18,7 +20,7 @@ async function readCatalog(broadcast: Broadcast): Promise<Catalog.Root | undefin
 	const effect = new Effect();
 	const track = new Track.Producer("catalog.json");
 	broadcast.catalog.serve(track, effect);
-	const catalog = (await new Json.Snapshot.Consumer<Catalog.Root>({ track: track.subscribe() }).latest())?.value;
+	const catalog = (await new Json.Snapshot.Consumer<Catalog.Root>({ track }).latest())?.value;
 	effect.close();
 	return catalog;
 }
@@ -31,6 +33,110 @@ const audioConfig: Catalog.AudioConfig = {
 	container: { kind: "legacy" },
 };
 
+const parity = (await Bun.file(new URL("../../../rs/hang/fixtures/catalog-parity.json", import.meta.url)).json()) as {
+	catalog: unknown;
+	refused?: boolean;
+}[];
+
+for (const kind of ["video", "audio", "text"] as const) {
+	const fixture = parity.find((c) => {
+		if (c.refused) return false;
+		const entries = Catalog.RootSchema.parse(c.catalog)[kind]?.renditions;
+		return entries && ["__proto__", "constructor", "toString"].every((name) => Object.hasOwn(entries, name));
+	});
+	if (!fixture) throw new Error(`missing shared ${kind} name fixture`);
+	const configs = Catalog.RootSchema.parse(fixture.catalog)[kind]?.renditions ?? {};
+
+	test(`shared Rust ${kind} names survive registration and the published catalog`, async () => {
+		const origin = new Origin.Producer();
+		const broadcast = new Broadcast({ origin, name: Path.from("names.hang") });
+		try {
+			const register = () =>
+				Object.entries(configs).map(([name, config]) => {
+					const rendition = broadcast[kind](name);
+					rendition.config.set(config);
+					expect(() => broadcast[kind](name)).toThrow();
+					return rendition;
+				});
+			const registered = register();
+			await settle();
+			const entries = (await readCatalog(broadcast))?.[kind]?.renditions ?? {};
+			expect(Object.keys(entries).sort()).toEqual(Object.keys(configs).sort());
+			expect(entries).toEqual(configs);
+			for (const rendition of registered) {
+				expect(rendition.track.peek()?.name).toBe(rendition.name);
+				rendition.close();
+			}
+			await settle();
+			expect((await readCatalog(broadcast))?.[kind]).toBeUndefined();
+			const again = register();
+			await settle();
+			const restored = (await readCatalog(broadcast))?.[kind]?.renditions ?? {};
+			expect(Object.keys(restored).sort()).toEqual(Object.keys(configs).sort());
+			expect(restored).toEqual(configs);
+			for (const rendition of again) expect(rendition.track.peek()?.name).toBe(rendition.name);
+
+			// A codec change replaces each prototype-named track under a fresh name. Text has no codec identity.
+			if (kind === "text") return;
+			const codec = kind === "video" ? "vp8" : "mp4a.40.2";
+			const byName = new Map(again.map((rendition) => [rendition.name, rendition]));
+			for (const [name, config] of Object.entries(configs)) {
+				expect(config.codec).not.toBe(codec);
+				byName.get(name)?.config.set({ ...config, codec });
+			}
+			await settle();
+			const replaced = (await readCatalog(broadcast))?.[kind]?.renditions ?? {};
+			expect(Object.keys(replaced).sort()).toEqual(Object.keys(configs).sort());
+			for (const rendition of again) {
+				const track = `${rendition.name}/1`;
+				expect(rendition.track.peek()?.name).toBe(track);
+				expect(replaced[rendition.name]?.codec).toBe(codec);
+				expect(replaced[rendition.name]?.track).toBe(track);
+			}
+		} finally {
+			broadcast.close();
+			origin.close();
+		}
+	});
+}
+
+test("shared Rust stats names survive the publisher's report builder", async () => {
+	const fixture = Stats.SnapshotSchema.parse(
+		await Bun.file(new URL("../../../rs/hang/fixtures/stats-snapshot.json", import.meta.url)).json(),
+	);
+	const clock = new Manual();
+	const installed = clock.install();
+	const origin = new Origin.Producer();
+	const broadcast = new Broadcast({ origin, name: Path.from("stats-names.hang"), stats: true });
+	try {
+		for (const [name, stats] of Object.entries(fixture.renditions ?? {})) {
+			const rendition = broadcast.video(name);
+			rendition.config.set(videoConfig);
+			rendition.stats.set(stats);
+		}
+		await settle();
+		const net = broadcast.net.peek();
+		if (!net) throw new Error("expected a network producer");
+		const consumer = new Json.Snapshot.Consumer<Stats.Snapshot>({
+			track: net.track("stats.json"),
+			schema: Stats.SnapshotSchema,
+		});
+		try {
+			await settle();
+			await clock.advance(Duration.millis(1000));
+			const reported = (await consumer.latest())?.value.renditions ?? {};
+			expect(Object.keys(reported).sort()).toEqual(Object.keys(fixture.renditions ?? {}).sort());
+			expect(reported).toEqual(fixture.renditions ?? {});
+		} finally {
+			consumer.close();
+		}
+	} finally {
+		broadcast.close();
+		origin.close();
+		installed.close();
+	}
+});
+
 test("sibling broadcasts on one page advertise the same capture clock", async () => {
 	const origin = new Origin.Producer();
 	const camera = new Broadcast({ enabled: true, origin, name: Path.from("participant/camera.hang") });
@@ -39,8 +145,8 @@ test("sibling broadcasts on one page advertise the same capture clock", async ()
 		camera.video("video").config.set(videoConfig);
 		screen.video("video").config.set(videoConfig);
 		await settle();
-		const cameraClock = (await readCatalog(camera))?.clock;
-		const screenClock = (await readCatalog(screen))?.clock;
+		const cameraClock = (await readCatalog(camera))?.media?.clock;
+		const screenClock = (await readCatalog(screen))?.media?.clock;
 		if (!cameraClock || !screenClock) throw new Error("siblings must advertise their page clock");
 		expect(cameraClock).toEqual(screenClock);
 		const captured = 1_000_000;
@@ -149,8 +255,58 @@ test("rendition.close() unregisters the name and drops it from the catalog", asy
 	broadcast.close();
 });
 
-test("subscriber demand hands the producer to the rendition and clears it when the track closes", async () => {
+test("hands the producer to the rendition without a subscriber and clears it when the track closes", async () => {
 	const broadcast = new Broadcast({ enabled: true, origin: new Origin.Producer(), name: Path.from("test.hang") });
+	await settle();
+
+	const rendition = broadcast.video("video");
+	await settle();
+
+	// Encoding needs no subscriber, so its groups wait in the cache for a late one.
+	const track = rendition.track.peek();
+	expect(track).toBeDefined();
+
+	// Closing the producer (encoder error / teardown) clears the signal, with no lingering effect watching it.
+	track?.finish();
+	track?.close();
+	await settle();
+	expect(rendition.track.peek()).toBeUndefined();
+
+	broadcast.close();
+});
+
+// The audio encoder ends its epoch whenever its track changes, so another rendition's rename must
+// not take the track away even for a microtask.
+test("renaming one rendition leaves the others' producers in place", async () => {
+	const broadcast = new Broadcast({ enabled: true, origin: new Origin.Producer(), name: Path.from("test.hang") });
+	const video = broadcast.video("video");
+	video.config.set(videoConfig);
+	const audio = broadcast.audio("audio");
+	audio.config.set(audioConfig);
+	await settle();
+
+	const track = audio.track.peek();
+	expect(track).toBeDefined();
+	const seen: unknown[] = [];
+	const dispose = audio.track.subscribe((value) => seen.push(value));
+
+	video.config.set({ ...videoConfig, codec: "vp8" });
+	await settle();
+	expect(video.track.peek()?.name).toBe("video/1");
+	expect(seen).toEqual([]);
+	expect(audio.track.peek()).toBe(track);
+
+	dispose();
+	broadcast.close();
+});
+
+test("on demand hands the producer to the rendition only while a subscriber is attached", async () => {
+	const broadcast = new Broadcast({
+		enabled: true,
+		origin: new Origin.Producer(),
+		name: Path.from("test.hang"),
+		onDemand: "all",
+	});
 	await settle();
 
 	const net = broadcast.net.peek();
@@ -158,20 +314,24 @@ test("subscriber demand hands the producer to the rendition and clears it when t
 
 	const rendition = broadcast.video("video");
 	await settle();
+	expect(rendition.track.peek()).toBeUndefined();
+
 	const subscriber = net.track("video").subscribe();
 	await settle();
-
-	// The request loop accepted the subscription and handed the producer to the rendition.
 	const track = rendition.track.peek();
 	expect(track).toBeDefined();
 
-	// Closing the producer (encoder error / teardown) clears the signal, with no lingering per-subscription
-	// effect watching it.
-	track?.close();
+	// The last subscriber leaving takes it back, but the broadcast keeps the track open for the next one.
+	subscriber.close();
 	await settle();
 	expect(rendition.track.peek()).toBeUndefined();
+	expect(track?.closed.peek()).toBeUndefined();
 
-	subscriber.close();
+	const again = net.track("video").subscribe();
+	await settle();
+	expect(rendition.track.peek()).toBe(track);
+
+	again.close();
 	broadcast.close();
 });
 
@@ -183,12 +343,12 @@ test("serves the catalog through a shared static track", async () => {
 	const net = broadcast.net.peek();
 	if (!net) throw new Error("expected a network producer once connected");
 
-	const subscriber = net.track(Broadcast.CATALOG_TRACK).subscribe();
-	const catalog = (await new Json.Snapshot.Consumer<Catalog.Root>({ track: subscriber }).latest())?.value;
+	const reader = new Json.Snapshot.Consumer<Catalog.Root>({ track: net.track(Broadcast.CATALOG_TRACK) });
+	const catalog = (await reader.latest())?.value;
 	expect(catalog?.video?.renditions.video?.codec).toBe("avc1.640028");
 
 	// Dropping the subscriber closes the served track; the broadcast keeps running for the next viewer.
-	subscriber.close();
+	reader.close();
 	await settle();
 	expect(broadcast.net.peek()).toBe(net);
 
@@ -220,7 +380,7 @@ test("serves no catalog until announced, so the first snapshot is the one at ann
 	if (!net) throw new Error("expected a network producer once connected");
 
 	const group = await net.track(Broadcast.CATALOG_TRACK).subscribe().ordered().nextGroup();
-	expect(group?.sequence).toBe(0);
+	expect(group?.sequence).toBe(0n);
 	const catalog = (await group?.readJson()) as Catalog.Root;
 	expect(Object.keys(catalog.video?.renditions ?? {})).toEqual(["video"]);
 	expect(Object.keys(catalog.audio?.renditions ?? {})).toEqual(["audio"]);
@@ -228,68 +388,9 @@ test("serves no catalog until announced, so the first snapshot is the one at ann
 	broadcast.close();
 });
 
-// With `linger`, a source that stops ends the publish cleanly: the finished broadcast stays announced
-// while its media is fresh, so a viewer still catching up drains the tail, then it closes.
-test("stopping the announce with linger serves the finished broadcast until its media is stale", async () => {
-	const clock = new Manual();
-	const restore = clock.install();
-	const origin = new Origin.Producer();
-	try {
-		const announce = new Signal(true);
-		const broadcast = new Broadcast({
-			enabled: true,
-			origin,
-			name: Path.from("test.hang"),
-			announce,
-			linger: true,
-		});
-		const video = broadcast.video("video");
-		video.config.set(videoConfig);
-		await settle();
-
-		const net = broadcast.net.peek();
-		if (!net) throw new Error("expected a network producer once connected");
-		const subscriber = net.track("video").subscribe();
-		await settle();
-		const track = video.track.peek();
-		if (!track) throw new Error("expected the rendition track once subscribed");
-		const group = track.appendGroup();
-		group.writeFrame({ payload: new Uint8Array([1]), timestamp: Time.Timestamp.now() });
-		group.close();
-
-		announce.set(false);
-		await settle();
-		expect(broadcast.net.peek()).toBeUndefined();
-		expect(net.route).toBeDefined();
-		const late = net.track("video").subscribe().ordered();
-		expect((await late.readFrame())?.payload).toEqual(new Uint8Array([1]));
-		const catalog = net.track(Broadcast.CATALOG_TRACK).subscribe();
-		expect(
-			(await new Json.Snapshot.Consumer<Catalog.Root>({ track: catalog }).latest())?.value.video,
-		).toBeDefined();
-
-		await clock.advance(Nano.fromMilli(Milli(30_000)));
-		expect(net.closed.peek()).toBeNull();
-		expect(net.route).toBeUndefined();
-		// A fresh broadcast waits unannounced for the next announce.
-		const next = broadcast.net.peek();
-		expect(next).toBeDefined();
-		expect(next).not.toBe(net);
-		expect(next?.route).toBeUndefined();
-
-		late.close();
-		catalog.close();
-		subscriber.close();
-		broadcast.close();
-	} finally {
-		origin.close();
-		restore();
-	}
-});
-
 // Regression: a re-announce re-created the catalog track, restarting its group sequence under the
-// same epoch, so a resumed viewer mistook the new catalog for the old one. Without `linger`, turning
-// the announce off unannounces at once and keeps the broadcast for the next announce.
+// same instance, so a resumed viewer mistook the new catalog for the old one. Turning the announce off
+// withdraws the route at once and keeps it, broadcast and instance, for the next announce.
 test("a re-announce continues the catalog's group sequence", async () => {
 	const announce = new Signal(true);
 	const broadcast = new Broadcast({
@@ -303,18 +404,23 @@ test("a re-announce continues the catalog's group sequence", async () => {
 
 	const net = broadcast.net.peek();
 	if (!net) throw new Error("expected a network producer once connected");
+	const announced = broadcast.in.origin.peek()?.follow(broadcast.in.name.peek());
 	const first = net.track(Broadcast.CATALOG_TRACK).subscribe().ordered();
-	expect((await first.nextGroup())?.sequence).toBe(0);
+	expect((await first.nextGroup())?.sequence).toBe(0n);
+	const instance = announced?.active.peek()?.instance;
+	expect(instance).toBeDefined();
 
 	announce.set(false);
 	await settle();
-	expect(net.route).toBeUndefined();
+	expect(announced?.active.peek()).toBeUndefined();
 	broadcast.audio("audio").config.set(audioConfig);
 	await settle();
 	announce.set(true);
 	await settle();
 
-	// The same track keeps serving, and its newest group is past the first.
+	// The follower continues the same instance, the same track keeps serving, and its newest group
+	// is past the first.
+	expect(announced?.active.peek()?.instance).toBe(instance);
 	expect(broadcast.net.peek()).toBe(net);
 	const group = await first.nextGroup();
 	expect(group?.sequence).toBeGreaterThan(0);
@@ -322,124 +428,8 @@ test("a re-announce continues the catalog's group sequence", async () => {
 	expect(Object.keys(catalog.audio?.renditions ?? {})).toEqual(["audio"]);
 
 	first.close();
+	announced?.close();
 	broadcast.close();
-});
-
-// With `linger`, a re-announce publishes a new broadcast under a new epoch, replacing the finished
-// one at once.
-test("announcing again replaces a finished broadcast with a new one", async () => {
-	const announce = new Signal(true);
-	const broadcast = new Broadcast({
-		enabled: true,
-		origin: new Origin.Producer(),
-		name: Path.from("test.hang"),
-		announce,
-		linger: true,
-	});
-	broadcast.video("video").config.set(videoConfig);
-	await settle();
-
-	const net = broadcast.net.peek();
-	if (!net) throw new Error("expected a network producer once connected");
-	const epoch = net.route?.epoch;
-	expect(epoch).toBeDefined();
-
-	announce.set(false);
-	await settle();
-	broadcast.audio("audio").config.set(audioConfig);
-	await settle();
-	expect(net.closed.peek()).toBeUndefined();
-	announce.set(true);
-	await settle();
-
-	expect(net.closed.peek()).toBeNull();
-	const next = broadcast.net.peek();
-	if (!next) throw new Error("expected a new network producer");
-	expect(next).not.toBe(net);
-	expect(next.route?.epoch).toBeDefined();
-	expect(next.route?.epoch).not.toBe(epoch);
-	const group = await next.track(Broadcast.CATALOG_TRACK).subscribe().ordered().nextGroup();
-	const catalog = (await group?.readJson()) as Catalog.Root;
-	expect(Object.keys(catalog.audio?.renditions ?? {})).toEqual(["audio"]);
-
-	broadcast.close();
-});
-
-// Disabling, renaming, or closing the publisher is abrupt: it ends a finished broadcast's linger at once.
-test("disabling, renaming, or closing ends a finished broadcast at once", async () => {
-	const enabled = new Signal(true);
-	const announce = new Signal(true);
-	const name = new Signal(Path.from("test.hang"));
-	const origin = new Origin.Producer();
-	const broadcast = new Broadcast({ enabled, origin, name, announce, linger: true });
-	broadcast.video("video").config.set(videoConfig);
-	await settle();
-
-	const first = broadcast.net.peek();
-	if (!first) throw new Error("expected a network producer once connected");
-	announce.set(false);
-	await settle();
-	expect(first.closed.peek()).toBeUndefined();
-	enabled.set(false);
-	await settle();
-	expect(first.closed.peek()).toBeNull();
-
-	enabled.set(true);
-	announce.set(true);
-	await settle();
-	const second = broadcast.net.peek();
-	if (!second) throw new Error("expected a network producer once re-enabled");
-	announce.set(false);
-	await settle();
-	expect(second.closed.peek()).toBeUndefined();
-	name.set(Path.from("renamed.hang"));
-	await settle();
-	expect(second.closed.peek()).toBeNull();
-
-	announce.set(true);
-	await settle();
-	const third = broadcast.net.peek();
-	if (!third) throw new Error("expected a network producer once announced again");
-	announce.set(false);
-	await settle();
-	expect(third.closed.peek()).toBeUndefined();
-	broadcast.close();
-	expect(third.closed.peek()).toBeNull();
-	origin.close();
-});
-
-// Regression: a rename or maxAge change in the same tick the announce stopped coalesced with it, so
-// the old broadcast finished and kept its path instead of ending at once.
-test("a rename as the announce stops ends the old broadcast at once", async () => {
-	const announce = new Signal(true);
-	const name = new Signal(Path.from("test.hang"));
-	const maxAge = new Signal<Milli | undefined>(undefined);
-	const origin = new Origin.Producer();
-	const broadcast = new Broadcast({ enabled: true, origin, name, announce, maxAge, linger: true });
-	broadcast.video("video").config.set(videoConfig);
-	await settle();
-
-	const first = broadcast.net.peek();
-	if (!first) throw new Error("expected a network producer once connected");
-	announce.set(false);
-	name.set(Path.from("renamed.hang"));
-	await settle();
-	expect(first.closed.peek()).toBeNull();
-	const second = broadcast.net.peek();
-	if (!second) throw new Error("expected a network producer under the new name");
-	expect(second).not.toBe(first);
-
-	announce.set(true);
-	await settle();
-	announce.set(false);
-	maxAge.set(Milli(1_000));
-	await settle();
-	expect(second.closed.peek()).toBeNull();
-	expect(broadcast.net.peek()).toBeDefined();
-	expect(broadcast.net.peek()).not.toBe(second);
-
-	broadcast.close();
-	origin.close();
 });
 
 // Regression: any rendition change re-created every rendition's track, so the next append restarted
@@ -455,7 +445,7 @@ test("a rendition keeps its track across rendition changes", async () => {
 	await settle();
 	const track = video.track.peek();
 	if (!track) throw new Error("expected the demanded track");
-	track.appendGroup().close();
+	track.appendGroup().finish();
 
 	// Registering another rendition leaves this one's track alone.
 	const audio = broadcast.audio("audio");
@@ -468,7 +458,7 @@ test("a rendition keeps its track across rendition changes", async () => {
 	const again = broadcast.video("video");
 	await settle();
 	expect(again.track.peek()).toBe(track);
-	expect(track.appendGroup().sequence).toBe(1);
+	expect(track.appendGroup().sequence).toBe(1n);
 
 	// The name keeps its kind.
 	again.close();
@@ -514,8 +504,8 @@ test("replacing a closed rendition track keeps the broadcast and publishes a fre
 	if (!track) throw new Error("expected the demanded track");
 
 	// The encoder wrote, then failed.
-	track.appendGroup().close();
-	track.close(new Error("encoder failed"));
+	track.appendGroup().finish();
+	track.abort(new Error("encoder failed"));
 	video.close();
 	await settle();
 
@@ -536,7 +526,7 @@ test("replacing a closed rendition track keeps the broadcast and publishes a fre
 	const replacement = again.track.peek();
 	expect(replacement).toBeDefined();
 	expect(replacement).not.toBe(track);
-	expect(replacement?.appendGroup().sequence).toBe(0);
+	expect(replacement?.appendGroup().sequence).toBe(0n);
 
 	first.close();
 	second.close();
@@ -544,7 +534,7 @@ test("replacing a closed rendition track keeps the broadcast and publishes a fre
 });
 
 test("changing maxAge publishes a new network broadcast", async () => {
-	const maxAge = new Signal<Milli | undefined>(Milli(1000));
+	const maxAge = new Signal<Duration | null | undefined>(Duration.millis(1000));
 	const broadcast = new Broadcast({
 		enabled: true,
 		origin: new Origin.Producer(),
@@ -556,19 +546,35 @@ test("changing maxAge publishes a new network broadcast", async () => {
 	const before = broadcast.net.peek();
 
 	// A track's retention is fixed at creation, so the tracks move to a fresh broadcast.
-	maxAge.set(Milli(2000));
+	maxAge.set(Duration.millis(2000));
 	await settle();
 	const after = broadcast.net.peek();
 	expect(after).toBeDefined();
 	expect(after).not.toBe(before);
-	expect((await after?.track("video").info())?.maxAge).toBe(Milli(2000));
+	expect((await after?.track("video").info())?.maxAge).toEqual(Duration.millis(2000));
 
+	// Omitted is the media max age, and null is no publisher limit.
+	maxAge.set(undefined);
+	await settle();
+	expect((await broadcast.net.peek()?.track("video").info())?.maxAge).toEqual(Container.MAX_AGE);
+	maxAge.set(null);
+	await settle();
+	expect((await broadcast.net.peek()?.track("video").info())?.maxAge).toBeNull();
+
+	broadcast.close();
+});
+
+test("the catalog track takes the zero default max age", async () => {
+	const broadcast = new Broadcast({ enabled: true, origin: new Origin.Producer(), name: Path.from("test.hang") });
+	await settle();
+	const info = await broadcast.net.peek()?.track(Broadcast.CATALOG_TRACK).info();
+	expect(info?.maxAge).toEqual(Duration.ZERO);
 	broadcast.close();
 });
 
 test("keeps the current catalog snapshot for a reconnecting viewer", async () => {
 	const clock = new Manual();
-	const restore = clock.install();
+	const installed = clock.install();
 
 	try {
 		const broadcast = new Broadcast({
@@ -582,20 +588,20 @@ test("keeps the current catalog snapshot for a reconnecting viewer", async () =>
 		const net = broadcast.net.peek();
 		if (!net) throw new Error("expected a network producer once connected");
 
-		const first = net.track(Broadcast.CATALOG_TRACK).subscribe();
-		expect((await new Json.Snapshot.Consumer<Catalog.Root>({ track: first }).latest())?.value.video).toBeDefined();
+		const first = new Json.Snapshot.Consumer<Catalog.Root>({ track: net.track(Broadcast.CATALOG_TRACK) });
+		expect((await first.latest())?.value.video).toBeDefined();
 		first.close();
 
 		// A reconnect past the idle cache window must still receive the live track's newest
 		// snapshot instead of waiting forever for an edit that may never come.
-		await clock.advance(Nano.fromMilli(Milli(60_000)));
-		const second = net.track(Broadcast.CATALOG_TRACK).subscribe();
-		expect((await new Json.Snapshot.Consumer<Catalog.Root>({ track: second }).latest())?.value.video).toBeDefined();
+		await clock.advance(Duration.millis(60_000));
+		const second = new Json.Snapshot.Consumer<Catalog.Root>({ track: net.track(Broadcast.CATALOG_TRACK) });
+		expect((await second.latest())?.value.video).toBeDefined();
 		second.close();
 
 		broadcast.close();
 	} finally {
-		restore();
+		installed.close();
 	}
 });
 
@@ -611,7 +617,7 @@ test("registering a sibling after an encoder failure keeps the network broadcast
 		await settle();
 		const track = video.track.peek();
 		if (!track) throw new Error("expected demanded video track");
-		track.close(new Error("encoder failed"));
+		track.abort(new Error("encoder failed"));
 		await settle();
 		broadcast.audio("audio/new").config.set(audioConfig);
 		await settle();
@@ -623,7 +629,7 @@ test("registering a sibling after an encoder failure keeps the network broadcast
 });
 
 // A name always means the same content, so a served rendition whose decoder identity changes moves to
-// a fresh track name under the same catalog ID and epoch, ending the old track on its old identity.
+// a fresh track name under the same catalog ID and instance, ending the old track on its old instance.
 // Fields a decoder needn't reinitialize for update the served track in place.
 test("a served decoder identity change moves the rendition to a fresh track name", async () => {
 	const broadcast = new Broadcast({ origin: new Origin.Producer(), name: Path.from("identity.hang") });
@@ -640,9 +646,10 @@ test("a served decoder identity change moves the rendition to a fresh track name
 
 	const net = broadcast.net.peek();
 	if (!net) throw new Error("expected a network producer once connected");
-	const epoch = net.route?.epoch;
+	const announced = broadcast.in.origin.peek()?.follow(broadcast.in.name.peek());
+	const instance = announced?.active.peek()?.instance;
 	const catalog = new Json.Snapshot.Consumer<Catalog.Root>({
-		track: net.track(Broadcast.CATALOG_TRACK).subscribe(),
+		track: net.track(Broadcast.CATALOG_TRACK),
 	});
 	const first = net.track("video").subscribe();
 	try {
@@ -650,7 +657,7 @@ test("a served decoder identity change moves the rendition to a fresh track name
 		await settle();
 		const track = video.track.peek();
 		if (!track) throw new Error("expected the demanded track");
-		track.appendGroup().close();
+		track.appendGroup().finish();
 
 		// Bitrate, frame rate, and coded size move either way on the served track.
 		for (const update of [
@@ -673,15 +680,16 @@ test("a served decoder identity change moves the rendition to a fresh track name
 		expect(config?.track).toBe("video/1");
 		expect(config?.codec).toBe("vp8");
 		expect(track.closed.peek()).toBeNull();
-		expect(video.track.peek()).toBeUndefined();
+		// The replacement is handed over at once, with or without a subscriber.
+		expect(video.track.peek()?.name).toBe("video/1");
 		expect(broadcast.net.peek()).toBe(net);
-		expect(net.route?.epoch).toBe(epoch);
+		expect(announced?.active.peek()?.instance).toBe(instance);
 
 		const second = net.track("video/1").subscribe();
 		await settle();
 		const replacement = video.track.peek();
 		expect(replacement?.name).toBe("video/1");
-		expect(replacement?.appendGroup().sequence).toBe(0);
+		expect(replacement?.appendGroup().sequence).toBe(0n);
 
 		// So is a display aspect change, which moves it again rather than redefining the second name.
 		video.config.set({
@@ -696,6 +704,7 @@ test("a served decoder identity change moves the rendition to a fresh track name
 		second.close();
 	} finally {
 		first.close();
+		announced?.close();
 		broadcast.close();
 	}
 });
@@ -776,7 +785,7 @@ test("a replacement track name is never reused, even one never served", async ()
 	const fail = async (name: string) => {
 		const sub = net.track(name).subscribe();
 		await settle();
-		video.track.peek()?.close(new Error("encoder failed"));
+		video.track.peek()?.abort(new Error("encoder failed"));
 		video.close();
 		await settle();
 		sub.close();
@@ -861,32 +870,377 @@ test("a name returning with a different identity takes a fresh track name", asyn
 	broadcast.close();
 });
 
-// Nobody has seen an unserved catalog, so its renditions settle without minting names.
-test("identity changes before the first announce keep the catalog ID as the track name", async () => {
+// Regression: identity was fixed only at the first announce, but an eager encoder caches groups
+// before then. A codec change while unannounced kept the name, so a late subscriber or a fetch read
+// the old codec's groups under the new catalog config.
+test("identity changes before the first announce take a fresh track name", async () => {
 	const announce = new Signal(false);
 	const broadcast = new Broadcast({ origin: new Origin.Producer(), name: Path.from("unserved.hang"), announce });
 	const video = broadcast.video("video");
 	video.config.set({ ...videoConfig, bitrate: Catalog.u53(1_000_000) });
 	await settle();
+	// The encoder writes before anyone can find the broadcast.
+	const cached = video.track.peek();
+	if (!cached) throw new Error("expected the track to be handed over before the first announce");
+	cached.appendGroup().finish();
+
+	// Everything except identity still updates the track in place.
+	video.config.set({ ...videoConfig, bitrate: Catalog.u53(500_000) });
+	await settle();
+	expect(video.track.peek()).toBe(cached);
+
 	video.config.set({ ...videoConfig, codec: "vp8", bitrate: Catalog.u53(500_000) });
 	await settle();
+	expect(cached.closed.peek()).toBeDefined();
 
 	announce.set(true);
 	await settle();
 	const net = broadcast.net.peek();
 	if (!net) throw new Error("expected a network producer once connected");
 	const catalog = new Json.Snapshot.Consumer<Catalog.Root>({
-		track: net.track(Broadcast.CATALOG_TRACK).subscribe(),
+		track: net.track(Broadcast.CATALOG_TRACK),
 	});
 	const config = (await catalog.latest())?.value.video?.renditions.video;
 	expect(config?.codec).toBe("vp8");
 	expect(config?.bitrate).toBe(Catalog.u53(500_000));
-	expect(config?.track).toBeUndefined();
+	expect(config?.track).toBe("video/1");
 
-	// The first snapshot fixed the name's identity.
+	// The replacement starts empty, so no group from the old codec reads under the new config.
+	const replacement = video.track.peek();
+	expect(replacement?.name).toBe("video/1");
+	expect(replacement?.appendGroup().sequence).toBe(0n);
+
+	broadcast.close();
+});
+
+test("stats names a track in the catalog and reports each listed rendition while subscribed", async () => {
+	const clock = new Manual();
+	const installed = clock.install();
+	const stats = new Signal(false);
+	const probe = new Signal({ rtt: Duration.millis(12.7) });
+	const broadcast = new Broadcast({
+		enabled: true,
+		origin: new Origin.Producer(),
+		name: Path.from("test.hang"),
+		stats,
+		probe,
+	});
+	try {
+		const video = broadcast.video("video");
+		video.config.set(videoConfig);
+		video.stats.set({ frames: 3, bytes: 300, keyframes: 1, skipped: 2, bitrate: 1_000_000 });
+		// A rendition without a config is not in the catalog, so it is not reported either.
+		broadcast.audio("audio").stats.set({ frames: 1 });
+		await settle();
+		expect((await readCatalog(broadcast))?.stats).toBeUndefined();
+
+		stats.set(true);
+		await settle();
+		expect((await readCatalog(broadcast))?.stats).toEqual({ track: "stats.json" });
+
+		const net = broadcast.net.peek();
+		if (!net) throw new Error("expected a network producer once connected");
+		const consumer = new Json.Snapshot.Consumer<Stats.Snapshot>({
+			track: net.track("stats.json"),
+			schema: Stats.SnapshotSchema,
+		});
+		await settle();
+		await clock.advance(Duration.millis(1000));
+		// Sub-millisecond durations are floored on the wire.
+		expect((await consumer.latest())?.value as unknown).toEqual({
+			transport: { rtt: 12 },
+			renditions: { video: { frames: 3, bytes: 300, keyframes: 1, skipped: 2, bitrate: 1_000_000 } },
+		});
+		consumer.close();
+
+		stats.set(false);
+		await settle();
+		expect((await readCatalog(broadcast))?.stats).toBeUndefined();
+	} finally {
+		broadcast.close();
+		installed.close();
+	}
+});
+
+test("an unsubscribed stats track writes nothing", async () => {
+	const clock = new Manual();
+	const installed = clock.install();
+	const broadcast = new Broadcast({
+		enabled: true,
+		origin: new Origin.Producer(),
+		name: Path.from("test.hang"),
+		stats: true,
+	});
+	try {
+		const video = broadcast.video("video");
+		video.config.set(videoConfig);
+		video.stats.set({ frames: 1 });
+		await settle();
+		await clock.advance(Duration.millis(3000));
+
+		const net = broadcast.net.peek();
+		if (!net) throw new Error("expected a network producer once connected");
+		const subscriber = net.track("stats.json").subscribe();
+		await settle();
+		await clock.advance(Duration.millis(1000));
+		// Nothing was written while nobody subscribed, so the first report opens the first group.
+		expect((await subscriber.recvGroup())?.sequence).toBe(0n);
+		subscriber.close();
+	} finally {
+		broadcast.close();
+		installed.close();
+	}
+});
+
+test("echo solicits feedback in the catalog unless it walks above the root", async () => {
+	const echo = new Signal<Path.Relative | undefined>(Path.normalizeRelative("viewers"));
+	const name = new Signal(Path.from("room/live.hang"));
+	const broadcast = new Broadcast({ enabled: true, name, echo });
+	try {
+		await settle();
+		expect((await readCatalog(broadcast))?.echo as unknown).toEqual({ path: "viewers" });
+
+		// From `room/live.hang`, `../../viewers` walks above the root, which every viewer refuses.
+		echo.set(Path.normalizeRelative("../../viewers"));
+		await settle();
+		expect((await readCatalog(broadcast))?.echo).toBeUndefined();
+
+		// A deeper name brings the same path back within the root.
+		name.set(Path.from("org/room/live.hang"));
+		await settle();
+		expect((await readCatalog(broadcast))?.echo as unknown).toEqual({ path: "../../viewers" });
+
+		echo.set(undefined);
+		await settle();
+		expect((await readCatalog(broadcast))?.echo).toBeUndefined();
+	} finally {
+		broadcast.close();
+	}
+});
+
+test("the catalog declares the longest group as the join interval once it lists media", async () => {
+	const broadcast = new Broadcast({ enabled: true, origin: new Origin.Producer(), name: Path.from("join.hang") });
+	const video = broadcast.video("video/hd");
+	video.join.set(Duration.millis(2000));
+	const audio = broadcast.audio("audio/data");
+	audio.join.set(Duration.millis(20));
+	broadcast.text("captions/en").config.set({ format: "vtt", container: { kind: "legacy" } } as Catalog.TextConfig);
+	await settle();
+
+	// Nothing but text is listed, so no interval is declared yet, while the clock already is.
+	const before = await readCatalog(broadcast);
+	expect(before?.media?.join).toBeUndefined();
+	expect(before?.media?.clock).toBeDefined();
+
+	// Audio lists first, yet the video registered beside it has the longer group, which wins.
+	audio.config.set(audioConfig);
+	await settle();
+	const catalog = await readCatalog(broadcast);
+	expect(catalog?.media?.join).toEqual({ interval: Catalog.u53(2000) });
+	expect(catalog?.media?.clock).toEqual(before?.media?.clock);
+	expect(catalog?.audio?.renditions["audio/data"]).not.toHaveProperty("hls");
+
+	// No record tracks reserve a name any more.
+	expect(() => broadcast.audio("video/hd.hls")).not.toThrow();
+	broadcast.close();
+});
+
+test("the join interval stays fixed for the network broadcast", async () => {
+	const name = new Signal(Path.from("fixed.hang"));
+	const broadcast = new Broadcast({ enabled: true, origin: new Origin.Producer(), name });
+	const video = broadcast.video("video");
+	video.join.set(Duration.millis(2000));
 	video.config.set(videoConfig);
 	await settle();
-	expect((await catalog.latest())?.value.video?.renditions.video?.track).toBe("video/1");
+	expect((await readCatalog(broadcast))?.media?.join?.interval).toBe(Catalog.u53(2000));
+
+	// A longer GOP, from a config change or a later rendition, leaves the declared grid alone.
+	video.join.set(Duration.millis(4000));
+	const later = broadcast.video("video/later");
+	later.join.set(Duration.millis(6000.5));
+	later.config.set(videoConfig);
+	await settle();
+	expect((await readCatalog(broadcast))?.media?.join?.interval).toBe(Catalog.u53(2000));
+
+	// A new network broadcast declares again, rounding up to whole milliseconds.
+	name.set(Path.from("renamed.hang"));
+	await settle();
+	expect((await readCatalog(broadcast))?.media?.join?.interval).toBe(Catalog.u53(6001));
+	broadcast.close();
+});
+
+test("an audio-only broadcast declares its join, and no join declares nothing", async () => {
+	const broadcast = new Broadcast({ enabled: true, origin: new Origin.Producer(), name: Path.from("audio.hang") });
+	const audio = broadcast.audio("audio");
+	audio.join.set(Duration.millis(0));
+	audio.config.set(audioConfig);
+	await settle();
+	// A zero join is no positive spacing, so nothing is promised.
+	expect((await readCatalog(broadcast))?.media?.join).toBeUndefined();
+
+	// A later listing tries again once a duration is known.
+	audio.join.set(Duration.millis(20));
+	await settle();
+	expect((await readCatalog(broadcast))?.media?.join?.interval).toBe(Catalog.u53(20));
+	broadcast.close();
+});
+
+// An HLS export reads the media tracks directly, so on demand it needs the interval before anything
+// is encoded, and its subscription to the media is what starts the encode.
+test("an on-demand rendition declares the interval before encoding, and a media subscriber starts it", async () => {
+	const broadcast = new Broadcast({
+		enabled: true,
+		origin: new Origin.Producer(),
+		name: Path.from("ondemand.hang"),
+		onDemand: "all",
+	});
+	const video = broadcast.video("video");
+	video.join.set(Duration.millis(2000));
+	video.config.set(videoConfig);
+	await settle();
+	const net = broadcast.net.peek();
+	if (!net) throw new Error("expected a network producer");
+
+	expect(video.track.peek()).toBeUndefined();
+	const catalog = await readCatalog(broadcast);
+	expect(catalog?.media?.join?.interval).toBe(Catalog.u53(2000));
+	expect(catalog?.video?.renditions.video).not.toHaveProperty("hls");
+
+	const media = net.track("video").subscribe();
+	await settle();
+	expect(video.track.peek()).toBeDefined();
+	media.close();
+	await settle();
+	expect(video.track.peek()).toBeUndefined();
+	broadcast.close();
+});
+
+// Identity follows hang's `same_identity`: interlacing reinitializes a video decoder.
+test("an interlacing change takes a fresh track name", async () => {
+	const broadcast = new Broadcast({ origin: new Origin.Producer(), name: Path.from("interlaced.hang") });
+	const video = broadcast.video("video");
+	video.config.set(videoConfig);
+	await settle();
+	video.config.set({ ...videoConfig, interlaced: true });
+	await settle();
+	expect((await readCatalog(broadcast))?.video?.renditions.video?.track).toBe("video/1");
+	expect(video.track.peek()?.name).toBe("video/1");
+
+	broadcast.close();
+});
+
+// Names belong to one network broadcast, so a new one serves each rendition under its ID again.
+test("a new network broadcast starts every track name over", async () => {
+	const name = new Signal(Path.from("one.hang"));
+	const broadcast = new Broadcast({ origin: new Origin.Producer(), name });
+	const video = broadcast.video("video");
+	video.config.set(videoConfig);
+	await settle();
+	video.config.set({ ...videoConfig, codec: "vp8" });
+	await settle();
+	expect((await readCatalog(broadcast))?.video?.renditions.video?.track).toBe("video/1");
+	expect(() => broadcast.video("video/1")).toThrow("replacement track");
+
+	name.set(Path.from("two.hang"));
+	await settle();
+	expect((await readCatalog(broadcast))?.video?.renditions.video?.track).toBeUndefined();
+	expect(video.track.peek()?.name).toBe("video");
+	expect(video.track.peek()?.appendGroup().sequence).toBe(0n);
+	expect(() => broadcast.video("video/1").close()).not.toThrow();
+
+	broadcast.close();
+});
+
+// A fold that throws publishes nothing, so it must not move a track the catalog still lists.
+test("a refused catalog fold renames no track", async () => {
+	const broadcast = new Broadcast({ origin: new Origin.Producer(), name: Path.from("refused.hang") });
+	const video = broadcast.video("video");
+	const audio = broadcast.audio("audio");
+	video.config.set(videoConfig);
+	await settle();
+	const track = video.track.peek();
+
+	video.config.set({ ...videoConfig, codec: "vp8" });
+	audio.config.set({ ...audioConfig, track: "elsewhere" });
+	await settle();
+	expect(video.track.peek()).toBe(track);
+	expect(track?.closed.peek()).toBeUndefined();
+	expect((await readCatalog(broadcast))?.video?.renditions.video?.codec).toBe(videoConfig.codec);
+
+	// Once the fold succeeds, the new identity moves to a fresh name.
+	audio.config.set(audioConfig);
+	await settle();
+	expect((await readCatalog(broadcast))?.video?.renditions.video?.track).toBe("video/1");
+	expect(video.track.peek()?.name).toBe("video/1");
+
+	broadcast.close();
+});
+
+// A failure keeps the rendition down, even across a sibling's registration, until it clears. The
+// rendition then recovers under a fresh track name, so its group sequence can start over.
+test("a failed rendition stays down until its failure clears", async () => {
+	const broadcast = new Broadcast({ origin: new Origin.Producer(), name: Path.from("failed.hang") });
+	const video = broadcast.video("video");
+	video.config.set(videoConfig);
+	await settle();
+	const track = video.track.peek();
+	const slot = video.slot.peek();
+	if (!track || !slot) throw new Error("expected a served rendition");
+
+	const failure = new Error("encoder failed");
+	slot.error.set(failure);
+	await settle();
+	expect(track.closed.peek()).toBe(failure);
+	expect(video.track.peek()).toBeUndefined();
+	broadcast.audio("audio").config.set(audioConfig);
+	await settle();
+	expect(video.track.peek()).toBeUndefined();
+
+	slot.error.set(undefined);
+	await settle();
+	expect(video.track.peek()?.name).toBe("video/1");
+	expect((await readCatalog(broadcast))?.video?.renditions.video?.track).toBe("video/1");
+
+	broadcast.close();
+});
+
+// A producer may abort its track itself, which fails the rendition's slot the same way.
+test("aborting a rendition's track fails its slot", async () => {
+	const broadcast = new Broadcast({ origin: new Origin.Producer(), name: Path.from("aborted.hang") });
+	const video = broadcast.video("video");
+	video.config.set(videoConfig);
+	await settle();
+	const failure = new Error("encoder failed");
+	video.track.peek()?.abort(failure);
+	await settle();
+	expect(video.slot.peek()?.error.peek()).toBe(failure);
+
+	broadcast.close();
+});
+
+// What a producer keeps for a rendition belongs to one network broadcast, so a new one starts it over.
+test("a new network broadcast starts each rendition's slot over", async () => {
+	const name = new Signal(Path.from("one.hang"));
+	const broadcast = new Broadcast({ origin: new Origin.Producer(), name });
+	const video = broadcast.video("video");
+	video.config.set(videoConfig);
+	await settle();
+	const first = video.slot.peek();
+	if (!first) throw new Error("expected a slot");
+	first.bitrate = 1_000_000;
+	first.error.set(new Error("encoder failed"));
+	await settle();
+	expect(video.track.peek()).toBeUndefined();
+
+	name.set(Path.from("two.hang"));
+	await settle();
+	const second = video.slot.peek();
+	expect(second).toBeDefined();
+	expect(second).not.toBe(first);
+	expect(second?.bitrate).toBe(0);
+	expect(second?.error.peek()).toBeUndefined();
+	expect(video.track.peek()?.name).toBe("video");
+	expect(video.track.peek()?.closed.peek()).toBeUndefined();
 
 	broadcast.close();
 });

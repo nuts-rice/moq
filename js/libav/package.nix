@@ -13,10 +13,12 @@
 {
   lib,
   stdenv,
+  buildPackages,
   stdenvNoCC,
   fetchurl,
   fetchFromGitHub,
   importNpmLock,
+  linkFarm,
   emscripten,
   nodejs,
   python3,
@@ -91,6 +93,9 @@ let
         '') sources
       )}
       (cd configs && node ./mkconfig.js ${variant} '${builtins.toJSON fragments}')
+      # As a cross-compile, ffmpeg's configure defaults its host compiler to a
+      # literal `gcc`, which the darwin stdenv doesn't provide.
+      echo "--host-cc=${buildPackages.stdenv.cc}/bin/cc" >> configs/configs/${variant}/ffmpeg-config.txt
     '';
 
     # emcc compiles its system libraries into a cache on first use, and the
@@ -131,15 +136,34 @@ stdenvNoCC.mkDerivation {
     runHook preInstall
     mkdir -p $out
     cp ${wasm}/* $out/
+    chmod u+w $out/libav-${variant}.mjs
+    # The frontend reaches its worker and wasm through `base`, which a page under a strict CSP points
+    # at its own copies (@moq/hang's assets()). Two spots break app bundlers before that matters:
+    # webpack rewrites the computed import into a lookup that always misses, and an IIFE bundle has
+    # no import.meta.url, which the default base reads unguarded while the module loads.
+    substituteInPlace $out/libav-${variant}.mjs \
+      --replace-fail 'import(toImport)' 'import(/* webpackIgnore: true */ /* @vite-ignore */ toImport)' \
+      --replace-fail 'libav.base=import.meta.url;libav.base=libav.base.replace(' 'libav.base=import.meta.url&&import.meta.url.replace('
     install -Dm444 ${./README.md} $out/README.md
     install -Dm444 ${./index.d.ts} $out/index.d.ts
-    jq 'del(.scripts, .devDependencies, .jsr)
+    jq 'del(.scripts, .devDependencies)
       | .exports |= walk(if type == "string" then sub("^\\./dist/"; "./") else . end)' \
       ${./package.json} > $out/package.json
     runHook postInstall
   '';
 
-  passthru = { inherit wasm; };
+  passthru = {
+    inherit wasm;
+    # Everything the wasm build downloads, which sh/gh/cache.sh publishes so a
+    # rebuild never waits on ffmpeg.org, xiph.org, GitHub or npm.
+    sources = linkFarm "moq-libav-sources" (
+      sources
+      // {
+        "libav.js" = wasm.src;
+        "npm-deps" = wasm.npmDeps;
+      }
+    );
+  };
 
   meta = {
     description = "libav.js decoding Opus and AAC for the @moq/hang WebCodecs polyfill";

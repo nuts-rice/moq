@@ -10,14 +10,14 @@ use crate::{Error, Id, NonZeroSlab, State};
 /// `close` is an `Option` so closing can drop just the sender without removing the
 /// entry or revoking the callback. The task delivers one final terminal callback and
 /// then removes itself, so `user_data` stays valid until that callback fires.
-pub(crate) struct Task {
+pub(crate) struct Task<C = OnStatus> {
 	close: Option<oneshot::Sender<()>>,
-	pub callback: OnStatus,
+	pub callback: C,
 }
 
-impl Task {
+impl<C> Task<C> {
 	/// An entry, plus the receiver its task watches for [`Self::close`].
-	pub fn new(callback: OnStatus) -> (Self, oneshot::Receiver<()>) {
+	pub fn new(callback: C) -> (Self, oneshot::Receiver<()>) {
 		let (close, closed) = oneshot::channel();
 		let task = Self {
 			close: Some(close),
@@ -32,13 +32,25 @@ impl Task {
 	}
 }
 
-impl NonZeroSlab<Task> {
+/// A task's callback, which receives the task's result once it ends.
+pub(crate) trait Terminal: Copy + Send + 'static {
+	/// Deliver the terminal result.
+	fn terminal(&self, res: Result<(), Error>);
+}
+
+impl Terminal for OnStatus {
+	fn terminal(&self, res: Result<(), Error>) {
+		self.call(res);
+	}
+}
+
+impl<C: Terminal> NonZeroSlab<Task<C>> {
 	/// Spawn `run` with its close receiver, then deliver its result as the terminal callback.
 	///
 	/// `slab` finds this slab again from the task, so it can remove its own entry.
 	pub fn spawn<F>(
 		&mut self,
-		callback: OnStatus,
+		callback: C,
 		slab: fn(&mut State) -> &mut Self,
 		run: impl FnOnce(oneshot::Receiver<()>) -> F,
 	) -> Result<Id, Error>
@@ -55,7 +67,7 @@ impl NonZeroSlab<Task> {
 			// Pull the entry out from under the lock so the callback never runs while held.
 			let entry = slab(&mut State::lock()).remove(id);
 			if let Some(entry) = entry {
-				entry.callback.call(res);
+				entry.callback.terminal(res);
 			}
 		});
 

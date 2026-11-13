@@ -11,30 +11,8 @@ on:
   # Nightly: catch an interop regression in the current tree before a user does.
   schedule:
     - cron: "0 8 * * *"
-  # On release PRs that touch the harness itself, so a backported change to the
-  # interop test is validated before it merges. Main PRs skip it; the schedule
-  # above covers main. `edited` catches a main PR retargeted to release.
-  pull_request:
-    branches: [release]
-    types: [opened, synchronize, reopened, edited]
-    paths:
-      - "test/lib/**"
-      - "test/p2p/**"
-      - "js/p2p/**"
-      - "test/interop/**"
-      - "test/max-age/**"
-      - "test/portrait/**"
-      - "test/vr/**"
-      - "demo/vr/**"
-      - "rs/moq-tokio/tests/integration/max_age.rs"
-      # The interop job also depends on the recipe that invokes it and the
-      # workspace membership that links the JS clients to source.
-      - "test/justfile"
-      - "package.json"
-      # The Go client builds against the modules this script stages.
-      - "sh/go/**"
-      - "cpp/moq/**"
-      - ".github/workflows/interop.yml"
+  # release-gate.yml, on release PRs that touch the harness.
+  workflow_call:
 
 # Keyed by event too, so a manual run on main cannot cancel the scheduled one that
 # publishes the night's report.
@@ -43,18 +21,18 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  id-token: write
   contents: read
 
 jobs:
   interop:
     name: Interop
     runs-on: ubuntu-latest
-    # `main` and its merge queue write the Rust cache; see .github/actions/rust-cache.
-    environment: ${{ (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/gh-readonly-queue/main/')) && 'cache-write' || '' }}
+    # Hosted `main` jobs write the Rust cache; see .github/actions/rust-cache.
+    environment: ${{ github.ref == 'refs/heads/main' && 'cache-write' || '' }}
     # The matrix runs in real time (ffmpeg -re pacing + per-subscriber timeouts);
     # this is a safety net against a hung relay/client plus a cold first build.
-    timeout-minutes: 60
+    # A full run takes 40 to 60 minutes, so 60 cancelled a run that never hung.
+    timeout-minutes: 90
     outputs:
       report: ${{ steps.report.outcome }}
 
@@ -77,7 +55,7 @@ jobs:
 
       - name: Workspace dependencies
         id: setup
-        run: nix develop --command bun install --frozen-lockfile
+        run: nix develop --command just js install frozen
         shell: bash -leo pipefail {0}
 
       # Each suite reports independently after setup, while a failed step still fails the job.
@@ -86,6 +64,33 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: nix develop --command just test max-age
         shell: bash -leo pipefail {0}
+
+      - name: Datagram tracks
+        id: datagram-tracks
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: nix develop --command just test datagram-tracks
+        shell: bash -leo pipefail {0}
+
+      - name: Stream limits over WebSocket
+        id: stream-limits
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: nix develop --command just test stream-limits
+        shell: bash -leo pipefail {0}
+
+      - name: Relay fills
+        id: relay-fill
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: nix develop --command just test relay-fill
+        shell: bash -leo pipefail {0}
+
+      - name: Receive credit recovery
+        id: receive-credit
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: nix develop --command just test receive-credit
+        shell: bash -leo pipefail {0}
+        env:
+          # Fail rather than skip the io_uring arm if the runner's kernel lacks it.
+          CI_STRICT: 1
 
       - name: Harness regressions
         id: harness
@@ -114,8 +119,10 @@ jobs:
           # The run writes its directory here, so a failed one is uploaded below
           # and a passing one is deleted as usual. Each case's record lands beside
           # it, for the report below.
-          MOQ_TEST_RUNS: ${{ runner.temp }}/moq-test-runs
-          MOQ_TEST_RESULTS: ${{ runner.temp }}/moq-test-runs/results.jsonl
+          HARNESS_RUNS: ${{ runner.temp }}/moq-test-runs
+          HARNESS_RESULTS: ${{ runner.temp }}/moq-test-runs/results.jsonl
+          # A release PR fails, rather than skips, a browser the lite-07 cut waits on to prove its route key.
+          CI_STRICT: ${{ github.event_name == 'pull_request' && '1' || '' }}
 
       # The same matrix with every client pinned to one moq-transport draft per pass. A release
       # PR runs the oldest and newest even draft between Rust and native JS; nightly and manual
@@ -128,9 +135,9 @@ jobs:
           nix develop --command just test interop "${args[@]}"
         shell: bash -leo pipefail {0}
         env:
-          INTEROP_ARGS: ${{ github.event_name == 'pull_request' && '--publishers rust --subscribers rust,js-native-node,js-native-bun --versions moq-transport-14,moq-transport-22' || '--all --versions ietf' }}
-          MOQ_TEST_RUNS: ${{ runner.temp }}/moq-test-runs
-          MOQ_TEST_RESULTS: ${{ runner.temp }}/moq-test-runs/results.jsonl
+          INTEROP_ARGS: ${{ github.event_name == 'pull_request' && '--publishers rust --subscribers rust,js-native-node,js-native-bun --versions moq-transport-18,moq-transport-22' || '--all --versions ietf' }}
+          HARNESS_RUNS: ${{ runner.temp }}/moq-test-runs
+          HARNESS_RESULTS: ${{ runner.temp }}/moq-test-runs/results.jsonl
 
       # Registry installs and the release matrix run only on main, nightly or
       # on demand: a break only needs catching before the next release.
@@ -141,8 +148,8 @@ jobs:
         shell: bash -leo pipefail {0}
         env:
           GH_TOKEN: ${{ github.token }}
-          MOQ_TEST_RUNS: ${{ runner.temp }}/moq-test-runs
-          MOQ_TEST_RESULTS: ${{ runner.temp }}/moq-test-runs/results.jsonl
+          HARNESS_RUNS: ${{ runner.temp }}/moq-test-runs
+          HARNESS_RESULTS: ${{ runner.temp }}/moq-test-runs/results.jsonl
 
       - name: Portrait transcode
         id: portrait
@@ -150,15 +157,16 @@ jobs:
         run: nix develop --command just test portrait
         shell: bash -leo pipefail {0}
         env:
-          MOQ_TEST_RUNS: ${{ runner.temp }}/moq-test-runs
-          MOQ_TEST_RESULTS: ${{ runner.temp }}/moq-test-runs/results.jsonl
+          HARNESS_RUNS: ${{ runner.temp }}/moq-test-runs
+          HARNESS_RESULTS: ${{ runner.temp }}/moq-test-runs/results.jsonl
 
       - name: VR projection
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: nix develop --command just test vr
         shell: bash -leo pipefail {0}
         env:
-          MOQ_TEST_RUNS: ${{ runner.temp }}/moq-test-runs
+          HARNESS_RUNS: ${{ runner.temp }}/moq-test-runs
+          HARNESS_RESULTS: ${{ runner.temp }}/moq-test-runs/results.jsonl
 
       - name: Interop negative control
         id: negative
@@ -166,8 +174,8 @@ jobs:
         run: nix develop --command just test interop-negative
         shell: bash -leo pipefail {0}
         env:
-          MOQ_TEST_RUNS: ${{ runner.temp }}/moq-test-runs
-          MOQ_TEST_RESULTS: ${{ runner.temp }}/moq-test-runs/results.jsonl
+          HARNESS_RUNS: ${{ runner.temp }}/moq-test-runs
+          HARNESS_RESULTS: ${{ runner.temp }}/moq-test-runs/results.jsonl
 
       # Browser-to-browser media QA: presented frame progress, audible tone, audio/video skew, and
       # the publication lifecycle, plus the negative controls that prove each assertion can fail.
@@ -177,8 +185,8 @@ jobs:
         run: nix develop --command just test media
         shell: bash -leo pipefail {0}
         env:
-          MOQ_TEST_RUNS: ${{ runner.temp }}/moq-test-runs
-          MOQ_TEST_RESULTS: ${{ runner.temp }}/moq-test-runs/results.jsonl
+          HARNESS_RUNS: ${{ runner.temp }}/moq-test-runs
+          HARNESS_RESULTS: ${{ runner.temp }}/moq-test-runs/results.jsonl
 
       # Run independently so an unrelated cold-start failure cannot hide the
       # codec replacement and same-track coded-size growth measurements.
@@ -188,8 +196,8 @@ jobs:
         run: nix develop --command just test media --media-cases rename
         shell: bash -leo pipefail {0}
         env:
-          MOQ_TEST_RUNS: ${{ runner.temp }}/moq-test-runs
-          MOQ_TEST_RESULTS: ${{ runner.temp }}/moq-test-runs/results.jsonl
+          HARNESS_RUNS: ${{ runner.temp }}/moq-test-runs
+          HARNESS_RESULTS: ${{ runner.temp }}/moq-test-runs/results.jsonl
 
       # A failing harness run keeps its directory, holding the process logs, the
       # relay config, and a Playwright trace of the failing page. Upload it for a
@@ -225,6 +233,10 @@ jobs:
             "Rust cache": "${{ steps.rust-cache.outcome }}",
             "Playwright Chromium": "${{ steps.setup.outcome }}",
             "Optional publisher retention": "${{ steps.max-age.outcome }}",
+            "Datagram tracks": "${{ steps.datagram-tracks.outcome }}",
+            "Stream limits over WebSocket": "${{ steps.stream-limits.outcome }}",
+            "Relay fills": "${{ steps.relay-fill.outcome }}",
+            "Receive credit recovery": "${{ steps.receive-credit.outcome }}",
             "Harness regressions": "${{ steps.harness.outcome }}",
             "Subscription termination interop": "${{ steps.bare-fin.outcome }}",
             "P2P data-channel transport": "${{ steps.p2p.outcome }}",

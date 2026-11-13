@@ -42,9 +42,13 @@ age budget.
 Natively that holds only as far as the caller lets it. The container consumer
 reads groups in sequence order and applies its age budget inside `read()`, so a
 group skipped for age is never observed, and a frame queued behind a stalled
-group is observed when the stall clears. A caller that estimates keeps the budget
-at least as long as the estimate's ceiling, which is why `moq play` waits 2 s on
-a stalled group under `--delay auto`. The observation is also only as honest as
+group is observed when the stall clears. A missing group, one that has delivered
+no frame, is waited for only the playout delay plus any lookahead, since past that
+it would play late: a reordered backlog's holes waited out to the whole budget
+would delay the frames behind them, which the estimator would measure as
+jitter. A caller that estimates keeps the budget past the target, which is why
+`moq play` waits on a stalled group for the delay plus its `--stretch`, 2 s by
+default. The observation is also only as honest as
 the caller is prompt: `read()` is timed when it resolves, so a player drains it
 as packets come and lets the playback buffer hold the target, rather than
 pacing reads to the speaker.
@@ -54,10 +58,16 @@ drop is not the receiver's own doing. The subscription's max delay drops groups
 before any container sees them, at the relay and in the receiver's own transport
 subscriber, so a subscription cut to the target hides every frame later than
 the target: the estimate creeps up one bucket at a time while the frames it
-should have measured go unplayed. In automatic mode both implementations
-subscribe with at least the ceiling, 2 s: `moq play --delay auto` through its
-age budget, and the browser through the audio subscription alone, since its
-container consumer observes each frame before applying the local budget.
+should have measured go unplayed. Both implementations subscribe with the delay
+plus the player's `stretch` setting: `moq play` through its age budget, and the
+browser through the audio subscription alone, since its container consumer
+observes each frame before applying the local budget. The 2 s default reaches
+the estimate's own ceiling, so any lateness the estimator can measure is
+observed at once. A smaller stretch hides frames later than the target plus the
+stretch, so a jump in lateness larger than the stretch is learned in steps of
+about the stretch; a zero stretch cuts a live subscription to the target and
+accepts the one-bucket creep. A buffered browser player keeps its subscription
+at least the delay plus its lookahead, whatever the stretch.
 Browser video keeps the shared budget, because a longer one fetches whole stale
 groups, so a broadcast with no audio measures only the lateness that budget
 lets through.
@@ -91,9 +101,11 @@ observe(arrival, media):
     if media > newest:                  # a reordered frame never joins the history
         newest = media
         drop history entries with entry.media < media - WINDOW
+        if MAX_HISTORY entries are held: drop the oldest
         push (arrival, media) onto history
 
-    ref = entry in history with entry.media <= media, minimising (entry.arrival - entry.media)
+    ref = entry in history with entry.media <= media, minimising (entry.arrival - entry.media),
+          the oldest on a tie
     if there is none: return            # older than the whole window, not measured
     delay = max(0, (arrival - ref.arrival) - (media - ref.media))
 
@@ -101,12 +113,19 @@ observe(arrival, media):
         origin = arrival; interval = 0; peak = delay; return
 
     index = floor((arrival - origin) / RESAMPLE)
+    resumed = ended; ended = false
     if index <= interval:
         peak = max(peak, delay); return
 
     fold(bucket of peak)
-    fold(nothing) for each elapsed empty interval, at most IDLE_MAX
+    if resumed:                         # a declared silence folds nothing
+        origin = arrival; index = 0
+    else:
+        fold(nothing) for each elapsed empty interval, at most IDLE_MAX
     interval = index; peak = delay
+
+end():                                  # a declared end precedes the next observation
+    if not first observation: ended = true
 
 fold(bucket):                           # prior starts at 1
     rest = 1 - FORGET * (1 - prior)     # what the decayed evidence leaves
@@ -138,6 +157,22 @@ special case, and neither does a group the relay dropped.
 `WINDOW` is also the horizon over which a build-up is visible. A queue that
 fills over ten seconds is measured as the part of it that happened in the last
 two.
+
+### Bounding the history
+
+The history holds at most `MAX_HISTORY` (8192) arrivals. The window is media
+time and the publisher chooses the timestamp rate, so without a cap a stream
+that advances a nanosecond per frame keeps every frame it sends. The cap stays
+far above the two-second window of any real track, including a 1000 fps one
+(2000 entries); a stream dense enough to reach it measures against a window
+shorter than `WINDOW` instead of growing without bound.
+
+The reference is a minimum over a prefix of the history, and the publisher
+chooses the prefix by reordering, so scanning for it lets every frame cost
+`MAX_HISTORY` comparisons. Keep the history in a structure that answers any
+prefix's minimum in logarithmic time, such as a segment tree over a ring.
+Keep the oldest entry on a tie: tied entries with a different `arrival` and
+`media` round `delay` differently.
 
 ### Reordered arrivals are measured against what came before them
 
@@ -286,8 +321,9 @@ business.
 
 ## The advertised flush span, and how it composes
 
-A hang rendition may advertise `jitter`: the largest delay the publisher has
-seen between a frame being ready and handing it to the transport. It is
+A hang rendition may advertise `jitter`: the largest span of media the
+publisher writes behind a frame's timestamp, from B-frame reordering or a batch
+written together. It is
 described in [hang](/concept/hang) and specified in
 [draft-lcurley-moq-hang](/draft/moq-hang). The two quantities share a word and
 get confused for each other, so plainly:
@@ -295,15 +331,15 @@ get confused for each other, so plainly:
 | | Advertised `jitter` | The estimate here |
 | --- | --- | --- |
 | Measured by | the publisher, once | each receiver, continuously |
-| Measured at | the transport handoff | the receiver's transport |
-| Covers | encoder latency, packet packing, reorder, segmentation | all of that, plus the network |
+| Measured from | media timestamps | the receiver's arrival times |
+| Covers | packet packing, reorder, segmentation | all of that, plus encoder latency and the network |
 | Is | a declared lower bound | an observation |
 
-**They compose as a maximum, and the reason matters.** Both are the same
-formula, lateness relative to a windowed minimum, evaluated one hop apart. The
-receiver measures from the frame's media timestamp to its own arrival, so the
-publisher's flush delay is already inside every number on this page: a publisher
-flushing 100 ms of media at once produces arrivals whose relative delay reaches
+**They compose as a maximum, and the reason matters.** Both are lateness
+behind the media timestamp, evaluated one hop apart. The receiver measures from
+the frame's media timestamp to its own arrival, so the publisher's batching is
+already inside every number on this page: a publisher writing 100 ms of media at
+once produces arrivals whose relative delay reaches
 100 ms less one frame, on a perfect network, with no help from the catalog.
 
 So the advertised value is a **floor**, not an addend:
@@ -317,7 +353,7 @@ publishers that need it most. Taking the maximum on the grounds that they
 "describe the same quantity" reaches the right operation by the wrong argument:
 they are the same quantity measured at different points, and the receiver's
 point strictly contains the publisher's. The floor earns its place by being
-correct *immediately*, before the estimator has seen a full flush cycle, which
+correct *immediately*, before the estimator has seen a full batch, which
 is the one thing a measurement cannot be.
 
 ## Across renditions
@@ -328,38 +364,53 @@ constant offset between tracks cancels out of `measured`: a video encoder that
 flushes 200 ms behind the audio encoder produces the same video target as one
 that does not, and its frames would all arrive 200 ms late for the shared clock.
 
-The catalog `delay` field carries that offset: how far a rendition's minimum
-flush lateness trails the broadcast's earliest rendition, measured by the
-publisher and never lowered. It is an addend, not a floor, because nothing on
-this page contains it. The shared playout is the largest requirement among the
-renditions actually subscribed:
+The catalog `delay` field carries that offset. It is an addend, not a floor,
+because nothing on this page contains it, and it is never lowered.
+
+A publisher that knows the offset states it, and it is used as given. The
+receiver already adds a frame duration on top, so an encoder configured not to
+reorder or queue frames, whose frames trail by no more than their own duration,
+states zero. moq-video does so for a backend that confirmed its preset, and
+moq-audio for Opus and PCM captured at the codec's rate, since a resampler
+holds input. Anything else is measured: the least a rendition's
+timestamps trailed those the broadcast's other renditions already wrote, over a
+window of a second or a group of its media, whichever is longer, keeping the
+largest of those windows. A measured value is reported only once a window
+closes.
+
+Lateness only some frames have is left out, since `measured` already contains
+it. A B-frame written after a later reference picture trails that picture and
+another rendition's, and the audio written beside it trails them too. The
+reference pictures do not, and every window holds one.
+
+The shared playout is the largest requirement among the renditions actually
+subscribed:
 
 ```
 playout = max over subscribed renditions of (delay + target)
 ```
 
 A receiver **must not** subtract one rendition's `delay` from another's. Each is
-a lifetime maximum taken against a sliding baseline, so two values need not
-share an origin: if the earliest rendition later drifts behind another, their
-difference understates the real spread. The maximum never under-buffers,
+taken against whichever rendition was ahead and only ever rises, so two values
+need not share an origin: if the earliest rendition later drifts behind another,
+their difference understates the real spread. The maximum never under-buffers,
 because the subscribed renditions' spread is measured from an earliest baseline
 no earlier than the broadcast's, so it never exceeds the largest `delay` among
 them. The cost is over-buffering by the smallest subscribed `delay` when the
 broadcast's earliest rendition is not subscribed.
 
 The playout is recomputed when a rendition is subscribed, unsubscribed, or its
-catalog entry rises, so dropping a slow rendition lowers latency. The shared
-reference itself only ever moves earlier, so once the earliest subscribed track
-leaves, the clock stays anchored to it until playback re-anchors; that errs on
-the safe side.
+catalog entry rises, so dropping a slow rendition lowers latency. Each track's
+own arrivals only ever move its part of the shared reference earlier. A track
+that leaves, or whose timeline restarts, releases its part: the earliest
+remaining track's anchor takes over, or the next frame re-anchors.
 
 A track that replaces another in the same slot and on the same broadcast path,
 such as the new name a codec change publishes under, continues the outgoing
 track's histogram, prior weight included, instead of starting over. The path's
 arrivals did not change with the name; a track on another path starts from the prior.
 Restarting would drop the target to the cold-start 100 ms at the switch, then
-raise it as the lateness is relearned, and the playout follows both moves:
-buffered audio is skipped on the drop and playback parks on each rise. Only the
+raise it as the lateness is relearned, and the playout follows both moves. Only the
 reference window restarts, so the new track's frames are measured against its
 own fastest. Its opening backlog would read as seconds late against the old
 track's arrivals.
@@ -405,10 +456,12 @@ The advertised floor is the one term that can exceed that bound, and it is
 deliberately not clamped to it. The ceiling is a property of the histogram's
 size; the floor is a number the publisher declared about itself, so clamping
 the floor to the ceiling would under-buffer precisely the publisher that was
-honest about a long flush.
+honest about a long flush. Honoring it must not cost memory in proportion to
+the declared number, so the browser decodes at most 500 ms of any target and
+holds the rest as the encoded frames it actually received.
 
 Policy limits sit above the algorithm. A receiver's own configured maximum and
-the track's retention window both cap what it may hold, and neither is the
+the track's max age both cap what it may hold, and neither is the
 estimator's business.
 
 ## Idle intervals
@@ -437,6 +490,25 @@ keeps decaying at the base rate. Only the weight the prior regained is replaced
 quickly, the same way it is at cold start, since it stands for no evidence at
 all.
 
+### Declared silence
+
+A publisher that stops sending on purpose, such as a muted push-to-talk
+speaker, marks the stop with a declared end. The silence after it says
+nothing about the path, so relaxing toward the prior would only make a
+listener who sat through a long mute come back over-buffered. `end()` tells
+the estimator that a declared end lies between the previous observation and
+the next. The next measured observation then folds the pending interval as
+usual and starts a fresh interval at its own arrival instead of folding the
+intervals in between. If it lands in the pending interval it is merged as
+usual, since there is nothing to skip. Either way the end is spent, so a
+later gap the publisher did not declare still relaxes the estimate. The
+reference history, the histogram, and the prior are untouched, and an end
+before the first observation, or under a fixed target, does nothing.
+
+The receiver calls `end()` before observing the first frame from a group later
+than the declared end's own: the stopped encoder's final packets may follow the
+marker in its group, and they belong to the speech before the silence, not after it.
+
 ## Fixed targets
 
 An explicit delay **fixes the target and disables adaptation**. It is taken
@@ -447,13 +519,15 @@ target = delay
 ```
 
 An impossible fixed target is refused, not silently adjusted. A negative delay,
-or one beyond the track's retention window, is an error at configuration time.
+or one beyond the track's max age, is an error at configuration time.
 Supported or refused, not warned about and continued.
 
 In the browser this is the numeric `delay` setting; natively it is
-`decode::Options::delay`, where `None` selects the estimator. The two spell the
-same thing the same way on purpose. It is distinct from `max_delay`, which is the
-live-edge skip budget and not a buffer.
+`decode::Options::delay.min` with `decode::Options::estimate` set to `false`.
+`estimate` defaults to `true`, which runs the estimator instead and never goes
+below that `min`. The two spell the same thing the same way on purpose. It is
+distinct from `delay.max`, which is the live-edge skip budget and not a buffer.
+The same `min` is where a cold join starts.
 
 ## Constants
 
@@ -473,6 +547,7 @@ The exceptions are marked.
 | `FRESH_MAX` | 0.1 | Ours, twice the quantile's tail. NetEq ramps the forget factor from a start weight of 2 instead; see [the histogram](#the-histogram) |
 | `PRIOR[i]` | `0.5^(i+1)` | NetEq's histogram seed |
 | `IDLE_MAX` | 1024 intervals | Ours. A work bound with no effect on output |
+| `MAX_HISTORY` | 8192 arrivals | Ours. Bounds a rate the publisher chooses; see [Bounding the history](#bounding-the-history) |
 | Out-of-range delays | clamped, not dropped | Ours. See [the histogram](#the-histogram) |
 
 ## Implementing from this page
@@ -512,7 +587,8 @@ directly, so neither is graded against the other.
 `arrival` and `media` are parallel arrays in **delivery order**, the order the
 receiver observes them, so `media` is deliberately out of order in the
 `reorder` and `backlog` cases. `advertised` and `delay` are present only where the case uses
-them. `target` lists `[frame index, target]` at every frame where the target
+them, as is `ends`: the indices, ascending, of the frames observed right after a
+[declared end](#declared-silence), each of which calls `end()` before it is observed. `target` lists `[frame index, target]` at every frame where the target
 differs from the previous frame's, starting at frame 0, so an implementation
 folds the trace one frame at a time and compares its target at each listed
 index. Tolerance is 1e-6 ms, which the `f64` rules above make generous.
@@ -526,6 +602,7 @@ index. Tolerance is 1e-6 ms, which the `f64` rules above make generous.
 | `reorder` | A run delivered after a newer one is measured against the frames before it, so the target covers waiting for it |
 | `backlog` | A backlog delivered newest first behind the live edge is not measured, so its media span never reaches the target |
 | `idle` | A 30 s gap relaxes the histogram toward the prior |
+| `silence` | A declared 60 s silence and a declared pause leave the target where it was, and a later undeclared gap still relaxes it |
 | `tunein` | A stale frame then the live edge 14.5 s later leaves the target near the frame duration. This is the #3517 regression |
 | `spike` | A recurring stall raises the target, and it decays once the stalls stop |
 | `straggler` | One late interval after the prior is spent leaves the target where it was |
@@ -543,3 +620,290 @@ longer match it, which is what stops a file being edited by hand to make a
 failing implementation pass. It compares rather than rewrites; regenerating is
 the `bun doc/concept/audio-jitter/corpus.ts` command above. It runs in
 `just check`.
+
+## Received-audio time stretch
+
+Every player adapts received PCM to the shared clock with the seams of WebRTC
+NetEq's time stretch: native playback in `rs/moq-audio`, and the browser in the
+AudioWorklet's ring in `js/watch`, live or buffered. Neither generates
+replacement audio for a missing packet, so a hole in the media plays as a hole.
+The estimator above is unchanged. Both share the decision, level filter, pitch
+search, admission, seams, and [corpus](#stretch-corpus) below.
+
+So in steady state audio plays on the shared clock at the playout delay. When
+the audio received ahead of the playhead runs low, playback slows down and
+falls behind the clock; once that buffer is back above the target, playback
+speeds up until audio is on the clock again. A congestion stall costs a gap and
+a catch-up, not the audio that arrived late.
+
+The source is WebRTC's
+[`TimeStretch`](https://webrtc.googlesource.com/src/+/refs/heads/main/modules/audio_coding/neteq/time_stretch.cc),
+[`Accelerate`](https://webrtc.googlesource.com/src/+/refs/heads/main/modules/audio_coding/neteq/accelerate.cc),
+[`PreemptiveExpand`](https://webrtc.googlesource.com/src/+/refs/heads/main/modules/audio_coding/neteq/preemptive_expand.cc),
+[`DspHelper`](https://webrtc.googlesource.com/src/+/refs/heads/main/modules/audio_coding/neteq/dsp_helper.cc),
+and [`DecisionLogic`](https://webrtc.googlesource.com/src/+/refs/heads/main/modules/audio_coding/neteq/decision_logic.cc),
+read on 2026-11-04. Both ports retain the BSD license and patent grant, in
+`WEBRTC-LICENSE` and `WEBRTC-PATENTS` beside `rs/moq-audio` and `js/watch`.
+
+### PCM and decision state
+
+PCM is interleaved `f32` in \[-1, 1]; analysis uses `f64`, and each output sample
+rounds once to `f32`. A frame is one sample across all channels. All counts
+below are frames at the output device's rate `R`. Duration-to-frame conversion
+uses `floor(R * milliseconds / 1000)`, except a measured pitch rounds to the
+nearest frame, with half rounded upward. A processing window is 30 ms of
+**newly received PCM**. A short window passes unchanged. Startup padding is
+never analysed, and finish drains the remaining input without stretching. So
+does the tail before a [declared end](#declared-silence): running dry after it
+is silence rather than an underrun, so nothing expands toward a target that no
+arrival will refill.
+
+The state is `cooldown`, initially 60 ms (NetEq's six startup ticks), reduced
+by each frame rendered, saturating at zero. A successful stretch sets it to
+50 ms (NetEq's five 10 ms ticks); a rejected seam leaves it unchanged. There is
+no concealment state.
+
+### Decision
+
+At each window boundary a player decides on five inputs:
+
+- `target`: the playout delay the shared clock plays at.
+- `level`: how far the playhead trailed the newest received audio when it
+  arrived, decoded or not, less what the stretch and skips removed since.
+  Between arrivals the depth drains because the next one has not landed, not
+  because audio is ahead of the clock, so deciding on the depth would slow down
+  into every gap and settle a burst behind. `level` is the playout delay NetEq's
+  `DecisionLogic` compares, with the publisher's cadence taken out: a batched
+  publisher such as AAC in TS, which delivers a whole PES at once, settles
+  where an evenly paced one does.
+- `raw`: the received audio ahead of the playhead, decoded or not. A stall
+  delivers no arrival to lower `level`, so `raw` stops a playhead behind the
+  clock from speeding into it.
+- `lag`: how far the playhead trails the shared clock, negative when it plays
+  ahead of it.
+- `bound`: how far audio may trail the clock, which is the subscription's max
+  delay less the playout delay: the player's `stretch` setting (2 s by
+  default), or for a buffered player the larger of it and the lookahead. A zero
+  stretch turns the stretch off; see [below](#skips-underruns-and-silence).
+
+`level` passes through NetEq's `BufferLevelFilter` once per window: three of its
+10 ms steps at the factor the target selects, 251, 252, 253, or 254 in 256ths
+for a target up to 20, 60, or 140 ms, or longer. With `w = (factor / 256)^3`
+and `stretched` the frames the stretch removed since the previous update
+(negative when it added them):
+
+```
+filtered = max(0, w * filtered + (1 - w) * level - stretched)
+```
+
+The first update after a start, an underrun, or a new timeline takes `level`
+as it is.
+
+With NetEq's limits, its 85 ms deceleration offset and 20 ms granularity,
+
+```
+low  = max(floor(3 * target / 4), target - 85 ms)
+high = max(target, low + 20 ms)
+buffer = min(filtered, raw)
+```
+
+choose in this order:
+
+1. `lag > 0` and `buffer >= 4 * high`: fast accelerate, up to `lag`, even
+   during cooldown.
+2. `cooldown > 0`: hold.
+3. `lag > 0` and `buffer >= high`: accelerate, up to `lag`.
+4. `filtered < low` and `lag < bound`: preemptive expand, up to `bound - lag`.
+5. `lag < 0`: preemptive expand, up to `-lag`.
+6. Otherwise: hold.
+
+The "up to" is the decision's allowance: a seam never changes the output by
+more. So speeding up only ever catches a playhead behind the clock up to it,
+and slowing down lets audio fall behind by at most `bound`, or brings a
+playhead ahead of the clock back onto it. These are NetEq's thresholds and
+rates, untuned. A moved target moves the clock, so a rise leaves audio ahead of
+it and a fall leaves audio behind, and both become ordinary slowing down and
+speeding up: nothing parks in silence on a rise, and nothing skips buffered
+audio on a fall shorter than the bound and one window. A fall past that skips
+to the bound, as any lag past it does.
+
+Without a clock reading the target is where the playhead belongs, so
+`lag = level - target`. The browser then never skips; native playback bounds
+the lag at three quarters of its ring's capacity above the target.
+
+### Skips, underruns, and silence
+
+A playhead that trails the clock by more than `bound` and one window skips
+ahead to `bound` behind it, dropping the staged window and the audio it passes.
+Less than that is the stretch's to catch up. A join is the exception: until
+the player has read once on the clock, its bound is zero, so the backlog a
+subscription opens on is skipped rather than played out at the stretch's pace,
+and playback starts on the clock. A shared clock whose reference moves earlier,
+as it does through a tune-in backlog that arrives faster than real time, jumps
+ahead by as much, and audio skips those jumps as video skips the frames they
+pass, as far as the playhead trails the clock and the player holds audio past
+its target, which the early media that moved the reference leaves it. Jumps
+skip once they add up to more than one window, so a publisher's clock drifting
+fast, which moves the reference by a little at a time, and a reference moving
+while the buffer runs low, are the stretch's to catch up. Only those
+skips and a ring overflowing its fixed capacity drop received audio; each
+counts as a skip in
+the player's stats. A finite tail before a declared end plays as received, and
+a playhead behind the clock skips a declared silence by its lag rather than
+stretching across it, which drops no audio.
+
+After an underrun the player resumes on a cushion of one window and one read,
+the device period natively and the render quantum in the browser, and never
+more than it starts on. It resets the filter, so the low level it resumes on
+slows playback down until the buffer is back at the target. Refilling to the
+whole target instead would add up to one target of silence and leave audio
+that much further behind. A declared end releases the wait, so a short tail
+drains.
+
+`level` and `raw` count everything received ahead of the playhead, decoded or
+still encoded. The browser holds the part of the target above its ring's floor
+encoded, and a buffered player its whole lookahead, while native playback
+decodes everything at once. The browser's decode gate releases a playing ring's
+next frame while what it was given, landed or still decoding, reaches less than
+its floor and one window past the playhead, so the ring always holds a full
+window to stretch, and a hole in the media plays as silence. A frame stamped
+within a millisecond and two samples of where the last one ended continues it
+in both players: millisecond stamps, or ones rounded from another clock, land
+either side of the exact boundary, which is no hole.
+
+A zero `stretch` turns the stretch off, for content where a pitch-period splice
+is audible, such as music. Every window holds, so received audio plays
+unaltered, and the bound is zero: a playhead trailing the clock by more than one
+window skips onto it, and one more than a window ahead of it pads silence until
+the clock reaches it. Late audio is skipped, an underrun is silence, and drift
+between the publisher's clock and the device's is corrected by a skip or a pad
+of about one window.
+
+### Pitch search and admission
+
+Use channel zero as NetEq does. All channels share the selected seam and lag,
+including a silent first channel. For analysis only, linearly sample the first
+channel at a virtual 48 kHz clock and apply NetEq's 48 kHz FIR coefficients
+`[1019, 390, 427, 440, 427, 390, 1019] / 4096`. For downsampled index `i`
+in `[0, 110)`, sum taps `j` in ascending order, at input-frame position
+`(10 + 12*i - j) * R / 48000`. Interpolate between adjacent input frames;
+clamp either endpoint to the window. This retains NetEq's filter and delay
+compensation while admitting native 44.1 kHz and 96 kHz devices too.
+
+For integer lag `l` in `[10, 60)`, sum `down[t] * down[t-l]` for
+`t` in `[60, 110)`. Thus each candidate correlates 50 samples at 4 kHz,
+covering 2.5 to just under 15 ms. Choose the largest sum, smallest lag on a
+tie. At the first candidate, use offset zero. Otherwise use a parabolic
+peak offset `clamp(0.5*(left-right)/(left-2*center+right), -0.5, 0.5)`;
+a zero denominator gives zero, and the last candidate's right neighbour is
+zero, as in NetEq's single-peak search. Convert `(lag+offset)*R/4000`
+to the nearest frame, clamped to `[1, floor(15 ms * R)]`. Rates too low to
+contain that interval hold unchanged.
+
+With `M = floor(15 ms * R)` and pitch `L`, measure the original channel-zero
+vectors `input[M-L .. M]` and `input[M .. M+L]`. Let `E1`, `E2` be their
+squared energies and `C` their dot product. The signal is passive if
+`(E1+E2)/(2*L) <= 8*75000/(32768*32768)`, NetEq's VAD before a background
+noise model is initialised. No background synthesis or noise model is added.
+Otherwise admit the seam only when `C > threshold * sqrt(E1*E2)`, with
+threshold **14746/16384** normally and **8192/16384** for fast accelerate.
+These are NetEq's original thresholds; none was tuned. Active uncorrelated
+PCM holds unchanged, so zero underruns are not guaranteed for arbitrary input
+or outages. Passive PCM may stretch without correlation.
+
+This is a floating-point adaptation, not bit-identical int16 NetEq: FIR and
+correlation sums avoid Q-format rounding, peak refinement uses a parabola
+instead of its fixed-point lookup, and fade weights are computed directly.
+The corpus defines parity between our languages. These arithmetic choices
+are separate from the unchanged admission thresholds; perceptual acceptance
+still needs the listening proof required by the quest.
+
+### Seam and boundaries
+
+Fast mode takes every whole period that fits both before the middle and in the
+allowance, `min(floor(M/L), floor(allowance/L)) * L`, after admission; the
+others take `L` when `L <= allowance` and hold otherwise. For a crossfade of
+`L` frames, frame `i` uses `w=(i+1)/(L+1)` and
+`f32(a*(1-w)+b*w)` independently for every channel.
+
+- Accelerate: copy `[0, M-L)`, fade `[M-L, M)` into `[M, M+L)`, then copy
+  `[M+L, 30 ms)`. Output loses `L` frames.
+- Preemptive expand: copy `[0, M)`, fade `[M, M+L)` into `[M-L, M)`, then
+  copy `[M, 30 ms)`. Output gains `L` frames. All 30 ms is fresh input, so
+  NetEq's requirement for at least 15 ms of new active speech is satisfied.
+
+A window consumes its input once. Never reanalyse staged output or repeat
+history after the input ends. Allocate input and 45 ms of output per sink at
+setup; callback processing has no allocation, lock, or host-clock read.
+`buffered()` includes staged output, and finishing accounts for it before
+completing the sink.
+
+These bounds do not promise concealment of missing media or convergence of a
+signal whose seams continually fail admission.
+
+### Stretch corpus
+
+`audio-jitter/stretch/corpus.json` holds literal interleaved input and expected
+output PCM, device rate and channels, the decision and allowance to stage, and
+the admitted lag (zero means hold). Compare output within 1e-6 absolute sample
+amplitude. It includes hold, accelerate and fast seams within and past their
+allowance, linked stereo, passive noise, rejected active noise, the normal and
+fast thresholds, and 8/44.1/48 kHz seams.
+
+`audio-jitter/stretch/decisions.json` holds the rule's cases, each a target,
+filtered level, raw depth, lag, bound, and cooldown with the decision and
+allowance they produce, and the filter's, each a target and a series of levels
+and stretched frames with the filtered level after each update. Both
+implementations consume these exact vectors; generating expected output from
+the implementation under test is not conformance.
+
+## Comfort noise
+
+A [declared silence](#declared-silence) is not an underrun. A receiver whose
+playback runs dry at a declared end counts no underrun or stall, and fills the
+silence with comfort noise instead of plain silence, so a muted talker's
+background carries on rather than the line going dead. It keeps doing so
+through the refill before the next utterance plays.
+
+The publisher sends nothing while muted, so the level is measured from what the
+receiver itself played since playback last resumed:
+
+```
+played(samples):                  # audio just played, not comfort noise or startup padding
+    if filling: filling = false; quietest = infinity; sum = 0; frames = 0
+    for each frame:
+        sum += every channel's sample squared
+        frames += 1
+        if frames == BLOCK:
+            quietest = min(quietest, sum / (BLOCK * channels))
+            sum = 0; frames = 0
+
+fill(samples):
+    if not filling:
+        filling = true
+        if quietest is finite: level = min(sqrt(quietest), COMFORT_MAX)
+    each sample = uniform(-1, 1) * level * sqrt(3)
+```
+
+`BLOCK` is 20 ms at the output rate, rounded, and blocks count from the first
+frame played after a silence. `COMFORT_MAX` is 0.001 RMS, -60 dBFS: audio that
+never falls quiet, such as music, would otherwise fill a pause with noise as
+loud as itself. `level` starts at 0, so a source that was already silent, such
+as a noise-suppressed microphone, gets none, and a silence after too little
+audio to fill one block keeps the previous level. Uniform noise on `[-a, a]`
+has an RMS of `a / sqrt(3)`, so the noise sits at `level`. Sums are `f64` in
+the order written; the noise itself is not part of conformance.
+
+Decoded audio stops a codec's pre-skip short of the declared end when the
+publisher leaves its encoder's lookahead unflushed, so the browser's ring takes
+the end that early. Natively, `moq play` declares the end on the playback sink
+when it reads the marker, and the stopped encoder's final frames that follow
+the marker still play before the silence.
+
+### Comfort corpus
+
+`audio-jitter/comfort/corpus.json` holds cases of constant runs played, each
+followed by the level the next silence must fill at, within 1e-9. It covers the
+quietest block rather than the last, blocks straddling a level change, a stereo
+mean, the -60 dBFS cap, an already silent source, and a silence that keeps or
+remeasures the level.

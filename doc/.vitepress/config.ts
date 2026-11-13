@@ -1,10 +1,29 @@
-import { defineConfig } from "vitepress";
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { type DefaultTheme, defineConfig } from "vitepress";
 import llmstxt from "vitepress-plugin-llms";
 import { syncDrafts } from "./drafts";
 
 // Generated before VitePress enumerates routes, so the pages and this sidebar
 // list stay in sync with the kramdown-rfc sources under drafts/.
 const drafts = syncDrafts();
+
+// The JS API reference under lib/js/api/, generated the same way from the
+// packages' TSDoc. TypeDoc runs in its own process, since it holds the whole
+// program in memory and needs its own TypeScript. It reuses a cached reference
+// while none of its inputs has changed.
+const generator = fileURLToPath(new URL("./api/index.ts", import.meta.url));
+execFileSync("bun", [generator], { stdio: "inherit" });
+const reference = (items: DefaultTheme.SidebarItem[], parent?: string): DefaultTheme.SidebarItem[] =>
+	items
+		// A package with several entrypoints lists its main one again under itself.
+		.filter((item) => item.link !== parent)
+		.map((item) => {
+			const link = item.link?.replace(/\.md$/, "");
+			return { ...item, link, items: item.items && reference(item.items, item.link) };
+		});
+const api = reference(JSON.parse(readFileSync(new URL("../lib/js/api/typedoc-sidebar.json", import.meta.url), "utf8")));
 
 export default defineConfig({
 	title: "Media over QUIC",
@@ -97,8 +116,12 @@ export default defineConfig({
 						{ text: "Overview", link: "/concept/" },
 						{ text: "Transport", link: "/concept/transport" },
 						{ text: "moq-lite", link: "/concept/moq-lite" },
+						{ text: "Identity and recovery", link: "/concept/identity" },
+						{ text: "Sockets", link: "/concept/socket" },
 						{ text: "hang", link: "/concept/hang" },
+						{ text: "Archives", link: "/concept/archives" },
 						{ text: "Audio jitter", link: "/concept/audio-jitter" },
+						{ text: "Compressed tracks", link: "/concept/compression" },
 						{ text: "Stats", link: "/concept/stats" },
 						{ text: "Standards", link: "/concept/standard" },
 						{
@@ -143,8 +166,12 @@ export default defineConfig({
 						{
 							text: "moq-cli",
 							link: "/bin/cli",
-							items: [{ text: "Inspect a relay", link: "/bin/inspect" }],
+							items: [
+								{ text: "MPEG-TS", link: "/bin/ts" },
+								{ text: "Inspect a relay", link: "/bin/inspect" },
+							],
 						},
+						{ text: "moq-studio", link: "/bin/studio" },
 						{
 							text: "Gateways",
 							items: [
@@ -183,10 +210,8 @@ export default defineConfig({
 								{ text: "moq-video", link: "/lib/rs/moq-video" },
 								{ text: "moq-audio", link: "/lib/rs/moq-audio" },
 								{ text: "moq-auth", link: "/lib/rs/moq-auth" },
-								{ text: "moq-room", link: "/lib/rs/moq-room" },
 								{ text: "moq-json", link: "/lib/rs/moq-json" },
-								{ text: "moq-flate", link: "/lib/rs/moq-flate" },
-								{ text: "moq-clock", link: "/lib/rs/moq-clock" },
+								{ text: "kio", link: "/lib/rs/kio" },
 							],
 						},
 						{
@@ -203,7 +228,8 @@ export default defineConfig({
 								{ text: "@moq/signals", link: "/lib/js/signals" },
 								{ text: "@moq/clock", link: "/lib/js/clock" },
 								{ text: "@moq/json", link: "/lib/js/json" },
-								{ text: "@moq/flate", link: "/lib/js/flate" },
+								{ text: "@moq/stats", link: "/lib/js/api/stats" },
+								{ text: "API reference", link: "/lib/js/api/" },
 							],
 						},
 						{ text: "Swift", link: "/lib/swift/" },
@@ -216,6 +242,11 @@ export default defineConfig({
 						{ text: "Layers", link: "/lib/layers" },
 					],
 				},
+			],
+
+			"/lib/js/api/": [
+				{ text: "TypeScript", link: "/lib/js/" },
+				{ text: "API reference", link: "/lib/js/api/", items: api },
 			],
 		},
 
@@ -274,6 +305,9 @@ export default defineConfig({
 				domain: "https://doc.moq.dev",
 				// Static files are already served verbatim.
 				ignoreFiles: ["public/**"],
+				// llms.txt still indexes the API reference and each page has its .md twin,
+				// but inlining its 1.2 MB of signatures would more than double llms-full.txt.
+				ignoreFilesPerOutput: { llmsFullTxt: ["lib/js/api/**"] },
 			}),
 		],
 	},

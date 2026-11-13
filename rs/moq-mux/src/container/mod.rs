@@ -13,8 +13,10 @@
 use bytes::Bytes;
 
 mod consumer;
+mod declared;
 mod decode;
 mod group;
+mod input;
 mod producer;
 mod source;
 #[cfg(test)]
@@ -27,12 +29,14 @@ pub mod fmp4;
 pub mod legacy;
 pub mod loc;
 pub mod mkv;
+pub mod mp4;
 pub mod ts;
 
-pub use consumer::Consumer;
+pub use consumer::{Consumer, DELAY_MAX, Playout};
 pub use group::GroupConsumer;
-pub use producer::Producer;
-pub(crate) use source::ExportSource;
+pub(crate) use input::Input;
+pub use producer::{Finished, Guard, Producer};
+pub(crate) use source::{ExportSource, Resume};
 
 /// The media role that determines how a container represents frame durations.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -9,12 +9,12 @@
 //! - land: a snapshot starts and lands under one prefix, releasing its one consumer.
 //! - register: a consumer of one prefix registers, counting the snapshots it waits on.
 //!
-//! The snapshot is crate-private, so this reaches it through the hidden `fuzz` module.
+//! The snapshot is crate-private, so this reaches it through the `fuzz` module.
 //!
 //! Run with `cargo bench -p moq-net --features fuzz --bench synced`.
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use moq_net::{Hop, Pattern, Patterns, announce, fuzz, origin};
+use moq_net::{Pattern, Patterns, fuzz, origin};
 
 /// `(streams, consumers)` shapes.
 const SHAPES: [(usize, usize); 4] = [(10, 10), (1_000, 10), (10, 1_000), (1_000, 1_000)];
@@ -25,16 +25,16 @@ struct Table {
 	producer: origin::Producer,
 	_driver: origin::Driver,
 	_streams: Vec<fuzz::Snapshot>,
-	_consumers: Vec<announce::Consumer>,
+	_consumers: Vec<origin::Routes>,
 }
 
 fn table(streams: usize, consumers: usize) -> Table {
-	let (producer, driver) = origin::Producer::new(origin::Config::new(Hop::new(1).unwrap()));
+	let (producer, driver) = origin::Producer::new(origin::Config::new(std::num::NonZeroU64::new(1).unwrap()));
 	let streams = (0..streams)
 		.map(|i| fuzz::snapshot(&producer, &format!("room/{i}")))
 		.collect();
 	let consumers = (0..consumers)
-		.map(|i| scoped(&producer, &format!("other/{i}")).announced())
+		.map(|i| scoped(&producer, &format!("other/{i}")).routes())
 		.collect();
 	Table {
 		producer,
@@ -57,12 +57,12 @@ fn bench_land(c: &mut Criterion) {
 		let id = BenchmarkId::from_parameter(format!("{streams}st_{consumers}c"));
 		group.bench_function(id, |b| {
 			let table = table(streams, consumers);
-			let watcher = scoped(&table.producer, "room/incoming").announced();
+			let watcher = scoped(&table.producer, "room/incoming").routes();
 			b.iter(|| {
 				let snapshot = fuzz::snapshot(&table.producer, "room/incoming");
-				assert!(!watcher.is_synced());
+				assert!(!watcher.poll_synced(&kio::Waiter::noop()).is_ready());
 				drop(snapshot);
-				assert!(watcher.is_synced());
+				assert!(watcher.poll_synced(&kio::Waiter::noop()).is_ready());
 			});
 		});
 	}
@@ -78,8 +78,8 @@ fn bench_register(c: &mut Criterion) {
 			let incoming = scoped(&table.producer, "room/incoming");
 			let _held = fuzz::snapshot(&table.producer, "room/incoming");
 			b.iter(|| {
-				let watcher = incoming.announced();
-				assert!(!watcher.is_synced());
+				let watcher = incoming.routes();
+				assert!(!watcher.poll_synced(&kio::Waiter::noop()).is_ready());
 			});
 		});
 	}

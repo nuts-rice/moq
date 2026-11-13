@@ -10,9 +10,12 @@ use hang::catalog::{AudioCodec, VideoCodec};
 
 use super::{Export, Import};
 
-/// A millisecond track: the frames written here carry timestamps.
+/// A millisecond media track: the frames written here carry timestamps. It declares media's
+/// max age, so an exporter started after publishing still reads the superseded groups.
 fn timed() -> moq_net::track::Info {
-	moq_net::track::Info::default().with_timescale(moq_net::Timescale::MILLI)
+	moq_net::track::Info::default()
+		.with_timescale(moq_net::Timescale::MILLI)
+		.with_max_age(hang::container::MAX_AGE)
 }
 
 /// Open an FLV export on the hang catalog of `source`.
@@ -26,8 +29,8 @@ async fn open_export(source: crate::Source) -> Export<crate::catalog::Consumer> 
 
 /// A drift budget no test timeline comes close to, so the exporter reads every group.
 ///
-/// The media track's full retention window, so an exporter started after publishing
-/// can still read every retained group. These tests write or import a whole broadcast
+/// The media track's full max age, so an exporter started after publishing
+/// can still read every fresh group. These tests write or import a whole broadcast
 /// and only then export it, which the
 /// exporter's default [`Duration::ZERO`] collapses to the
 /// live edge: completeness has to be asked for, exactly as a real recorder does.
@@ -127,17 +130,17 @@ fn synth_flv() -> Vec<u8> {
 }
 
 /// Drive the exporter to completion, dropping an already-finished importer to signal EOS.
-async fn drain_export<S: crate::catalog::Stream>(mut exporter: Export<S>, importer: Import) -> Vec<u8> {
+async fn drain_export<S: crate::catalog::Stream>(mut exporter: Export<S>, importer: super::Finished) -> Vec<u8> {
 	let mut exported = Vec::new();
 	let mut importer = Some(importer);
 	for _ in 0..64 {
-		match tokio::time::timeout(Duration::from_millis(100), exporter.next()).await {
+		match kio::clock::timeout(Duration::from_millis(100), exporter.next()).await {
 			Ok(Ok(Some(chunk))) => exported.extend_from_slice(&chunk),
 			Ok(Ok(None)) => break,
 			Ok(Err(e)) => panic!("exporter error: {e}"),
 			Err(_) => {
 				if let Some(deadline) = exporter.next_deadline() {
-					tokio::time::advance(deadline.saturating_duration_since(moq_clock::now())).await;
+					tokio::time::advance(deadline.saturating_duration_since(kio::clock::now())).await;
 				} else {
 					importer = None; // No scheduled frames remain; close the broadcast.
 				}
@@ -156,7 +159,7 @@ async fn export_roundtrips_through_import() {
 
 	let mut importer = Import::new(producer, catalog.reserve());
 	importer.decode(&bytes::BytesMut::from(synth_flv().as_slice())).unwrap();
-	importer.finish().unwrap();
+	let importer = importer.finish().unwrap();
 	catalog.finish().unwrap();
 
 	let exporter = open_export(crate::source::announced(&consumer).await).await;
@@ -170,7 +173,7 @@ async fn export_roundtrips_through_import() {
 	let cat2 = crate::catalog::Producer::new(&mut bcast2, crate::catalog::Config::default()).unwrap();
 	let mut imp2 = Import::new(bcast2, cat2.reserve());
 	imp2.decode(&bytes::BytesMut::from(exported.as_slice())).unwrap();
-	imp2.finish().unwrap();
+	let _finished = imp2.finish().unwrap();
 
 	let snap = cat2.snapshot();
 	assert_eq!(snap.video.renditions.len(), 1);
@@ -194,12 +197,16 @@ async fn export_emits_sequence_headers_and_frames() {
 
 	let mut importer = Import::new(producer, catalog.reserve());
 	importer.decode(&bytes::BytesMut::from(synth_flv().as_slice())).unwrap();
-	importer.finish().unwrap();
+	let importer = importer.finish().unwrap();
 	catalog.finish().unwrap();
 
 	let exporter = open_export(crate::source::announced(&consumer).await)
 		.await
-		.with_delay(RECORDING_MAX_DELAY)
+		.with_delay(
+			moq_net::track::Delay::default()
+				.with_min(RECORDING_MAX_DELAY)
+				.with_max(RECORDING_MAX_DELAY),
+		)
 		.with_replay();
 	let exported = drain_export(exporter, importer).await;
 
@@ -277,7 +284,7 @@ async fn export_roundtrips_enhanced() {
 	importer
 		.decode(&bytes::BytesMut::from(synth_enhanced_flv().as_slice()))
 		.unwrap();
-	importer.finish().unwrap();
+	let importer = importer.finish().unwrap();
 	catalog.finish().unwrap();
 
 	let exporter = open_export(crate::source::announced(&consumer).await).await;
@@ -304,7 +311,7 @@ async fn export_roundtrips_enhanced() {
 	let cat2 = crate::catalog::Producer::new(&mut bcast2, crate::catalog::Config::default()).unwrap();
 	let mut imp2 = Import::new(bcast2, cat2.reserve());
 	imp2.decode(&bytes::BytesMut::from(exported.as_slice())).unwrap();
-	imp2.finish().unwrap();
+	let _finished = imp2.finish().unwrap();
 
 	let snap = cat2.snapshot();
 	assert!(matches!(
@@ -341,7 +348,7 @@ async fn export_roundtrips_mp3() {
 
 	let mut importer = Import::new(producer, catalog.reserve());
 	importer.decode(&bytes::BytesMut::from(flv.as_slice())).unwrap();
-	importer.finish().unwrap();
+	let importer = importer.finish().unwrap();
 	catalog.finish().unwrap();
 
 	let exporter = open_export(crate::source::announced(&consumer).await).await;
@@ -360,7 +367,7 @@ async fn export_roundtrips_mp3() {
 	let cat2 = crate::catalog::Producer::new(&mut bcast2, crate::catalog::Config::default()).unwrap();
 	let mut imp2 = Import::new(bcast2, cat2.reserve());
 	imp2.decode(&bytes::BytesMut::from(exported.as_slice())).unwrap();
-	imp2.finish().unwrap();
+	let _finished = imp2.finish().unwrap();
 
 	let snap = cat2.snapshot();
 	let a = snap.audio.renditions.values().next().unwrap();
@@ -395,7 +402,7 @@ async fn export_roundtrips_av1() {
 	importer
 		.decode(&bytes::BytesMut::from(synth_av1_flv().as_slice()))
 		.unwrap();
-	importer.finish().unwrap();
+	let importer = importer.finish().unwrap();
 	catalog.finish().unwrap();
 
 	let exporter = open_export(crate::source::announced(&consumer).await).await;
@@ -421,7 +428,7 @@ async fn export_roundtrips_av1() {
 	let cat2 = crate::catalog::Producer::new(&mut bcast2, crate::catalog::Config::default()).unwrap();
 	let mut imp2 = Import::new(bcast2, cat2.reserve());
 	imp2.decode(&bytes::BytesMut::from(exported.as_slice())).unwrap();
-	imp2.finish().unwrap();
+	let _finished = imp2.finish().unwrap();
 
 	let snap = cat2.snapshot();
 	assert!(matches!(
@@ -451,7 +458,7 @@ async fn export_roundtrips_ac3() {
 			synth_enhanced_audio_flv(b"ac-3", &AC3_FRAME).as_slice(),
 		))
 		.unwrap();
-	importer.finish().unwrap();
+	let importer = importer.finish().unwrap();
 	catalog.finish().unwrap();
 
 	let exporter = open_export(crate::source::announced(&consumer).await).await;
@@ -467,7 +474,7 @@ async fn export_roundtrips_ac3() {
 	let cat2 = crate::catalog::Producer::new(&mut bcast2, crate::catalog::Config::default()).unwrap();
 	let mut imp2 = Import::new(bcast2, cat2.reserve());
 	imp2.decode(&bytes::BytesMut::from(exported.as_slice())).unwrap();
-	imp2.finish().unwrap();
+	let _finished = imp2.finish().unwrap();
 	assert!(matches!(
 		cat2.snapshot().audio.renditions.values().next().unwrap().codec,
 		AudioCodec::Ac3
@@ -486,7 +493,7 @@ async fn export_roundtrips_eac3() {
 			synth_enhanced_audio_flv(b"ec-3", &EAC3_FRAME).as_slice(),
 		))
 		.unwrap();
-	importer.finish().unwrap();
+	let importer = importer.finish().unwrap();
 	catalog.finish().unwrap();
 
 	let exporter = open_export(crate::source::announced(&consumer).await).await;
@@ -502,7 +509,7 @@ async fn export_roundtrips_eac3() {
 	let cat2 = crate::catalog::Producer::new(&mut bcast2, crate::catalog::Config::default()).unwrap();
 	let mut imp2 = Import::new(bcast2, cat2.reserve());
 	imp2.decode(&bytes::BytesMut::from(exported.as_slice())).unwrap();
-	imp2.finish().unwrap();
+	let _finished = imp2.finish().unwrap();
 	assert!(matches!(
 		cat2.snapshot().audio.renditions.values().next().unwrap().codec,
 		AudioCodec::Ec3
@@ -524,7 +531,7 @@ fn avcc_level(level: u8) -> Vec<u8> {
 type Keepalive = (
 	moq_net::broadcast::Producer,
 	crate::catalog::Producer,
-	Vec<crate::container::Producer<crate::catalog::hang::Container>>,
+	Vec<crate::container::Finished<crate::catalog::hang::Container>>,
 );
 
 /// Build a broadcast with two H.264 video renditions plus one AAC audio rendition,
@@ -577,7 +584,7 @@ fn build_multitrack_broadcast() -> (moq_net::broadcast::Consumer, Vec<Vec<u8>>, 
 				keyframe: true,
 			})
 			.unwrap();
-		video.finish().unwrap();
+		let video = video.finish().unwrap();
 		tracks.push(video);
 	}
 
@@ -603,7 +610,7 @@ fn build_multitrack_broadcast() -> (moq_net::broadcast::Consumer, Vec<Vec<u8>>, 
 			keyframe: true,
 		})
 		.unwrap();
-	audio.finish().unwrap();
+	let audio = audio.finish().unwrap();
 	tracks.push(audio);
 	catalog.finish().unwrap();
 
@@ -618,7 +625,7 @@ async fn drain_to_end<S: crate::catalog::Stream>(mut exporter: Export<S>, keepal
 	let mut exported = Vec::new();
 	let mut keepalive = Some(keepalive);
 	for _ in 0..64 {
-		match tokio::time::timeout(Duration::from_millis(100), exporter.next()).await {
+		match kio::clock::timeout(Duration::from_millis(100), exporter.next()).await {
 			Ok(Ok(Some(chunk))) => exported.extend_from_slice(&chunk),
 			Ok(Ok(None)) => break,
 			Ok(Err(e)) => panic!("exporter error: {e}"),
@@ -665,7 +672,7 @@ async fn export_multitrack_roundtrips_all_renditions() {
 	let cat2 = crate::catalog::Producer::new(&mut bcast2, crate::catalog::Config::default()).unwrap();
 	let mut imp2 = Import::new(bcast2, cat2.reserve());
 	imp2.decode(&bytes::BytesMut::from(exported.as_slice())).unwrap();
-	imp2.finish().unwrap();
+	let _finished = imp2.finish().unwrap();
 
 	let snap = cat2.snapshot();
 	assert_eq!(
@@ -709,7 +716,7 @@ async fn export_without_multitrack_keeps_best_rendition() {
 	let cat2 = crate::catalog::Producer::new(&mut bcast2, crate::catalog::Config::default()).unwrap();
 	let mut imp2 = Import::new(bcast2, cat2.reserve());
 	imp2.decode(&bytes::BytesMut::from(exported.as_slice())).unwrap();
-	imp2.finish().unwrap();
+	let _finished = imp2.finish().unwrap();
 
 	let snap = cat2.snapshot();
 	let renditions: Vec<_> = snap.video.renditions.values().collect();
@@ -763,7 +770,7 @@ async fn export_without_multitrack_keeps_best_audio_rendition() {
 					keyframe: true,
 				})
 				.unwrap();
-			audio.finish().unwrap();
+			let audio = audio.finish().unwrap();
 			tracks.push(audio);
 		};
 
@@ -794,7 +801,7 @@ async fn export_without_multitrack_keeps_best_audio_rendition() {
 	let cat2 = crate::catalog::Producer::new(&mut bcast2, crate::catalog::Config::default()).unwrap();
 	let mut imp2 = Import::new(bcast2, cat2.reserve());
 	imp2.decode(&bytes::BytesMut::from(exported.as_slice())).unwrap();
-	imp2.finish().unwrap();
+	let _finished = imp2.finish().unwrap();
 
 	let snap = cat2.snapshot();
 	assert_eq!(
@@ -850,7 +857,7 @@ async fn export_picks_the_best_selected_rendition() {
 	let cat2 = crate::catalog::Producer::new(&mut bcast2, crate::catalog::Config::default()).unwrap();
 	let mut imp2 = Import::new(bcast2, cat2.reserve());
 	imp2.decode(&bytes::BytesMut::from(exported.as_slice())).unwrap();
-	imp2.finish().unwrap();
+	let _finished = imp2.finish().unwrap();
 
 	let snap = cat2.snapshot();
 	let renditions: Vec<_> = snap.video.renditions.values().collect();
@@ -897,7 +904,7 @@ async fn export_rebinds_to_a_better_rendition_before_the_header() {
 
 	let mut exporter = open_export(crate::source::announced(&consumer).await).await;
 	assert!(
-		tokio::time::timeout(Duration::from_millis(100), exporter.next())
+		kio::clock::timeout(Duration::from_millis(100), exporter.next())
 			.await
 			.is_err(),
 		"the header waits on the small rendition's config"
@@ -935,7 +942,7 @@ async fn export_rebinds_to_a_better_rendition_before_the_header() {
 		})
 		.unwrap();
 
-	let header = tokio::time::timeout(Duration::from_millis(100), exporter.next())
+	let header = kio::clock::timeout(Duration::from_millis(100), exporter.next())
 		.await
 		.expect("the header follows the better rendition")
 		.unwrap()
@@ -945,7 +952,7 @@ async fn export_rebinds_to_a_better_rendition_before_the_header() {
 		"the sequence header carries the better rendition's avcC"
 	);
 
-	let frame = tokio::time::timeout(Duration::from_millis(100), exporter.next())
+	let frame = kio::clock::timeout(Duration::from_millis(100), exporter.next())
 		.await
 		.expect("the better rendition's frame follows")
 		.unwrap()
@@ -1019,7 +1026,7 @@ async fn export_unbinds_a_rendition_disabled_before_the_header() {
 
 	let mut exporter = open_export(crate::source::announced(&consumer).await).await;
 	assert!(
-		tokio::time::timeout(Duration::from_millis(100), exporter.next())
+		kio::clock::timeout(Duration::from_millis(100), exporter.next())
 			.await
 			.is_err(),
 		"the header waits on the small rendition's config"
@@ -1036,14 +1043,14 @@ async fn export_unbinds_a_rendition_disabled_before_the_header() {
 		.unwrap()
 		.enabled = false;
 	assert!(
-		tokio::time::timeout(Duration::from_millis(100), exporter.next())
+		kio::clock::timeout(Duration::from_millis(100), exporter.next())
 			.await
 			.is_err(),
 		"nothing enabled"
 	);
 	small.write(crate::container::test_util::video_frame(0, true)).unwrap();
 	assert!(
-		tokio::time::timeout(Duration::from_millis(100), exporter.next())
+		kio::clock::timeout(Duration::from_millis(100), exporter.next())
 			.await
 			.is_err(),
 		"the disabled rendition's keyframe writes no header"
@@ -1065,7 +1072,7 @@ async fn export_unbinds_a_rendition_disabled_before_the_header() {
 			keyframe: true,
 		})
 		.unwrap();
-	let header = tokio::time::timeout(Duration::from_millis(100), exporter.next())
+	let header = kio::clock::timeout(Duration::from_millis(100), exporter.next())
 		.await
 		.expect("the header follows the enabled rendition")
 		.unwrap()
@@ -1143,7 +1150,7 @@ async fn export_rebinds_to_a_better_audio_rendition_before_the_header() {
 
 	let mut exporter = open_export(crate::source::announced(&consumer).await).await;
 	assert!(
-		tokio::time::timeout(Duration::from_millis(100), exporter.next())
+		kio::clock::timeout(Duration::from_millis(100), exporter.next())
 			.await
 			.is_err(),
 		"the header waits on the video config"
@@ -1174,7 +1181,7 @@ async fn export_rebinds_to_a_better_audio_rendition_before_the_header() {
 		crate::catalog::hang::Container::Legacy(crate::container::Kind::Data),
 	);
 
-	let header = tokio::time::timeout(Duration::from_millis(100), exporter.next())
+	let header = kio::clock::timeout(Duration::from_millis(100), exporter.next())
 		.await
 		.expect("the header resolves")
 		.unwrap()
@@ -1228,7 +1235,7 @@ async fn export_preserves_timestamps() {
 
 	let mut importer = Import::new(producer, catalog.reserve());
 	importer.decode(&bytes::BytesMut::from(synth_flv().as_slice())).unwrap();
-	importer.finish().unwrap();
+	let importer = importer.finish().unwrap();
 	catalog.finish().unwrap();
 
 	let exporter = open_export(crate::source::announced(&consumer).await).await;
@@ -1295,7 +1302,7 @@ async fn export_authors_dts_and_composition_time_for_reordered_avc() {
 	video.write(video_frame(80, &[0, 0, 0, 1, 0x41], false)).unwrap();
 	video.write(video_frame(40, &[0, 0, 0, 1, 0x01], false)).unwrap();
 	video.write(video_frame(120, &[0, 0, 0, 1, 0x41], false)).unwrap();
-	video.finish().unwrap();
+	let _finished = video.finish().unwrap();
 
 	let mut audio = crate::container::Producer::new(
 		audio_track,
@@ -1309,7 +1316,7 @@ async fn export_authors_dts_and_composition_time_for_reordered_avc() {
 			keyframe: true,
 		})
 		.unwrap();
-	audio.finish().unwrap();
+	let _finished = audio.finish().unwrap();
 	catalog.finish().unwrap();
 
 	let exporter = open_export(crate::source::announced(&consumer).await).await;
@@ -1342,21 +1349,289 @@ async fn export_authors_dts_and_composition_time_for_reordered_avc() {
 	);
 }
 
+/// The `(DTS, PTS)` of every AVC frame tag, and the audio tag timestamps, an export renders of
+/// a broadcast that declares `reorder` and carries a group of `stamps` (ms, decode order) for
+/// each entry, plus one audio frame at 20 ms. With `open`, the last group is cut but the video
+/// track stays open.
+async fn export_declared(reorder: u8, groups: &[&[u64]], open: bool) -> anyhow::Result<(Vec<(u32, i64)>, Vec<u32>)> {
+	use hang::catalog::{AAC, AudioConfig, Container, H264, VideoConfig};
+	use moq_net::Timestamp;
+
+	let mut producer = moq_net::broadcast::Info::new().produce();
+	let consumer = producer.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut producer, crate::catalog::Config::default()).unwrap();
+	let video_track = producer.create_track(producer.unique_name(".avc1"), timed()).unwrap();
+	let audio_track = producer.create_track(producer.unique_name(".aac"), timed()).unwrap();
+	let mut video_config = VideoConfig::new(H264 {
+		profile: 0x42,
+		constraints: 0xc0,
+		level: 0x1f,
+		inline: false,
+	});
+	video_config.container = Container::Legacy;
+	video_config.description = Some(Bytes::from(avcc()));
+	video_config.reorder = Some(reorder);
+	let mut audio_config = AudioConfig::new(AAC { profile: 2 }, 44100, 2);
+	audio_config.container = Container::Legacy;
+	audio_config.description = Some(Bytes::from_static(&ASC));
+	{
+		let mut catalog = catalog.modify().unwrap();
+		catalog
+			.video
+			.renditions
+			.insert(video_track.name().to_string(), video_config);
+		catalog
+			.audio
+			.renditions
+			.insert(audio_track.name().to_string(), audio_config);
+	}
+	let frame = |ms: u64, payload: &'static [u8], keyframe| crate::container::Frame {
+		timestamp: Timestamp::from_millis(ms).unwrap(),
+		duration: None,
+		payload: Bytes::from_static(payload),
+		keyframe,
+	};
+	let mut video = crate::container::Producer::new(
+		video_track,
+		crate::catalog::hang::Container::Legacy(crate::container::Kind::Data),
+	);
+	for stamps in groups {
+		for (index, &ms) in stamps.iter().enumerate() {
+			let payload: &'static [u8] = if index == 0 {
+				&[0, 0, 0, 1, 0x65]
+			} else {
+				&[0, 0, 0, 1, 0x41]
+			};
+			video.write(frame(ms, payload, index == 0)).unwrap();
+		}
+	}
+	match open {
+		true => video.cut(None).unwrap(),
+		false => video.end_with(None).unwrap(),
+	}
+	let mut audio = crate::container::Producer::new(
+		audio_track,
+		crate::catalog::hang::Container::Legacy(crate::container::Kind::Data),
+	);
+	audio.write(frame(20, &[0xde, 0xad], true)).unwrap();
+	let _finished = audio.finish().unwrap();
+	catalog.finish().unwrap();
+
+	let mut exporter = open_export(crate::source::announced(&consumer).await)
+		.await
+		.with_delay(
+			moq_net::track::Delay::default()
+				.with_min(RECORDING_MAX_DELAY)
+				.with_max(RECORDING_MAX_DELAY),
+		)
+		.with_replay();
+	let mut exported = Vec::new();
+	if let Some(Err(err)) = drain_until_idle(&mut exporter, &mut exported).await {
+		return Err(err.into());
+	}
+	drop(video);
+	let tags = parse_tags(&exported);
+	let video = tags
+		.iter()
+		.filter(|tag| tag.tag_type == super::TAG_VIDEO && tag.body[1] == super::AVC_NALU)
+		.map(|tag| {
+			let pts = i64::from(tag.timestamp) + i64::from(super::read_i24(&tag.body[2..5]));
+			(tag.timestamp, pts)
+		})
+		.collect();
+	let audio = tags
+		.iter()
+		.filter(|tag| tag.tag_type == super::TAG_AUDIO && tag.body[1] == super::AAC_RAW)
+		.map(|tag| tag.timestamp)
+		.collect();
+	Ok((video, audio))
+}
+
+/// A rendition that declares its reorder depth decodes each group from that group's frames: its
+/// first frames a millisecond apart below its earliest presentation, and the rest at its
+/// presentation slots. The whole stream shifts by the depth, so those fit FLV's unsigned clock.
+#[tokio::test(start_paused = true)]
+async fn export_declared_reorder_decodes_each_group_from_its_frames() {
+	let groups: [&[u64]; 2] = [&[0, 160, 80, 40, 120], &[400, 560, 480, 440, 520]];
+	let (video, audio) = export_declared(2, &groups, false).await.unwrap();
+	assert_eq!(
+		video,
+		[
+			(0, 2),
+			(1, 162),
+			(2, 82),
+			(42, 42),
+			(82, 122),
+			(400, 402),
+			(401, 562),
+			(402, 482),
+			(442, 442),
+			(482, 522)
+		]
+	);
+	assert_eq!(audio, [22]);
+
+	// A first group cut short leaves the next decoding where it would have.
+	let cut: [&[u64]; 2] = [&[0, 160, 80], &[400, 560, 480, 440, 520]];
+	let (cut, _) = export_declared(2, &cut, false).await.unwrap();
+	assert_eq!(cut[3..], video[5..]);
+
+	// A depth of zero decodes at presentation, and refuses a frame that reorders.
+	let (video, _) = export_declared(0, &[&[0, 40, 80]], false).await.unwrap();
+	assert_eq!(video, [(0, 0), (40, 40), (80, 80)]);
+	let err = export_declared(0, &[&[0, 80, 40]], false).await.unwrap_err();
+	assert!(err.to_string().contains("declared depth"), "{err}");
+
+	// A group that ends goes out whole while the track stays open, though fewer frames than the
+	// depth settle nothing.
+	let (video, _) = export_declared(2, &[&[0, 80]], true).await.unwrap();
+	assert_eq!(video, [(0, 2), (1, 82)]);
+}
+
+/// A depth the catalog declares only after the header raises the shift for the groups it clocks,
+/// rather than put their first DTS before zero.
+#[tokio::test(start_paused = true)]
+async fn a_reorder_declared_after_the_header_raises_the_shift() {
+	use hang::catalog::{Container, H264, VideoConfig};
+	use moq_net::Timestamp;
+
+	let mut producer = moq_net::broadcast::Info::new().produce();
+	let consumer = producer.consume();
+	let mut catalog = crate::catalog::Producer::new(&mut producer, crate::catalog::Config::default()).unwrap();
+	let video_track = producer.create_track(producer.unique_name(".avc1"), timed()).unwrap();
+	let name = video_track.name().to_string();
+	let mut config = VideoConfig::new(H264 {
+		profile: 0x42,
+		constraints: 0xc0,
+		level: 0x1f,
+		inline: false,
+	});
+	config.container = Container::Legacy;
+	config.description = Some(Bytes::from(avcc()));
+	catalog.modify().unwrap().video.renditions.insert(name.clone(), config);
+	let frame = |ms: u64, keyframe| crate::container::Frame {
+		timestamp: Timestamp::from_millis(ms).unwrap(),
+		duration: None,
+		payload: Bytes::from_static(if keyframe {
+			&[0, 0, 0, 1, 0x65]
+		} else {
+			&[0, 0, 0, 1, 0x41]
+		}),
+		keyframe,
+	};
+	let mut video = crate::container::Producer::new(
+		video_track,
+		crate::catalog::hang::Container::Legacy(crate::container::Kind::Data),
+	);
+	video.write(frame(0, true)).unwrap();
+
+	let mut exporter = open_export(crate::source::announced(&consumer).await)
+		.await
+		.with_delay(
+			moq_net::track::Delay::default()
+				.with_min(RECORDING_MAX_DELAY)
+				.with_max(RECORDING_MAX_DELAY),
+		)
+		.with_replay();
+	let mut exported = exporter.next().await.unwrap().expect("the header").to_vec();
+
+	catalog
+		.modify()
+		.unwrap()
+		.video
+		.renditions
+		.get_mut(&name)
+		.unwrap()
+		.reorder = Some(2);
+	for (ms, keyframe) in [(1, true), (5, false), (3, false)] {
+		video.write(frame(ms, keyframe)).unwrap();
+	}
+	let _finished = video.finish().unwrap();
+	catalog.finish().unwrap();
+	drain_until_idle(&mut exporter, &mut exported).await.unwrap().unwrap();
+
+	let video: Vec<_> = parse_tags(&exported)
+		.iter()
+		.filter(|tag| tag.tag_type == super::TAG_VIDEO && tag.body[1] == super::AVC_NALU)
+		.map(|tag| {
+			let pts = i64::from(tag.timestamp) + i64::from(super::read_i24(&tag.body[2..5]));
+			(tag.timestamp, pts)
+		})
+		.collect();
+	assert_eq!(video, [(0, 2), (1, 3), (2, 7), (3, 5)]);
+}
+
 /// Poll `exporter` into `out` until it ends or goes idle; `None` if it went idle.
 async fn drain_until_idle<S: crate::catalog::Stream>(
 	exporter: &mut Export<S>,
 	out: &mut Vec<u8>,
-) -> Option<anyhow::Result<()>> {
+) -> Option<crate::Result<()>> {
 	loop {
-		match tokio::time::timeout(Duration::from_millis(100), exporter.next()).await {
+		match kio::clock::timeout(Duration::from_millis(100), exporter.next()).await {
 			Ok(Ok(Some(chunk))) => out.extend_from_slice(&chunk),
 			Ok(Ok(None)) => return Some(Ok(())),
 			Ok(Err(e)) => return Some(Err(e)),
 			Err(_) => {
 				let deadline = exporter.next_deadline()?;
-				tokio::time::advance(deadline.saturating_duration_since(moq_clock::now())).await;
+				tokio::time::advance(deadline.saturating_duration_since(kio::clock::now())).await;
 			}
 		}
+	}
+}
+
+/// A rendition the catalog moves to another track, in its broadcast or a sibling one, goes on
+/// as the same FLV video with that track's media and none of the one it left. A new track
+/// described by another SPS is announced by a new sequence-header tag ahead of its first frame.
+#[tokio::test(start_paused = true)]
+async fn a_moved_rendition_continues_on_its_new_track() {
+	use crate::container::test_util::{Moving, SPS, marked_frame, marks};
+
+	for (track, broadcast, sps) in [("b", None, Moving::MAIN_SPS), ("a", Some("other"), SPS)] {
+		let mut moving = Moving::new();
+		let mut exporter = Export::new(moving.source().await, moving.catalog_stream().await);
+		let mut out = Vec::new();
+		for i in 0..45 {
+			moving.a.write(marked_frame(i, 0xa1)).unwrap();
+			assert!(drain_until_idle(&mut exporter, &mut out).await.is_none());
+		}
+
+		moving.point(track, broadcast, sps);
+		assert!(drain_until_idle(&mut exporter, &mut out).await.is_none());
+		let next = match broadcast {
+			None => &mut moving.b,
+			Some(_) => &mut moving.other,
+		};
+		for i in 45..120 {
+			moving.a.write(marked_frame(i, 0xa2)).unwrap();
+			if i >= 60 {
+				next.write(marked_frame(i, 0xb1)).unwrap();
+			}
+			assert!(drain_until_idle(&mut exporter, &mut out).await.is_none());
+		}
+
+		let expected: Vec<u8> = [vec![0xa1; 45], vec![0xb1; 60]].concat();
+		assert_eq!(marks(&out), expected, "moved to {track} in {broadcast:?}");
+		// Each sequence header's record, and the mark of the frame after it.
+		let tags = parse_tags(&out);
+		let headers: Vec<(bool, Option<u8>)> = tags
+			.iter()
+			.enumerate()
+			.filter(|(_, tag)| tag.tag_type == 9 && tag.body[1] == 0)
+			.map(|(index, tag)| {
+				let main = tag.body.windows(4).any(|w| w == &Moving::MAIN_SPS[..4]);
+				(
+					main,
+					tags.get(index + 1).and_then(|tag| marks(&tag.body).first().copied()),
+				)
+			})
+			.collect();
+		let mut announced = vec![(false, Some(0xa1))];
+		if sps == Moving::MAIN_SPS {
+			announced.push((true, Some(0xb1)));
+		}
+		assert_eq!(headers, announced, "moved to {track} in {broadcast:?}");
+		let timestamps: Vec<u32> = tags.iter().map(|tag| tag.timestamp).collect();
+		assert!(timestamps.is_sorted(), "{timestamps:?}");
 	}
 }
 
@@ -1409,7 +1684,11 @@ async fn a_track_leaving_the_catalog_is_read_to_its_end() {
 
 	let mut exporter = open_export(crate::source::announced(&consumer).await)
 		.await
-		.with_delay(RECORDING_MAX_DELAY)
+		.with_delay(
+			moq_net::track::Delay::default()
+				.with_min(RECORDING_MAX_DELAY)
+				.with_max(RECORDING_MAX_DELAY),
+		)
 		.with_replay();
 	let mut exported = Vec::new();
 	// Consume the header and the two initial frames without advancing past
@@ -1421,9 +1700,9 @@ async fn a_track_leaving_the_catalog_is_read_to_its_end() {
 	// The audio rendition retires before its tail lands; the video carries on.
 	catalog.modify().unwrap().audio.renditions.remove(&audio_name);
 	audio.write(frame(23, &[0xbe, 0xef], true)).unwrap();
-	audio.finish().unwrap();
+	let _finished = audio.finish().unwrap();
 	video.write(frame(33, &[0, 0, 0, 1, 0x41], false)).unwrap();
-	video.finish().unwrap();
+	let _finished = video.finish().unwrap();
 	catalog.finish().unwrap();
 
 	let end = drain_until_idle(&mut exporter, &mut exported).await;
@@ -1442,7 +1721,7 @@ async fn a_track_leaving_the_catalog_is_read_to_its_end() {
 async fn drain_exporter_chunks<S: crate::catalog::Stream>(mut exporter: Export<S>, chunks: usize) -> Vec<u8> {
 	let mut exported = Vec::new();
 	for _ in 0..chunks {
-		match tokio::time::timeout(Duration::from_millis(100), exporter.next()).await {
+		match kio::clock::timeout(Duration::from_millis(100), exporter.next()).await {
 			Ok(Ok(Some(chunk))) => exported.extend_from_slice(&chunk),
 			Ok(Ok(None)) => panic!("exporter ended early"),
 			Ok(Err(e)) => panic!("exporter error: {e}"),
@@ -1460,12 +1739,15 @@ async fn configured_delay_holds_live_frames() {
 	let mut config = AudioConfig::new(AAC { profile: 2 }, 44100, 2);
 	config.description = Some(Bytes::from_static(&[0x12, 0x10]));
 	let mut live = Live::audio(config);
-	let mut export = super::Export::new(live.source().await, live.catalog_stream().await)
-		.with_delay(std::time::Duration::from_millis(100));
+	let mut export = super::Export::new(live.source().await, live.catalog_stream().await).with_delay(
+		moq_net::track::Delay::default()
+			.with_min(std::time::Duration::from_millis(100))
+			.with_max(std::time::Duration::from_millis(100)),
+	);
 	assert!(export.next().await.unwrap().is_some(), "container header");
 	live.track.write(raw_frame(0, &[0xde, 0xad], true)).unwrap();
 	assert!(
-		tokio::time::timeout(std::time::Duration::from_millis(1), export.next())
+		kio::clock::timeout(std::time::Duration::from_millis(1), export.next())
 			.await
 			.is_err(),
 		"the release delay must hold a live frame instead of emitting on arrival"
@@ -1481,9 +1763,10 @@ async fn delay_drops_late_frames_and_drains_the_final_frame() {
 	config.description = Some(Bytes::from_static(&[0x12, 0x10]));
 	let mut live = Live::audio(config);
 	let delay = std::time::Duration::from_millis(100);
-	let mut export = super::Export::new(live.source().await, live.catalog_stream().await).with_delay(delay);
+	let mut export = super::Export::new(live.source().await, live.catalog_stream().await)
+		.with_delay(moq_net::track::Delay::default().with_min(delay).with_max(delay));
 	export.next().await.unwrap().unwrap();
-	let start = moq_clock::now();
+	let start = kio::clock::now();
 	live.track.write(raw_frame(0, b"first", true)).unwrap();
 	let first = export.next().await.unwrap().unwrap();
 	assert!(first.windows(5).any(|part| part == b"first"));
@@ -1493,13 +1776,14 @@ async fn delay_drops_late_frames_and_drains_the_final_frame() {
 	tokio::time::advance(std::time::Duration::from_millis(200)).await;
 	assert!(export.poll_next(&kio::Waiter::noop()).is_pending());
 	live.track.write(raw_frame(20_000, b"expired", true)).unwrap();
-	live.track.write(raw_frame(400_000, b"final", true)).unwrap();
-	live.track.finish().unwrap();
+	// Sent a delay ahead: any further would be a step in its timeline, which re-acquires.
+	live.track.write(raw_frame(300_000, b"final", true)).unwrap();
+	live.track.end_with(None).unwrap();
 	live.catalog.finish().unwrap();
 	let final_frame = export.next().await.unwrap().unwrap();
 	assert!(final_frame.windows(5).any(|part| part == b"final"));
 	assert!(!final_frame.windows(7).any(|part| part == b"expired"));
-	assert!(start.elapsed() >= std::time::Duration::from_millis(500));
+	assert!(start.elapsed() >= std::time::Duration::from_millis(400));
 	assert!(export.next().await.unwrap().is_none());
 }
 
@@ -1516,7 +1800,11 @@ async fn decode_order_is_independent_of_cross_track_arrival_order() {
 			catalog.modify().unwrap().audio.renditions.insert(name, config);
 		});
 		let mut export = super::Export::new(live.source().await, live.catalog_stream().await)
-			.with_delay(std::time::Duration::from_millis(100))
+			.with_delay(
+				moq_net::track::Delay::default()
+					.with_min(std::time::Duration::from_millis(100))
+					.with_max(std::time::Duration::from_millis(100)),
+			)
 			.with_multitrack(true);
 		export.next().await.unwrap().unwrap();
 		live.track.write(raw_frame(0, b"initial-a", true)).unwrap();
@@ -1552,7 +1840,8 @@ async fn a_backlog_stays_in_the_source_until_due() {
 		let mut config = AudioConfig::new(AAC { profile: 2 }, 44100, 2);
 		config.description = Some(Bytes::from_static(&[0x12, 0x10]));
 		let mut live = Live::audio(config);
-		let mut export = super::Export::new(live.source().await, live.catalog_stream().await).with_delay(delay);
+		let mut export = super::Export::new(live.source().await, live.catalog_stream().await)
+			.with_delay(moq_net::track::Delay::default().with_min(delay).with_max(delay));
 		export.next().await.unwrap().unwrap();
 		live.track.write(raw_frame(0, b"first", true)).unwrap();
 		export.next().await.unwrap().unwrap();
@@ -1588,7 +1877,8 @@ async fn a_retained_group_trims_to_the_delay() {
 		tokio::time::advance(std::time::Duration::from_millis(20)).await;
 	}
 	let delay = std::time::Duration::from_millis(100);
-	let mut export = super::Export::new(live.source().await, live.catalog_stream().await).with_delay(delay);
+	let mut export = super::Export::new(live.source().await, live.catalog_stream().await)
+		.with_delay(moq_net::track::Delay::default().with_min(delay).with_max(delay));
 	export.next().await.unwrap().unwrap();
 	export.next().await.unwrap().unwrap();
 	// What is left spans no more than the delay: five 20 ms frames.

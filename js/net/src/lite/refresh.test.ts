@@ -1,5 +1,5 @@
 import { expect, spyOn, test } from "bun:test";
-import { Manual, Nano } from "@moq/clock";
+import { Duration, Manual } from "@moq/clock";
 import { accept } from "../connection/accept.ts";
 import { connect } from "../connection/connect.ts";
 import { createMockTransportPair } from "../mock.ts";
@@ -10,15 +10,15 @@ import { ALPN_06, ALPN_07_WIP } from "./version.ts";
 
 test.each([ALPN_06, ALPN_07_WIP])("refresh joins reach a browser publisher on %s", async (alpn) => {
 	const clock = new Manual();
-	const restore = clock.install();
+	const installed = clock.install();
 	const source = new Producer();
 	const b = new Producer();
-	const broadcast = source.createBroadcast(Path.from("room"));
-	broadcast.announce();
+	const broadcastRoute = source.route(Path.from("room"));
+	const broadcast = broadcastRoute.broadcast;
 	const producer = broadcast.createTrack("data", { refresh: 1 });
 	const pair = createMockTransportPair(alpn);
 	const url = new URL("https://localhost/refresh");
-	const updates: number[] = [];
+	const updates: bigint[] = [];
 	const encode = SubscribeUpdate.prototype.encode;
 	const spy = spyOn(SubscribeUpdate.prototype, "encode").mockImplementation(function (
 		this: SubscribeUpdate,
@@ -36,14 +36,14 @@ test.each([ALPN_06, ALPN_07_WIP])("refresh joins reach a browser publisher on %s
 				accept({ url, transport: pair.server, publish: source.consume() }),
 			])),
 		);
-		const announcements = b.announced();
+		const announcements = b.routes();
 		while ((await announcements.next())?.kind !== "start") {}
 		const request = b.request(Path.from("room"));
 		while (request.active.peek() === undefined) await request.active.changed();
 		const active = request.active.peek();
 		if (!active) throw new Error("broadcast missing");
 		const remote = active.track("data");
-		expect((await remote.info()).refresh).toBe(alpn === ALPN_07_WIP ? 1 : undefined);
+		expect((await remote.info()).refresh).toBe(alpn === ALPN_07_WIP ? 1 : null);
 		const baseline = remote.subscribe();
 		const group = producer.appendGroup();
 		group.writeFrame({ payload: new Uint8Array(3) });
@@ -53,32 +53,32 @@ test.each([ALPN_06, ALPN_07_WIP])("refresh joins reach a browser publisher on %s
 		expect((await received.readFrame())?.payload.length).toBe(3);
 		expect((await received.readFrame())?.payload.length).toBe(3);
 		const joins = [remote.subscribe()];
-		await clock.advance(Nano(0));
-		expect(producer.demand().wanted.peek()).toBe(0);
+		await clock.advance(Duration.nanos(0));
+		expect(producer.demand().wanted.peek()).toBe(0n);
 		updates.length = 0;
 		group.writeFrame({ payload: new Uint8Array(1) });
 		expect((await received.readFrame())?.payload.length).toBe(1);
 		for (let i = 0; i < 8; i++) joins.push(remote.subscribe());
-		await clock.advance(Nano(0));
+		await clock.advance(Duration.nanos(0));
 		if (alpn === ALPN_07_WIP) {
-			while (producer.demand().wanted.peek() !== 1) await producer.demand().wanted.changed();
+			while (producer.demand().wanted.peek() !== 1n) await producer.demand().wanted.changed();
 		}
-		expect(producer.demand().wanted.peek()).toBe(alpn === ALPN_07_WIP ? 1 : 0);
+		expect(producer.demand().wanted.peek()).toBe(alpn === ALPN_07_WIP ? 1n : 0n);
 		// Concurrent local joins coalesce into one upstream update.
-		expect(updates).toEqual(alpn === ALPN_07_WIP ? [1] : []);
+		expect(updates).toEqual(alpn === ALPN_07_WIP ? [1n] : []);
 		// A parameter change restates the wanted group rather than clearing it.
 		joins.push(remote.subscribe({ priority: 9 }));
-		await clock.advance(Nano(0));
-		expect(updates).toEqual(alpn === ALPN_07_WIP ? [1, 1] : []);
+		await clock.advance(Duration.nanos(0));
+		expect(updates).toEqual(alpn === ALPN_07_WIP ? [1n, 1n] : []);
 		for (const join of joins) join.close();
 		received.close();
 		baseline.close();
-		group.close();
+		group.finish();
 	} finally {
 		spy.mockRestore();
 		for (const origin of [b, source]) origin.close();
 		for (const peer of peers) peer.abort();
-		await clock.advance(Nano(0));
-		restore();
+		await clock.advance(Duration.nanos(0));
+		installed.close();
 	}
 });

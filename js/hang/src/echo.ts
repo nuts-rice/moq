@@ -5,9 +5,9 @@
  */
 
 import type { Path } from "@moq/net";
-import * as z from "@zod/mini";
+import * as z from "zod/mini";
 import { u53Schema } from "./catalog/integers";
-import { measurementSchema } from "./snapshot";
+import { renditions } from "./catalog/section";
 import { TransportSchema } from "./stats";
 
 /** The newest received media timestamp paired with its arrival wall time. */
@@ -45,8 +45,6 @@ export const RenditionSchema = z.object({
 			z.transform((value) => value ?? undefined),
 		),
 	),
-	// Latest playout latency in milliseconds; absent when unavailable.
-	latency: measurementSchema,
 });
 /** One rendition's delivery counters and latest playout measurements. */
 export type Rendition = z.infer<typeof RenditionSchema>;
@@ -55,10 +53,12 @@ export const SnapshotSchema = z.looseObject({
 	// Connection measurements; unavailable fields remain absent.
 	transport: z.optional(TransportSchema),
 	// Empty entries retain a rendition ID whose counters are all zero.
-	renditions: z.optional(z.record(z.string(), RenditionSchema)),
+	renditions: z.optional(renditions(RenditionSchema)),
 });
 /** One viewer report, with application or container sections flattened beside it. */
 export type Snapshot = z.infer<typeof SnapshotSchema>;
+/** What a viewer writes for one report: {@link Snapshot} with plain numbers. */
+export type SnapshotInput = z.input<typeof SnapshotSchema>;
 
 /** The suffix identifying viewer feedback broadcasts at announce time. */
 export const SUFFIX = ".echo";

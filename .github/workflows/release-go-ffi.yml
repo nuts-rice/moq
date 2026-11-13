@@ -99,7 +99,10 @@ jobs:
       - name: Package
         env:
           BUILD_VERSION: ${{ needs.ffi.outputs.version }}
+        # package-ffi.sh strips LLVM bitcode, which Go's cgo now rejects, with
+        # rustc's llvm-tools.
         run: |
+          rustup component add llvm-tools
           just go package-ffi \
             --version "$BUILD_VERSION" \
             --source-dir go/ffi \
@@ -118,6 +121,9 @@ jobs:
     needs: [ffi, package]
     runs-on: ubuntu-latest
     if: github.ref_type == 'tag'
+    # The moq-bot key lives in the `bot` Environment, which only protected
+    # refs can deploy to, `moq-ffi-v*` tags among them.
+    environment: bot
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

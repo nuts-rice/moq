@@ -5,11 +5,9 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use moq_clock::Instant;
+use kio::clock::Instant;
 
 use anyhow::Context;
-use hang::moq_net;
-use moq_video::render::wgpu;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
@@ -21,7 +19,7 @@ use super::args::Args;
 use super::layout::fit;
 use super::media::Media;
 use super::output::Output;
-use super::timeline::Presentation;
+use moq_mux::sync::{Consumer, Producer as Presentation};
 
 /// How early a frame may be shown rather than waiting another wakeup for it.
 /// Under a display's frame interval, so it can't be seen, but enough that timer
@@ -43,6 +41,15 @@ pub(super) enum Event {
 	/// still queued, then stop.
 	Ended,
 	Failed(String),
+	/// Audio resumed after a declared silence, starting at this media timestamp.
+	Utterance(Duration),
+	/// Received audio the player discarded rather than played to bound its
+	/// delay: skipped at the fast threshold, or refused by a full sink. `skip`
+	/// marks the first frame of a spell, one jump however many frames it spans.
+	Trimmed {
+		audio: Duration,
+		skip: bool,
+	},
 }
 
 /// Run native playback on the calling thread until the window closes.
@@ -61,10 +68,14 @@ pub fn run(
 		.context("failed to create the playback event loop")?;
 	let proxy = event_loop.create_proxy();
 	let video = Arc::new(Mutex::new(VecDeque::new()));
-	let presentation = Arc::new(Mutex::new(Presentation::new(args.video_delay())));
+	let presentation = Presentation::new(args.video_delay());
 	// Signals the decoder that the presenter took a frame, so it can hand over
 	// the next one instead of dropping it.
 	let drained = Arc::new(tokio::sync::Notify::new());
+	// Set once the window's device opens. The media task starts now anyway, so
+	// the broadcast resolves while the window does, and waits for it only to
+	// open a decoder.
+	let render = Arc::new(tokio::sync::SetOnce::new());
 
 	let media = tokio::spawn(
 		Media {
@@ -73,8 +84,12 @@ pub fn run(
 			args,
 			video: video.clone(),
 			presentation: presentation.clone(),
+			playhead: Default::default(),
 			drained: drained.clone(),
-			output: proxy.clone(),
+			output: Remote {
+				proxy: proxy.clone(),
+				render: render.clone(),
+			},
 		}
 		.run(),
 	);
@@ -93,7 +108,7 @@ pub fn run(
 	} else {
 		format!("moq play: {broadcast}")
 	};
-	let mut app = App::new(title, video, presentation, drained);
+	let mut app = App::new(title, video, presentation.consume(), drained, render);
 	let result = event_loop.run_app(&mut app).context("playback event loop failed");
 	media.abort();
 	network.abort();
@@ -106,7 +121,15 @@ pub fn run(
 	}
 }
 
-impl Output for EventLoopProxy<Event> {
+/// The window as the media task reaches it.
+#[derive(Clone)]
+struct Remote {
+	proxy: EventLoopProxy<Event>,
+	/// What the window's device draws, once it is open.
+	render: Arc<tokio::sync::SetOnce<moq_video::Output>>,
+}
+
+impl Output for Remote {
 	type Speaker = moq_audio::playback::Engine;
 
 	async fn speaker(&self) -> anyhow::Result<Self::Speaker> {
@@ -114,7 +137,11 @@ impl Output for EventLoopProxy<Event> {
 	}
 
 	fn send(&self, event: Event) {
-		let _ = self.send_event(event);
+		let _ = self.proxy.send_event(event);
+	}
+
+	async fn render(&self) -> moq_video::Output {
+		*self.render.wait().await
 	}
 }
 
@@ -134,8 +161,9 @@ async fn watch_network(mut tasks: tokio::task::JoinSet<anyhow::Result<()>>, prox
 struct App {
 	title: String,
 	video: Arc<Mutex<VecDeque<moq_video::Frame>>>,
-	presentation: Arc<Mutex<Presentation>>,
+	presentation: Consumer,
 	drained: Arc<tokio::sync::Notify>,
+	render: Arc<tokio::sync::SetOnce<moq_video::Output>>,
 	display: Option<Display>,
 	next_redraw: Option<Instant>,
 	/// The media tasks are done. Keep presenting whatever they left queued, then
@@ -150,14 +178,16 @@ impl App {
 	fn new(
 		title: String,
 		video: Arc<Mutex<VecDeque<moq_video::Frame>>>,
-		presentation: Arc<Mutex<Presentation>>,
+		presentation: Consumer,
 		drained: Arc<tokio::sync::Notify>,
+		render: Arc<tokio::sync::SetOnce<moq_video::Output>>,
 	) -> Self {
 		Self {
 			title,
 			video,
 			presentation,
 			drained,
+			render,
 			display: None,
 			next_redraw: None,
 			ending: false,
@@ -171,23 +201,19 @@ impl App {
 			return Ok(());
 		};
 		let mut video = self.video.lock().unwrap();
-		let presentation = self.presentation.lock().unwrap();
-
-		// The clock is re-read here rather than cached with the frame: another
-		// track re-anchoring moves the whole queue's schedule, and a deadline
-		// computed on arrival would present all of it that far late. A frame with
-		// no deadline at all has nothing to wait for, since nothing has anchored
-		// the clock yet.
-		let cutoff = Instant::now() + VIDEO_EARLY_TOLERANCE;
+		// Re-read the shared schedule on every redraw: any track may have moved it.
+		let cutoff = Instant::now().saturating_add(VIDEO_EARLY_TOLERANCE);
 		let mut due = None;
-		while video
-			.front()
-			.is_some_and(|frame| presentation.due(frame.timestamp).is_none_or(|at| at <= cutoff))
+		if let Some(index) = self
+			.presentation
+			.present(video.iter().map(|frame| frame.timestamp), cutoff)
 		{
-			due = video.pop_front();
+			for _ in 0..=index {
+				due = video.pop_front();
+			}
 		}
-		let next_redraw = video.front().and_then(|frame| presentation.due(frame.timestamp));
-		drop(presentation);
+		let next_redraw = video.front().and_then(|frame| self.presentation.due(frame.timestamp));
+
 		let popped = due.is_some();
 		drop(video);
 
@@ -242,6 +268,9 @@ impl ApplicationHandler<Event> for App {
 			// still resolving, rather than showing whatever was in the surface.
 			Ok(display) => {
 				display.window.request_redraw();
+				self.render
+					.set(moq_video::render::output(&display.device))
+					.expect("the display opens once");
 				self.display = Some(display);
 			}
 			Err(err) => self.fail(event_loop, err),
@@ -263,6 +292,7 @@ impl ApplicationHandler<Event> for App {
 				}
 			}
 			Event::Failed(err) => self.fail(event_loop, err),
+			Event::Utterance(_) | Event::Trimmed { .. } => {}
 		}
 	}
 
@@ -309,7 +339,7 @@ impl ApplicationHandler<Event> for App {
 			return;
 		}
 
-		let now = moq_clock::now();
+		let now = kio::clock::now();
 		match self.next_redraw {
 			Some(deadline) if deadline <= now => {
 				self.next_redraw = None;
@@ -355,7 +385,7 @@ impl Display {
 			compatible_surface: Some(&surface),
 			apply_limit_buckets: false,
 		}))?;
-		let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))?;
+		let (device, queue) = pollster::block_on(moq_video::render::request_device(&adapter, &Default::default()))?;
 		let mut config = surface
 			.get_default_config(&adapter, size.width.max(1), size.height.max(1))
 			.context("the graphics adapter cannot present to this window")?;

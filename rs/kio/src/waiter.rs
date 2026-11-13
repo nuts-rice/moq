@@ -2,7 +2,6 @@ use std::{
 	fmt,
 	future::Future,
 	pin::Pin,
-	// std, not `crate::sync`: loom's Arc has no `downgrade`. See `sync.rs`.
 	sync::{
 		Arc, OnceLock, Weak,
 		atomic::{AtomicBool, AtomicU64, Ordering},
@@ -42,10 +41,14 @@ pub struct Waiter {
 	// A registration found no free slot in `parked`, so a list may hold this waiter
 	// unrecorded and a later registration there would stack a duplicate.
 	lost: AtomicBool,
+
+	// Made by [`Self::noop`]: nothing would ever see its wake, so it registers nothing and a
+	// channel parks it nowhere.
+	noop: bool,
 }
 
-/// Lists a waiter remembers being parked on. A relay's busiest tasks park on up to 8.
-const PARKED: usize = 8;
+/// Lists a waiter remembers being parked on.
+const PARKED: usize = 16;
 
 impl Waiter {
 	/// Create a new waiter from an async [`Waker`].
@@ -55,18 +58,31 @@ impl Waiter {
 			shared: OnceLock::new(),
 			parked: Default::default(),
 			lost: AtomicBool::new(false),
+			noop: false,
 		}
 	}
 
 	/// Create a no-op waiter that discards registrations.
+	///
+	/// A channel's value poll parks it nowhere, taking no waiter lock, so polling one only
+	/// for the answer now costs no more than a read.
 	pub fn noop() -> Self {
-		Self::new(Waker::noop().clone())
+		Self {
+			noop: true,
+			..Self::new(Waker::noop().clone())
+		}
+	}
+
+	/// Whether this is a [`noop`](Self::noop) waiter.
+	#[inline]
+	pub(crate) fn is_noop(&self) -> bool {
+		self.noop
 	}
 
 	/// Register this waiter with a [`WaiterList`] for future notification.
 	///
 	/// Delegates to [`WaiterList::register`], a no-op while the list still holds it.
-	/// Only the first 8 lists at once are remembered: a waiter kept across polls
+	/// Only the first 16 lists at once are remembered: a waiter kept across polls
 	/// that also sits on more appends a duplicate to those extras on every call.
 	pub fn register(&self, list: &mut WaiterList) {
 		list.register(self);
@@ -123,6 +139,13 @@ impl Waiter {
 		true
 	}
 
+	/// Whether a registration under `tag` is recorded, which proves the list carrying
+	/// `tag` still holds this waiter. Zero, a list never registered on, matches nothing.
+	#[inline]
+	pub(crate) fn holds(&self, tag: u64) -> bool {
+		tag != 0 && self.parked.iter().any(|slot| slot.load(Ordering::Relaxed) == tag)
+	}
+
 	/// Whether every list holding this waiter is recorded, so registering it again
 	/// cannot stack a duplicate.
 	fn reusable(&self) -> bool {
@@ -147,9 +170,9 @@ impl Waiter {
 	/// the task until `poll` returns, and drops it if `poll` polled the set since.
 	/// Otherwise the executor polls the task again for a wake its own poll took.
 	///
-	/// Use it once, around a task's outermost poll. Only the innermost batch holds
-	/// wakes, so one nested inside (around a [`Tasks`](crate::Tasks) child, say)
-	/// lets its siblings' wakes of the owner through, and costs polls.
+	/// Use it around a task's outermost poll. Batches nest: a child task polled
+	/// inside may open its own, and a wake of this waiter's sets from inside the
+	/// child's batch is still held for this one.
 	pub fn batch<R>(&self, poll: impl FnOnce() -> R) -> R {
 		crate::task::Polling::run(&self.waker, poll)
 	}
@@ -176,6 +199,7 @@ impl Clone for Waiter {
 			shared: OnceLock::from(shared),
 			parked: std::array::from_fn(|i| AtomicU64::new(self.parked[i].load(Ordering::Relaxed))),
 			lost: AtomicBool::new(self.lost.load(Ordering::Relaxed)),
+			noop: self.noop,
 		}
 	}
 }
@@ -233,7 +257,8 @@ impl WaiterList {
 		}
 	}
 
-	/// Register a waiter, a no-op while this list still holds it.
+	/// Register a waiter, a no-op while this list still holds it, or for a
+	/// [`Waiter::noop`].
 	///
 	/// The list's tag changes on every drain and the waiter records the tag it
 	/// joined under, so a matching record proves the entry is still here and a
@@ -244,6 +269,10 @@ impl WaiterList {
 	/// window covers the list over time. A list about to grow sweeps every
 	/// dead slot first.
 	pub fn register(&mut self, waiter: &Waiter) {
+		// Registering would only allocate a handle nothing can wake, leaving a dead slot once it drops.
+		if waiter.noop {
+			return;
+		}
 		if self.tag == 0 {
 			self.tag = serial();
 		}
@@ -277,6 +306,13 @@ impl WaiterList {
 		self.entries.push(new_weak);
 	}
 
+	/// The tag a registration records right now. It changes on every drain, so a waiter
+	/// that [holds](Waiter::holds) it is still here.
+	#[inline]
+	pub(crate) fn tag(&self) -> u64 {
+		self.tag
+	}
+
 	/// Start a new round, so no record of an entry made in the last one matches.
 	fn drained(&mut self) {
 		self.cursor = 0;
@@ -308,10 +344,82 @@ impl WaiterList {
 		self.entries.iter().all(|entry| entry.strong_count() == 0)
 	}
 
-	/// Wake all live waiters, draining the list.
+	/// Drop every entry without waking it.
+	pub(crate) fn clear(&mut self) {
+		self.drained();
+		self.entries.clear();
+	}
+
+	/// Wake all live waiters, draining the list. Under a [`Hold`], the wakes wait for it.
 	pub fn wake(&mut self) {
 		self.drained();
+		let held = HELD
+			.try_with(|held| {
+				let mut held = held.borrow_mut();
+				if held.depth > 0 {
+					held.wakers.extend(self.entries.drain(..));
+				}
+				held.depth > 0
+			})
+			.unwrap_or(false);
+		if held {
+			return;
+		}
 		for waker in self.entries.drain(..).filter_map(|w| w.upgrade()) {
+			waker.wake_by_ref();
+		}
+	}
+}
+
+/// The wakes this thread holds back, and how many [`Hold`]s are open.
+struct Held {
+	depth: usize,
+	wakers: Vec<Weak<Waker>>,
+}
+
+thread_local! {
+	static HELD: std::cell::RefCell<Held> = const {
+		std::cell::RefCell::new(Held {
+			depth: 0,
+			wakers: Vec::new(),
+		})
+	};
+}
+
+/// Holds back every wake this thread makes through a [`WaiterList`] until it drops.
+///
+/// A waker may poll its task inline, and that task may take a lock its waker is still
+/// holding. Open a hold before taking the locks, so their guards drop first and the
+/// held wakes go out once nothing is locked. Holds nest: the outermost delivers.
+#[must_use = "wakes are held back only while the hold lives"]
+pub struct Hold {
+	// Thread-bound: it counts on this thread's held wakes.
+	_thread: std::marker::PhantomData<*const ()>,
+}
+
+/// Hold back this thread's wakes until the returned [`Hold`] drops.
+pub fn hold() -> Hold {
+	// Outside a thread-local's destructor at least, where nothing is held.
+	let _ = HELD.try_with(|held| held.borrow_mut().depth += 1);
+	Hold {
+		_thread: std::marker::PhantomData,
+	}
+}
+
+impl Drop for Hold {
+	fn drop(&mut self) {
+		let wakers = HELD
+			.try_with(|held| {
+				let mut held = held.borrow_mut();
+				held.depth = held.depth.saturating_sub(1);
+				match held.depth {
+					0 => std::mem::take(&mut held.wakers),
+					_ => Vec::new(),
+				}
+			})
+			.unwrap_or_default();
+		// Outside the borrow: a waker may poll inline and open a hold of its own.
+		for waker in wakers.into_iter().filter_map(|w| w.upgrade()) {
 			waker.wake_by_ref();
 		}
 	}
@@ -426,7 +534,7 @@ where
 	crate::Pending::new(poll)
 }
 
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 mod tests {
 	use super::*;
 
@@ -469,9 +577,42 @@ mod tests {
 	#[cfg(target_pointer_width = "64")]
 	fn the_list_stays_small() {
 		let list = std::mem::size_of::<WaiterList>();
-		let state = std::mem::size_of::<crate::State<()>>();
+		let state = std::mem::size_of::<crate::channel::Channel<()>>();
 		assert!(list <= 56, "WaiterList grew to {list} B");
-		assert!(state <= 176, "State<()> grew to {state} B");
+		// 184 B before the version counter, the value list's tag mirror (8 B each), and the
+		// waiter lists' own mutex moved the parking off the value's lock. Measured where a
+		// `Mutex` is 8 B; Darwin boxes its pthread mutex behind a 16 B one, once per lock, and a
+		// smaller one (2 B on Windows) leaves room.
+		let mutexes = 2 * std::mem::size_of::<std::sync::Mutex<()>>().saturating_sub(8);
+		assert!(state <= 200 + mutexes, "Channel<()> grew to {state} B");
+	}
+
+	/// Wakes made under a hold go out when the outermost hold drops, never before.
+	#[test]
+	fn a_hold_delivers_its_wakes_when_the_outermost_drops() {
+		struct Count(std::sync::atomic::AtomicUsize);
+		impl std::task::Wake for Count {
+			fn wake(self: Arc<Self>) {
+				self.0.fetch_add(1, Ordering::SeqCst);
+			}
+		}
+		let count = Arc::new(Count(Default::default()));
+		let woken = || count.0.load(Ordering::SeqCst);
+		let waiter = Waiter::new(Waker::from(count.clone()));
+		let mut list = WaiterList::new();
+
+		let outer = hold();
+		let inner = hold();
+		waiter.register(&mut list);
+		list.wake();
+		drop(inner);
+		assert_eq!(woken(), 0, "an inner hold delivered");
+		drop(outer);
+		assert_eq!(woken(), 1, "the outermost hold lost the wake");
+
+		waiter.register(&mut list);
+		list.wake();
+		assert_eq!(woken(), 2, "a wake with no hold open waited");
 	}
 
 	#[test]
@@ -541,7 +682,7 @@ mod tests {
 	fn abandoned_waiters_do_not_grow_the_list() {
 		let mut list = WaiterList::new();
 		for _ in 0..1_000 {
-			Waiter::noop().register(&mut list);
+			Waiter::new(Waker::noop().clone()).register(&mut list);
 		}
 		assert!(list.entries.len() <= 2);
 	}
@@ -550,11 +691,22 @@ mod tests {
 	fn a_list_is_empty_once_its_waiters_drop() {
 		let mut list = WaiterList::new();
 		assert!(list.is_empty());
-		let waiter = Waiter::noop();
+		let waiter = Waiter::new(Waker::noop().clone());
 		waiter.register(&mut list);
 		assert!(!list.is_empty());
 		drop(waiter);
 		assert!(list.is_empty());
+	}
+
+	/// A peek through a no-op waiter allocates no handle and takes no slot, clone or not.
+	#[test]
+	fn a_noop_waiter_registers_nothing() {
+		let mut list = WaiterList::new();
+		let waiter = Waiter::noop();
+		waiter.register(&mut list);
+		assert!(waiter.shared.get().is_none(), "a no-op registration allocated a handle");
+		waiter.clone().register(&mut list);
+		assert!(list.entries.is_empty());
 	}
 
 	/// Tasks parked on one list are retired and re-register in whatever order they
@@ -564,16 +716,19 @@ mod tests {
 	fn retired_live_waiters_do_not_grow_the_list() {
 		const LIVE: usize = 64;
 		let mut list = WaiterList::new();
-		let mut waiters: Vec<Waiter> = (0..LIVE).map(|_| Waiter::noop()).collect();
+		let mut waiters: Vec<Waiter> = (0..LIVE).map(|_| Waiter::new(Waker::noop().clone())).collect();
 		for waiter in &waiters {
 			waiter.register(&mut list);
 		}
 
+		// Miri takes over twenty minutes for the full run; a thousand rounds still far
+		// outnumber the bound.
+		let rounds = if cfg!(miri) { 1_000 } else { 100_000 };
 		let mut seed = 1u64;
-		for _ in 0..100_000 {
+		for _ in 0..rounds {
 			seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
 			let i = (seed >> 33) as usize % LIVE;
-			waiters[i] = Waiter::noop();
+			waiters[i] = Waiter::new(Waker::noop().clone());
 			waiters[i].register(&mut list);
 		}
 
@@ -598,7 +753,7 @@ mod tests {
 	/// after one of them drains, while an unrecorded list appends on every call.
 	#[test]
 	fn overflow_keeps_recorded_lists_idempotent() {
-		let waiter = Waiter::noop();
+		let waiter = Waiter::new(Waker::noop().clone());
 		let mut lists: Vec<_> = (0..=PARKED).map(|_| WaiterList::new()).collect();
 		for _ in 0..3 {
 			for list in &mut lists {
@@ -770,7 +925,7 @@ mod tests {
 
 	#[test]
 	fn wait_output_need_not_be_unpin() {
-		struct NotUnpin(#[allow(dead_code)] std::marker::PhantomPinned);
+		struct NotUnpin(#[allow(dead_code, reason = "only makes the type `!Unpin`")] std::marker::PhantomPinned);
 
 		let mut fut = std::pin::pin!(crate::wait(|_| Poll::Ready(NotUnpin(std::marker::PhantomPinned))));
 		let mut cx = Context::from_waker(Waker::noop());

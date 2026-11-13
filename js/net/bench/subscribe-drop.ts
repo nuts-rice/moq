@@ -1,6 +1,4 @@
 /** Sweep failed group sends over independent publishers and subscribers. */
-import { Milli } from "@moq/clock";
-import { Producer as GroupProducer } from "../src/group.ts";
 import { randomHop } from "../src/hop.ts";
 import { Publisher } from "../src/lite/publisher.ts";
 import { decodeSubscribeResponseMaybe, Subscribe } from "../src/lite/subscribe.ts";
@@ -24,15 +22,15 @@ try {
 			for (let rep = 0; rep < reps; rep++) {
 				const origins = Array.from({ length: publishers }, () => {
 					const origin = new OriginProducer();
-					const broadcast = origin.createBroadcast(Path.from("bench"));
-					broadcast.announce();
-					const track = broadcast.createTrack("video", { timescale: Timescale.MILLI });
-					for (let sequence = 0; sequence < groups; sequence++) {
-						const group = new GroupProducer(sequence);
+					const broadcastRoute = origin.route(Path.from("bench"));
+					const broadcast = broadcastRoute.broadcast;
+					const track = broadcast.createTrack("video", { timescale: Timescale.MILLI, maxAge: null });
+					for (let sequence = 0n; sequence < BigInt(groups); sequence++) {
+						const group = track.createGroup(sequence);
 						group.writeFrame(textFrame("frame"));
-						group.close();
-						track.writeGroup(group);
+						group.finish();
 					}
+					track.finish();
 					track.close();
 					return { origin, broadcast };
 				});
@@ -60,20 +58,22 @@ try {
 									broadcast: Path.from("bench"),
 									track: "video",
 									priority: 0,
-									maxDelay: Milli(30_000),
-									startGroup: 0,
+									maxDelay: 30_000,
+									startGroup: 0n,
 								}),
 								server,
 							);
 							try {
+								// Lite-07 keeps the Subscribe Stream open past SUBSCRIBE_FINISH, so stop once every
+								// group is accounted for rather than waiting for its end.
 								let dropped = 0;
-								for (;;) {
+								while (dropped < groups) {
 									const response = await decodeSubscribeResponseMaybe(
 										client.reader,
 										Version.DRAFT_07,
 									);
 									if (!response) break;
-									if ("drop" in response) dropped += response.drop.end - response.drop.start + 1;
+									if ("drop" in response) dropped += Number(response.drop.end - response.drop.start);
 								}
 								if (dropped !== groups) throw new Error(`dropped ${dropped}, expected ${groups}`);
 								client.writer.close();

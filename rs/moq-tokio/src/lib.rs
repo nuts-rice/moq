@@ -6,29 +6,20 @@
 //! - WebSocket (fallback via [web-transport-ws](https://crates.io/crates/web-transport-ws))
 //! - TCP via the `tcp://` (plaintext) and `tls://` schemes (qmux; requires `tcp` feature)
 //! - Unix domain socket via the `unix://` scheme (qmux, peer-credential aware; requires `uds` feature, unix-only)
-//! - Iroh P2P (requires `iroh` feature)
-//! - A WebRTC data channel with a browser peer, signaled by the caller (qmux; requires `webrtc` feature)
+//! - A qmux session established elsewhere, such as over a WebRTC data channel (requires `qmux` feature)
 //!
-//! See [`Client`] for connecting to relays and [`Server`] for accepting
-//! connections. The `mdns` feature finds peers to connect to on the local network.
+//! With `net`, `client::Client` connects to relays; transport features enable
+//! `server::Server` for accepting connections. The `mdns` feature finds peers on the local network.
 //!
-//! With `default-features = false`, the `quic` backend must be paired
-//! with the `aws-lc-rs` or `ring` crypto-provider feature. Every other subset
-//! compiles, including no transport at all: such a build cannot connect to
-//! anything, though a crypto provider on its own is still enough to configure TLS
-//! and to build a plain-TLS listener's `rustls::ServerConfig` from
-//! [`tls::Listen::server_config`].
+//! Cryptography always comes from rind. TLS setup checks CPU support and returns
+//! an error naming a missing feature. Older x86_64 CPUs and aarch64 boards without
+//! crypto extensions use rind's software paths; aarch64 requires NEON. Armv7 is supported.
 //!
 //! MoQ sessions need the `net` feature, which every transport turns on. Without
-//! it, `driver` and a crypto provider build [`quic::driver`] alone: an async
+//! it, `driver` builds [`quic::driver`] alone: an async
 //! QUIC stack for any application, MoQ or not.
 
 #![warn(missing_docs)]
-
-// The protocol crates need a compiled provider for reset and retry-token keys. A rustls provider
-// installed at runtime cannot supply constructors removed by their compile-time feature gates.
-#[cfg(all(feature = "driver", not(any(feature = "aws-lc-rs", feature = "ring"))))]
-compile_error!("a rustls QUIC backend requires a crypto provider: enable either the `aws-lc-rs` or `ring` feature");
 
 #[cfg(any(feature = "net", all(feature = "watch", feature = "_certs")))]
 mod abort;
@@ -56,11 +47,20 @@ pub mod panic;
 pub mod quic;
 #[cfg(any(feature = "quic", feature = "tcp", feature = "websocket"))]
 mod resolve;
+#[cfg(any(
+	feature = "net",
+	feature = "driver",
+	feature = "jemalloc",
+	feature = "mdns",
+	all(feature = "watch", feature = "_certs")
+))]
+mod runtime;
 pub mod secret;
 #[cfg(feature = "_transport")]
 pub mod server;
-#[doc(hidden)]
 pub mod settings;
+#[cfg(all(feature = "sim", feature = "net"))]
+pub mod sim;
 #[cfg(feature = "tcp")]
 pub mod tcp;
 pub mod tls;
@@ -75,22 +75,36 @@ pub mod worker;
 mod util;
 #[cfg(feature = "watch")]
 pub mod watch;
-#[cfg(feature = "webrtc")]
-pub mod webrtc;
 #[cfg(feature = "websocket")]
 pub mod websocket;
 
-/// Session settings for every qmux transport (WebSocket, `tcp://`, `tls://`, `unix://`, WebRTC).
+/// Session settings for every qmux transport moq-tokio establishes (WebSocket, `tcp://`, `tls://`, `unix://`),
+/// with `quic`'s windows and stream count.
 ///
-/// moq-lite holds a stream open per subscription, so a qmux session grants the same
-/// stream count as QUIC rather than qmux's default of 100, past which a peer's opens
-/// wait on credit forever.
-#[cfg(any(feature = "websocket", feature = "tcp", feature = "webrtc"))]
-fn qmux_config() -> qmux::Config {
+/// A qmux session leases receive credit as QUIC does, so it takes the same per-session
+/// numbers rather than qmux's own defaults. moq-lite holds a stream open per subscription,
+/// past qmux's default of 100, where a peer's opens would wait on credit forever.
+#[cfg(any(feature = "websocket", feature = "tcp"))]
+fn qmux_config(quic: &quic::Resolved) -> qmux::Config {
 	let mut config = qmux::Config::default();
-	config.max_streams_bidi = quic::DEFAULT_MAX_STREAMS;
-	config.max_streams_uni = quic::DEFAULT_MAX_STREAMS;
+	config.limits = quic.limits();
 	config
+}
+
+/// [`qmux_config`] at the `[quic]` defaults, for a server's qmux sessions, which widen once
+/// admitted (see [`server::Request::with_quic_limits`]).
+#[cfg(any(feature = "websocket", feature = "tcp"))]
+fn qmux_default() -> qmux::Config {
+	qmux_config(&quic::Resolved::default())
+}
+
+/// Run a qmux session's driver on the runtime, handing back the session.
+#[cfg(any(feature = "websocket", feature = "tcp"))]
+fn spawn_qmux<T: qmux::transport::Transport + Send + 'static>(
+	(session, driver): (qmux::Session, qmux::Driver<T>),
+) -> qmux::Session {
+	runtime::spawn(driver);
+	session
 }
 
 // Enumerated rather than globbed, so the root surface is a deliberate list and a
@@ -100,31 +114,13 @@ pub use client::Client;
 #[cfg(feature = "net")]
 pub use connect::{Addrs, ConnectError};
 #[cfg(feature = "net")]
-pub use connection::{Backoff, Connection, Redirect, Status};
+pub use connection::{Backoff, Connection, Redirect, Restart, Status};
 pub use error::{Error, Result};
 pub use log::{Log, RedactedUrl};
 #[cfg(feature = "_transport")]
 pub use server::{Listener, Server};
 #[cfg(feature = "net")]
 pub use transport::Transport;
-
-// Re-export these crates.
-#[cfg(feature = "net")]
-pub use moq_net;
-pub use rustls;
-
-/// Re-exported because [`watch::Files`] surfaces `notify::Result`/`notify::Error`
-/// in its API; a major `notify` bump is therefore a breaking change for this crate.
-#[cfg(feature = "watch")]
-pub use notify;
-
-/// Re-exported because [`tls::init_android`] takes a `jni::Env` handle; a major
-/// `jni` bump is therefore a breaking change for this crate.
-#[cfg(target_os = "android")]
-pub use jni;
-
-#[cfg(feature = "iroh")]
-pub mod iroh;
 
 #[cfg(feature = "mdns")]
 pub mod mdns;

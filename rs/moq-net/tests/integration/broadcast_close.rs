@@ -9,57 +9,54 @@ use crate::support;
 
 use std::time::Duration;
 
-use moq_net::{Error, Hop, Version};
+use moq_net::{Error, Version};
 use support::harness::{MockConnectOptions, connect_mock};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 fn produce_origin(hop: u64) -> moq_net::origin::Producer {
-	let (producer, driver) = moq_net::origin::Producer::new(moq_net::origin::Config::new(Hop::new(hop).unwrap()));
+	let (producer, driver) =
+		moq_net::origin::Producer::new(moq_net::origin::Config::new(std::num::NonZeroU64::new(hop).unwrap()));
 	support::harness::spawn(driver);
-	producer
+	producer.with_proxy(true)
 }
 
 /// Close a published broadcast and check what `reader`'s origin answers afterwards.
 async fn close_then_lookup(publisher: moq_net::origin::Producer, reader: moq_net::origin::Producer) {
-	let broadcast = publisher.create_broadcast("bcast").unwrap();
-	let _track = broadcast.create_track("video", None).unwrap();
-	broadcast.announce(Default::default()).unwrap();
+	let broadcast = publisher
+		.route("bcast", moq_net::origin::RouteOptions::hidden())
+		.unwrap();
+	let _track = broadcast.broadcast().create_track("video", None).unwrap();
+	broadcast.announce().unwrap();
 
 	let consumer = reader.consume();
-	moq_clock::timeout(TIMEOUT, consumer.routed("bcast"))
-		.await
-		.expect("announce timeout")
-		.expect("routed");
-	let handle = moq_clock::timeout(TIMEOUT, consumer.request_broadcast("bcast", None))
+	let handle = kio::clock::timeout(TIMEOUT, consumer.follow("bcast", None).unwrap().available())
 		.await
 		.expect("resolve timeout")
-		.expect("broadcast resolves");
+		.expect("broadcast resolves")
+		.unwrap();
 	handle.track("video").expect("a live broadcast serves its track");
 
-	broadcast.close();
+	broadcast.broadcast().close();
 
-	moq_clock::timeout(TIMEOUT, handle.closed())
+	kio::clock::timeout(TIMEOUT, handle.closed())
 		.await
 		.expect("the handle never closed");
 	assert!(matches!(handle.track("video"), Err(Error::Unroutable)));
 	assert!(matches!(handle.track("audio"), Err(Error::Unroutable)));
-	assert!(matches!(
-		consumer.request_broadcast("bcast", None).await,
-		Err(Error::Unroutable)
-	));
-	assert!(matches!(broadcast.announce(Default::default()), Err(Error::Closed)));
+	assert!(matches!(consumer.request("bcast", None).await, Err(Error::Unroutable)));
+	assert!(matches!(broadcast.announce(), Err(Error::Closed)));
 }
 
-#[moq_clock::test]
+#[kio::test]
 async fn close_ends_a_local_consumer() {
 	let origin = produce_origin(1);
 	close_then_lookup(origin.clone(), origin).await;
 }
 
-#[moq_clock::test]
+#[kio::test]
 async fn close_ends_a_remote_consumer() {
-	for version in ["moq-lite-05", "moq-transport-14", "moq-transport-19"] {
+	for version in ["moq-lite-05", "moq-transport-18"] {
 		let publisher = produce_origin(1);
 		let subscriber = produce_origin(2);
 		let mut options = MockConnectOptions::new(version.parse::<Version>().unwrap());

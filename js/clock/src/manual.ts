@@ -1,32 +1,34 @@
-import { install } from "./ambient.ts";
+import { type Installed, install } from "./ambient.ts";
 import type { Backend } from "./backend.ts";
-import { drain } from "./host.ts";
-import { Instant, Nano, Wall } from "./types.ts";
+import { drain, host } from "./host.ts";
+import { type Duration, type Instant, instantOf, type Wall, wallMillis, wallOf } from "./types.ts";
 
 type Timer = { at: number; order: number; index: number; ready: () => void };
 
 /**
  * A clock that starts at zero and advances only when a test moves it.
- * Drive it serially: overlapping advance, jump, or fire calls fail immediately.
+ * Drive it serially: overlapping advance, jump, fire, or drive calls fail immediately.
  */
 export class Manual {
 	/** The reproducible starting wall time, 2025-01-01T00:00:00Z. */
-	static readonly WALL_START = Wall(1_735_689_600_000);
-	#now = Instant.zero;
+	static readonly WALL_START: Wall = wallOf(1_735_689_600_000);
+	// Nanoseconds since the origin.
+	#now = 0;
 	// Wall time is derived from an anchor so tiny advances don't vanish into an epoch-sized float.
-	#wallAnchor = Manual.WALL_START;
-	#wallAnchorAt = Instant.zero;
+	#wallAnchor = wallMillis(Manual.WALL_START);
+	#wallAnchorAt = 0;
 	#timers: Timer[] = [];
 	#order = 0;
 	#revision = 0;
 	#fired = 0;
+	#tasks = 0;
 	#driving = false;
 	#advancing = false;
 	#armed?: () => void;
 	#backend: Backend = {
 		now: () => this.#now,
-		wall: () => this.wall(),
-		origin: () => this.#wallAnchor - Nano.toMilli(Nano(this.#wallAnchorAt)),
+		wall: () => this.#wall(),
+		origin: () => this.#wallAnchor - this.#wallAnchorAt / 1_000_000,
 		arm: (at, ready) => {
 			const timer = { at, order: this.#order++, index: this.#timers.length, ready };
 			this.#timers.push(timer);
@@ -38,41 +40,54 @@ export class Manual {
 				this.#remove(timer);
 			};
 		},
+		// Yields stay real host tasks, so the host's other work still gets a turn, but the clock counts them.
+		task: (ready) => {
+			this.#tasks++;
+			this.#revision++;
+			host.task(() => {
+				this.#tasks--;
+				ready();
+			});
+		},
 	};
 
-	/** Install this clock in the current realm and return an idempotent restore function. */
-	install(): () => void {
+	/** Install this clock in the current realm until the returned handle closes. */
+	install(): Installed {
 		return install(this.#backend);
 	}
 
 	/** Read this clock's instant without installing it. */
 	now(): Instant {
-		return this.#now;
+		return instantOf(this.#now);
 	}
 
 	/** Read this clock's wall time without installing it. */
 	wall(): Wall {
-		return Wall.add(this.#wallAnchor, Instant.durationSince(this.#now, this.#wallAnchorAt));
+		return wallOf(this.#wall());
+	}
+
+	#wall(): number {
+		return this.#wallAnchor + (this.#now - this.#wallAnchorAt) / 1_000_000;
 	}
 
 	/** Jump forward without draining tasks, firing due timers late as a stalled event loop would. */
-	jump(duration: Nano): void {
+	jump(duration: Duration): void {
 		if (this.#driving) throw new Error("time driver already pending");
 		this.#driving = true;
 		try {
-			this.#now = Instant.add(this.#now, duration);
+			this.#now += duration.asNanos();
 			this.#fire();
 		} finally {
 			this.#driving = false;
 		}
 	}
 
-	/** Advance through each due deadline, draining tasks before continuing to the target. */
-	async advance(duration: Nano): Promise<void> {
+	/** Advance through each due deadline, draining tasks and pending yields before continuing to the target. */
+	async advance(duration: Duration): Promise<void> {
 		if (this.#driving) throw new Error("time driver already pending");
 		this.#driving = true;
 		try {
-			await this.#advance(Instant.add(this.#now, duration));
+			await this.#advance(this.#now + duration.asNanos());
 		} finally {
 			this.#driving = false;
 		}
@@ -87,19 +102,46 @@ export class Manual {
 		this.#driving = true;
 		try {
 			await this.#advance();
-			return this.#now;
+			return instantOf(this.#now);
 		} finally {
 			this.#driving = false;
 		}
 	}
 
+	/**
+	 * Fire timers like repeated `fire` calls until `work` settles, then settle the same way.
+	 * Time stops at the deadline being fired when `work` settles, and no wait outlives the call.
+	 * Promise-based I/O such as a stream delivery lands before each deadline; a dynamic `import()`
+	 * may not, so load modules first. Await it directly: bun's `expect(...).rejects` runs it nested,
+	 * ahead of microtasks the caller already queued.
+	 */
+	async drive<T>(work: PromiseLike<T>): Promise<T> {
+		if (this.#driving) throw new Error("time driver already pending");
+		this.#driving = true;
+		const done = Promise.resolve(work);
+		let settled = false;
+		const stop = () => {
+			settled = true;
+			// Settled work may never arm the timer a parked wait expects.
+			this.#armed?.();
+		};
+		done.then(stop, stop);
+		try {
+			while (!settled) await this.#advance(undefined, () => settled);
+		} finally {
+			this.#driving = false;
+		}
+		return await done;
+	}
+
 	/** Set wall time forward or backward without passing monotonic time. */
 	stepWall(wall: Wall): void {
-		this.#wallAnchor = Wall(wall);
+		this.#wallAnchor = wallMillis(wall);
 		this.#wallAnchorAt = this.#now;
 	}
 
-	async #advance(target?: Instant): Promise<void> {
+	// Without a target, advances to the earliest deadline unless `stop` holds first.
+	async #advance(target?: number, stop?: () => boolean): Promise<void> {
 		const fired = this.#fired;
 		// Reached timers armed while draining join the heap once a target is chosen.
 		this.#advancing = target !== undefined;
@@ -107,7 +149,10 @@ export class Manual {
 			for (;;) {
 				const revision = this.#revision;
 				await drain();
+				// A yield armed while draining is still queued: time must not pass a yielding loop.
+				if (this.#tasks > 0) continue;
 				if (target === undefined) {
+					if (stop?.()) return;
 					// Select fire's target in the same turn that readies its first timer.
 					const at = this.#fired !== fired ? this.#now : this.#timers[0]?.at;
 					if (at === undefined) {
@@ -118,12 +163,12 @@ export class Manual {
 						this.#armed = undefined;
 						continue;
 					}
-					target = Instant(Math.max(this.#now, at));
+					target = Math.max(this.#now, at);
 					this.#advancing = true;
 				}
 				const first = this.#timers[0];
 				if (first !== undefined && first.at <= target) {
-					this.#now = Instant(Math.max(this.#now, first.at));
+					this.#now = Math.max(this.#now, first.at);
 					this.#ready(first);
 				} else if (this.#now < target) {
 					this.#now = target;

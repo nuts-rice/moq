@@ -26,7 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let info = track::Info::default().with_timescale(Timescale::MILLI);
 	let state = broadcast.create_track("control.json", info.clone())?;
 	let commands = broadcast.create_track("commands.json", info)?;
-	let mut state_reader = snapshot::Consumer::<Control>::new(state.subscribe(None), Default::default());
+	let mut state_reader = snapshot::Consumer::<Control>::new(state.consume(), Default::default());
 	let mut command_reader = stream::Consumer::<Command>::new(commands.subscribe(None), Default::default());
 	let mut state = snapshot::Producer::new(state, Default::default());
 	let mut commands = stream::Producer::new(commands, Default::default());
@@ -42,14 +42,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	{
 		state.update(Timed::from(control).at(Timestamp::from_millis(tick as u64)?))?;
 	}
-	state.finish()?;
+	let _state = state.finish()?;
 
 	// Every discrete command is meaningful, including Stop between Arm and Disarm.
 	let expected = [Command::Arm, Command::Stop, Command::Disarm];
 	for (tick, command) in expected.iter().enumerate() {
 		commands.append(Timed::from(command).at(Timestamp::from_millis(tick as u64)?))?;
 	}
-	commands.finish()?;
+	let _commands = commands.finish()?;
 
 	let waiter = kio::Waiter::noop();
 	// `latest` skips the stale steering values; `next` would replay them in order.

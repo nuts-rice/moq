@@ -10,7 +10,7 @@
  *
  * @module
  */
-import { Milli, Nano } from "@moq/clock";
+import { Duration } from "@moq/clock";
 import { Effect } from "@moq/signals";
 import type MoqWatch from "@moq/watch/element";
 import { Capture } from "./capture.ts";
@@ -50,20 +50,21 @@ export function probe(watch: MoqWatch, capture = false): Probe {
 		if (notes.length < 200) notes.push(line.slice(0, 200));
 	};
 
-	const { audio, sync, broadcast } = watch.player;
+	const { audio, sync, broadcast } = watch;
 	const recording = capture
 		? new Capture({
 				broadcast: audio.source.in.broadcast,
 				track: audio.source.out.track,
 				config: audio.source.out.config,
-				delay: sync.in.delay,
+				delay: sync.out.delay,
 				maxDelay: sync.out.maxDelay,
+				stretch: sync.in.stretch,
 			})
 		: undefined;
 
 	const signals = new Effect();
 	// Peeking does not request PROBE reports on an audio-only page.
-	signals.subscribe(watch.player.in.probe, () => {});
+	signals.subscribe(watch.connection.probe, () => {});
 
 	// Stall changes are taken as they happen: a re-stall shorter than the sample grid is exactly the
 	// one a 250 ms read would miss, and it is what tells a stall from an underrun.
@@ -124,11 +125,15 @@ export function probe(watch: MoqWatch, capture = false): Probe {
 			// Read back to back, so the pair calibrates the render clock against the viewer's.
 			at: performance.now(),
 			render: context ? context.currentTime * 1000 : undefined,
-			timestamp: audio.out.timestamp.peek(),
+			timestamp: audio.out.timestamp.peek()?.asMillis(),
 			stalled: audio.out.stalled.peek(),
-			delay: sync.out.delay.peek(),
-			rtt: watch.player.in.probe.peek()?.rtt,
-			networkJitter: sync.out.jitter.peek(),
+			clock: sync.now()?.asMillis(),
+			delay: sync.out.delay.peek().asMillis(),
+			playerUnderruns: audio.out.stats.peek()?.underruns,
+			playerSkips: audio.out.stats.peek()?.skips,
+			trimmed: audio.out.stats.peek()?.trimmed.asMillis(),
+			accelerated: audio.out.stats.peek()?.accelerated.asMillis(),
+			rtt: watch.connection.probe.peek()?.rtt?.asMillis(),
 			jitter: audio.source.out.config.peek()?.jitter,
 			renditionDelay: audio.source.out.config.peek()?.delay,
 			outputLatency: context ? context.outputLatency * 1000 : undefined,
@@ -153,7 +158,7 @@ export function probe(watch: MoqWatch, capture = false): Probe {
 		});
 	}
 
-	signals.interval(() => samples.push(sample()), Nano.fromMilli(Milli(SAMPLE_INTERVAL_MS)));
+	signals.interval(() => samples.push(sample()), Duration.millis(SAMPLE_INTERVAL_MS));
 
 	return {
 		drain: () => samples.splice(0, samples.length),
@@ -175,7 +180,6 @@ export function probe(watch: MoqWatch, capture = false): Probe {
 			// One rendition is published per broadcast here, so the first is the one playing.
 			const config = Object.values(catalog.audio?.renditions ?? {})[0];
 			return {
-				crossOriginIsolated: globalThis.crossOriginIsolated === true,
 				transport: watch.connection.transport.peek(),
 				codec: config?.codec,
 				rate: config?.sampleRate,

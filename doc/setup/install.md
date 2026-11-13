@@ -28,7 +28,7 @@ curl -fsSL https://moq.sh | sh
 ```
 
 It installs the newest `moq` release into `~/.local/bin`, without sudo or Rust,
-on macOS (Apple Silicon) and Linux (x86\_64, aarch64, glibc 2.34+). It checks
+on macOS (Apple Silicon) and Linux (x86\_64, aarch64, armv7, glibc 2.34+). It checks
 the download against the release's `SHA256SUMS` and never edits your shell
 profile; it prints the `PATH` line to add if needed. Run it again to upgrade.
 Pass options after `sh -s --`:
@@ -59,22 +59,40 @@ nix run github:moq-dev/moq/release#moq-relay -- relay.toml
 nix run github:moq-dev/moq/release#moq -- --help
 
 # Docker (linux/amd64 and linux/arm64). The image is scratch (the package
-# closure only) and has no shell.
+# closure only), has no shell, and runs as uid 65532, which must be able to read
+# mounted files.
 docker run -p 4443:4443/udp -p 4443:4443/tcp -v "$PWD/relay.toml:/app/relay.toml:ro" moqdev/moq-relay /app/relay.toml
 docker run -i moqdev/moq --help
 ```
 
 Static binaries for Linux (x86\_64, aarch64), macOS (Apple Silicon), and Windows
 (x64) are attached to every
-[GitHub release](https://github.com/moq-dev/moq/releases). The Nix cache at
+[GitHub release](https://github.com/moq-dev/moq/releases), plus `moq` for Linux
+armv7. The Nix cache at
 `nix.moq.dev` only holds tagged releases, so the `release` branch builds from
 source. Nix asks before trusting it; `--accept-flake-config` says yes for one
 command.
 
+Every archive, binary, and package attached to a `moq` or `moq-relay` release
+carries a build provenance attestation; older releases have none.
+`SHA256SUMS` comes from the same release, so it only catches a corrupt
+download. To check that a file was built by this repository's release
+workflow for the tag you expect, use the
+[GitHub CLI](https://cli.github.com/); `--source-ref` rejects a genuine file
+from another release:
+
+```bash
+gh attestation verify moq-cli-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz \
+  --repo moq-dev/moq \
+  --signer-workflow moq-dev/moq/.github/workflows/release-binary.yml \
+  --source-ref refs/tags/moq-cli-vX.Y.Z
+```
+
 ## Debian and Ubuntu
 
 Debian 12+ and Ubuntu 22.04+. The GStreamer plugin needs GStreamer 1.22, so it
-is available on Debian 12+ and Ubuntu 24.04+.
+is available on Debian 12+ and Ubuntu 24.04+. On 32-bit ARM (`armhf`), only
+`moq` is published.
 
 ```bash
 curl -fsSL https://apt.moq.dev/moq-keyring.gpg | sudo tee /usr/share/keyrings/moq-keyring.gpg > /dev/null
@@ -82,6 +100,8 @@ echo "deb [signed-by=/usr/share/keyrings/moq-keyring.gpg] https://apt.moq.dev st
 sudo apt update
 sudo apt install moq-relay moq gstreamer1.0-moq
 ```
+
+On `armhf`, install `moq` alone instead: `sudo apt install moq`.
 
 ## Fedora, RHEL, and openSUSE
 

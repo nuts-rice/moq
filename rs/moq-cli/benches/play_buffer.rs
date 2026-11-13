@@ -1,8 +1,15 @@
 //! Encoded retention cost and peak memory, swept over delay and bitrate.
 //! Run with `cargo bench -p moq-cli --bench play_buffer`.
-#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+#![expect(
+	clippy::disallowed_methods,
+	clippy::disallowed_types,
+	reason = "host time measures benchmark throughput"
+)]
 
-#[allow(dead_code)]
+#[allow(
+	dead_code,
+	reason = "the bench compiles the private module from source and uses only part of it"
+)]
 #[path = "../src/play/buffer.rs"]
 mod buffer;
 
@@ -14,7 +21,7 @@ fn main() {
 		for payload_bytes in [1_024, 65_536] {
 			let frames: Vec<_> = (0..300)
 				.map(|index| moq_mux::container::Frame {
-					timestamp: hang::moq_net::Timestamp::from_millis(index * 33).unwrap(),
+					timestamp: moq_net::Timestamp::from_millis(index * 33).unwrap(),
 					duration: None,
 					payload: bytes::Bytes::from(vec![128; payload_bytes]),
 					keyframe: index % 30 == 0,

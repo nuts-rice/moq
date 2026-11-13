@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { Manual, Milli, Nano, Wall } from "@moq/clock";
+import { Duration, type Installed, Manual, Wall } from "@moq/clock";
 import * as Catalog from "@moq/hang/catalog";
 import * as Json from "@moq/json";
 import { Track } from "@moq/net";
@@ -17,7 +17,7 @@ test("catalog producer seeds subscribers and fans out edits", async () => {
 	const effect = new Effect();
 	const track = new Track.Producer("catalog.json");
 	catalog.serve(track, effect);
-	const consumer = new Json.Snapshot.Consumer<Catalog.Root>({ track: track.subscribe() });
+	const consumer = new Json.Snapshot.Consumer<Catalog.Root>({ track });
 
 	// A new subscriber is seeded with the current catalog.
 	expect((await consumer.latest())?.value.video).toEqual({ renditions: {} });
@@ -57,7 +57,7 @@ test("catalog producer computes the version from the fields it uses", async () =
 	const effect = new Effect();
 	const track = new Track.Producer("catalog.json");
 	catalog.serve(track, effect);
-	const consumer = new Json.Snapshot.Consumer<Catalog.Root>({ track: track.subscribe() });
+	const consumer = new Json.Snapshot.Consumer<Catalog.Root>({ track });
 	const video = { codec: "avc1.64001f", container: { kind: "legacy" as const } };
 
 	// A caller's own version is replaced by the computed one.
@@ -87,8 +87,8 @@ test("catalog producer publishes every update as a snapshot group", async () => 
 	const subscriber = track.subscribe().ordered();
 
 	const first = await subscriber.nextGroup();
-	expect(first?.sequence).toBe(0);
-	expect(await first?.readJson()).toEqual({ clock: expect.anything(), video: { renditions: {} } });
+	expect(first?.sequence).toBe(0n);
+	expect(await first?.readJson()).toEqual({ media: { clock: expect.anything() }, video: { renditions: {} } });
 	expect(first?.done).toBe(true);
 
 	catalog.mutate((c) => {
@@ -96,9 +96,9 @@ test("catalog producer publishes every update as a snapshot group", async () => 
 	});
 
 	const second = await subscriber.nextGroup();
-	expect(second?.sequence).toBe(1);
+	expect(second?.sequence).toBe(1n);
 	expect(await second?.readJson()).toEqual({
-		clock: expect.anything(),
+		media: { clock: expect.anything() },
 		video: { renditions: {} },
 		scte35: { splices: [] },
 	});
@@ -109,43 +109,43 @@ test("catalog producer publishes every update as a snapshot group", async () => 
 
 test("catalog producer advertises the page clock from the first snapshot", async () => {
 	const clock = new Manual();
-	clock.jump(Nano.fromMilli(Milli(5000)));
-	const restore = clock.install();
+	clock.jump(Duration.millis(5000));
+	const installed = clock.install();
 	const catalog = new CatalogProducer();
 
 	const effect = new Effect();
 	const track = new Track.Producer("catalog.json");
 	catalog.serve(track, effect);
-	const consumer = new Json.Snapshot.Consumer<Catalog.Root>({ track: track.subscribe() });
+	const consumer = new Json.Snapshot.Consumer<Catalog.Root>({ track });
 
-	// Before any rendition: a live-only publisher exposes its clock without an archive.
+	// Before any rendition: a live-only publisher exposes its clock.
 	const first = Catalog.RootSchema.parse((await consumer.latest())?.value);
-	if (!first.clock) throw new Error("expected a root clock");
-	expect(first.archive).toBeUndefined();
-	expect(first.clock.timescale).toBe(1_000_000);
+	const mapping = first.media?.clock;
+	if (!mapping) throw new Error("expected a media clock");
+	expect(mapping.timescale).toBe(1_000_000);
 
 	// A timestamp stamped the way capture does (the clock's instant in microseconds) maps onto the
 	// wall clock the page was reading at that instant.
-	const wall = Catalog.wallClockTime(first.clock, 5_000_000, 1_000_000).getTime();
-	expect(wall).toBe(Manual.WALL_START + 5000);
+	const wall = Catalog.wallClockTime(mapping, 5_000_000, 1_000_000).getTime();
+	expect(wall).toBe(Manual.WALL_START.asUnixMillis() + 5000);
 
 	// Later edits keep the mapping, even across a system-clock adjustment: it is fixed for the broadcast.
-	clock.stepWall(Wall(Manual.WALL_START + 60_000));
+	clock.stepWall(Manual.WALL_START.add(Duration.secs(60)));
 	catalog.mutate((c) => {
 		c.video = { renditions: {} };
 	});
 	const second = Catalog.RootSchema.parse((await consumer.latest())?.value);
-	expect(second.clock).toEqual(first.clock);
+	expect(second.media?.clock).toEqual(mapping);
 
 	effect.close();
-	restore();
+	installed.close();
 });
 
 test("catalog producer omits the clock when the page's wall clock is unset", async () => {
 	// A device booted before it synced its clock: the page began in 1970.
 	const clock = new Manual();
-	clock.stepWall(Wall(86_400_000));
-	const restore = clock.install();
+	clock.stepWall(Wall.unixMillis(86_400_000));
+	const installed = clock.install();
 	try {
 		const catalog = new CatalogProducer();
 		catalog.mutate((c) => {
@@ -160,7 +160,7 @@ test("catalog producer omits the clock when the page's wall clock is unset", asy
 		expect(await group?.readJson()).toEqual({ video: { renditions: {} } });
 		effect.close();
 	} finally {
-		restore();
+		installed.close();
 	}
 });
 
@@ -180,7 +180,7 @@ test("a reconnecting subscriber is seeded with the full current catalog", async 
 	const effect = new Effect();
 	const track = new Track.Producer("catalog.json");
 	catalog.serve(track, effect);
-	const seeded = (await new Json.Snapshot.Consumer<Catalog.Root>({ track: track.subscribe() }).latest())?.value;
+	const seeded = (await new Json.Snapshot.Consumer<Catalog.Root>({ track }).latest())?.value;
 	expect(seeded?.video).toEqual({ renditions: {} });
 	expect(seeded?.scte35).toEqual({ splices: [] });
 
@@ -334,16 +334,16 @@ for (const section of ["json", "binary"] as const) {
 
 describe("estimate publication window", () => {
 	let clock = new Manual();
-	let restore: (() => void) | undefined;
+	let installed: Installed | undefined;
 	const scopes: Effect[] = [];
-	const advance = (ms: number) => clock.advance(Nano.fromMilli(Milli(ms)));
+	const advance = (ms: number) => clock.advance(Duration.millis(ms));
 	afterEach(() => {
 		for (const scope of scopes.splice(0)) scope.close();
-		restore?.();
+		installed?.close();
 	});
 	function fixture() {
 		clock = new Manual();
-		restore = clock.install();
+		installed = clock.install();
 		const producer = new CatalogProducer();
 		producer.mutate((catalog) => {
 			catalog.video = { renditions: { v: { codec: "avc1.640028", container: { kind: "legacy" } } } };
@@ -352,14 +352,14 @@ describe("estimate publication window", () => {
 		scopes.push(effect);
 		const track = new Track.Producer("catalog.json");
 		producer.serve(track, effect);
-		const consumer = new Json.Snapshot.Consumer<Catalog.Root>({ track: track.subscribe() });
+		const consumer = new Json.Snapshot.Consumer<Catalog.Root>({ track });
 		const estimate = (jitter: number) =>
 			producer.mutate((catalog) => {
 				if (!catalog.video) throw new Error("video missing");
 				catalog.video.renditions.v.jitter = Catalog.u53(jitter);
 			});
 		// The newest catalog group published so far, followed through the live largest stream.
-		let newest: number | undefined;
+		let newest: bigint | undefined;
 		const observer = track.subscribe();
 		void (async () => {
 			for (let largest = await observer.largest(); largest; largest = await observer.largest()) {
@@ -367,7 +367,7 @@ describe("estimate publication window", () => {
 			}
 		})();
 		const sent = async () => {
-			await clock.advance(Nano(0));
+			await clock.advance(Duration.nanos(0));
 			return newest;
 		};
 		return { producer, effect, sent, consumer, estimate };
@@ -441,7 +441,7 @@ describe("estimate publication window", () => {
 		scopes.push(again);
 		const track = new Track.Producer("catalog.json");
 		producer.serve(track, again);
-		const reader = new Json.Snapshot.Consumer<Catalog.Root>({ track: track.subscribe() });
+		const reader = new Json.Snapshot.Consumer<Catalog.Root>({ track });
 		await reader.latest();
 		estimate(3);
 		expect((await reader.latest())?.value.video?.renditions.v.jitter).toBe(Catalog.u53(3));
@@ -459,7 +459,7 @@ describe("estimate publication window", () => {
 		const leading = await sent();
 		await advance(990);
 		expect((await consumer.latest())?.value.video?.renditions.v.delay).toBe(Catalog.u53(7));
-		expect(await sent()).toBe((leading ?? 0) + 1);
+		expect(await sent()).toBe((leading ?? 0n) + 1n);
 		producer.mutate((catalog) => {
 			if (!catalog.video) throw new Error("video missing");
 			catalog.video.renditions.other = { codec: "avc1.640028", container: { kind: "legacy" } };

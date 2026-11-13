@@ -1,54 +1,4 @@
 //! Carrying a transport stream whole, without demultiplexing it.
-//!
-//! [`Passthrough`] publishes every 188-byte packet of its input, in order, on one track named by
-//! the catalog's [`m2ts`](hang::catalog::M2ts) section. It reads the PAT and PMT to find the
-//! program clock and the video stream, and reads nothing else past an adaptation field, so a
-//! scrambled multiplex groups and paces exactly like its clear twin.
-//!
-//! # Objects and groups
-//!
-//! An object runs from one PCR packet on the clock PID to the next, and is also cut wherever a
-//! group starts. A group starts at:
-//!
-//! - a packet with `random_access_indicator` on the video PID, or on the clock PID when the
-//!   program has no video;
-//! - a PCR with `discontinuity_indicator` that jumps forward, since no group may hold a PCR
-//!   discontinuity;
-//! - the first PCR at least [`FALLBACK`] after the group's start, for a source that never marks
-//!   random access;
-//! - the first object that would take the group past [`GROUP_BYTES_MAX`] or
-//!   [`GROUP_OBJECTS_MAX`], so a long GOP cannot outgrow what a relay caches. Objects are never
-//!   split to meet the bound.
-//!
-//! Only the first of these makes a group a random access point, so any other start publishes
-//! [`random_access`](hang::catalog::M2ts::random_access) false from then on, as does any group
-//! carried while the layout allows no random access (more than one program or video stream). A
-//! group the PCR discontinuity starts is behind a break even when it is also a random access
-//! point.
-//!
-//! Bytes before the first group are dropped: until the PMT, a PCR, and a group start have all
-//! been seen there is no group to put them in. The track is byte-identical to the input from its
-//! first group on, and only from there. Bytes off the 188-byte packet grid are dropped too.
-//!
-//! # Timestamps
-//!
-//! An object's timestamp is the PCR time of its first byte, interpolated at the rate between the
-//! PCRs either side of it, floored to microseconds. A PCR stamps the byte holding the last bit of
-//! its base, ten bytes into its packet, so even an object that starts at a PCR packet sits ten
-//! bytes of that rate before its own PCR.
-//!
-//! Every timestamp is then shifted onto the catalog's [`Clock`](crate::Clock) by one offset, fixed
-//! through the reservation's [`Timebase`](crate::catalog::Timebase) by the first object: zero when
-//! that object places the clock, and otherwise whatever lands it at now on a clock already in use.
-//!
-//! PCRs are unwrapped into a 64-bit count of 27 MHz ticks that never goes back. A step forward of
-//! at most half the 2^33 * 300 tick period adds to the count, across the wrap included. A PCR with
-//! `discontinuity_indicator` whose step is forward by that measure adds the step too, after the
-//! bytes before it are timed at the rate before it, and starts a group behind a break marker. Any
-//! step back ends the import: [`PcrRewindError`] without the flag, [`PcrRestartError`] with it,
-//! since a signalled restart is new content and needs a new broadcast. The timeline therefore
-//! depends only on the bytes since the importer's first PCR and its shift, and two importers of one
-//! feed started at the same packet each placing its own catalog's clock publish identical objects.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
@@ -62,17 +12,17 @@ use super::psi::{self, Pmt};
 /// The PCR clock, in Hz.
 pub(super) const PCR_HZ: u64 = 27_000_000;
 
-/// The longest a group runs without a random access point before a PCR starts the next.
-pub const FALLBACK: std::time::Duration = std::time::Duration::from_secs(1);
+/// The longest a group runs without a random access point before a PCR starts the next, in
+/// PCR ticks: one second.
 const FALLBACK_TICKS: u64 = PCR_HZ;
 
-/// The most bytes a group holds before its next object starts another: half of what `moq-net`
-/// caches of one group, so the frame headers and an object of slack never reach the cap.
-pub const GROUP_BYTES_MAX: u64 = moq_net::group::MAX_CACHE_BYTES / 2;
+/// The most bytes a group holds before its next object starts another, so a source with sparse
+/// random access points still gives a joiner a group it can take whole.
+pub(super) const GROUP_BYTES_MAX: u64 = 16 * 1024 * 1024;
 
-/// The most objects a group holds before its next object starts another: half of `moq-net`'s
-/// frame cap, which a source stamping PCRs far more often than the 40 ms norm could reach.
-pub const GROUP_OBJECTS_MAX: usize = moq_net::group::MAX_GROUP_FRAMES / 2;
+/// The most objects a group holds before its next object starts another, which a source stamping
+/// PCRs far more often than the 40 ms norm could otherwise grow without a boundary.
+pub(super) const GROUP_OBJECTS_MAX: usize = 4096;
 
 /// The bytes a PCR sits into its packet: four of header, the adaptation field's length and flags,
 /// and the five bytes the 33-bit base ends in.
@@ -104,68 +54,58 @@ const VIDEO_STREAM_TYPES: &[u8] = &[
 	0xEA, // VC-1
 ];
 
-/// The input is not a stream of 188-byte packets.
-///
-/// A 192-byte source (BDAV M2TS, a four-byte timestamp before each packet) or a 204-byte one
-/// (Reed-Solomon parity after each) is refused rather than reframed, since dropping those bytes
-/// would break the byte identity passthrough exists for.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-#[error("transport stream uses {size}-byte packets; passthrough carries 188-byte packets only")]
-pub struct PacketSizeError {
-	/// The packet size the sync bytes recur at.
-	pub size: usize,
-}
-
-/// The clock PID's PCR went backwards without `discontinuity_indicator`.
-///
-/// The source broke its own timebase without saying so, which leaves no timestamp that both
-/// follows the PCR and stays on one timeline.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-#[error("PCR on PID {pid} went back from {from} to {to} without a discontinuity_indicator")]
-pub struct PcrRewindError {
-	/// The clock PID.
-	pub pid: u16,
-	/// The previous PCR, raw 27 MHz ticks.
-	pub from: u64,
-	/// The PCR that stepped back, raw 27 MHz ticks.
-	pub to: u64,
-}
-
-/// The clock PID's PCR went backwards with `discontinuity_indicator`: the source restarted.
-///
-/// What follows is new content, which belongs in a new broadcast rather than on a timeline that
-/// steps back, so the import ends here.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-#[error("PCR on PID {pid} restarted from {from} back to {to}; a restart needs a new broadcast")]
-pub struct PcrRestartError {
-	/// The clock PID.
-	pub pid: u16,
-	/// The previous PCR, raw 27 MHz ticks.
-	pub from: u64,
-	/// The flagged PCR, raw 27 MHz ticks.
-	pub to: u64,
-}
-
-/// The clock PID carried no PCR across more bytes than a group may hold.
-///
-/// Those bytes cannot be timed, and holding them for a PCR that may never come is unbounded.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-#[error("no PCR on PID {pid} for {bytes} bytes")]
-pub struct PcrGapError {
-	/// The clock PID.
-	pub pid: u16,
-	/// The bytes waiting on a PCR.
-	pub bytes: u64,
-}
-
 /// Publishes a transport stream verbatim, as one track of whole 188-byte packets.
 ///
-/// See the [module documentation](self) for where objects and groups start and how they are
-/// timestamped.
+/// Every packet goes out in input order, on the track the catalog's [`m2ts`](hang::catalog::M2ts)
+/// section names. It reads the PAT and PMT to find the program clock and the video stream, and
+/// reads nothing else past an adaptation field, so a scrambled multiplex groups and paces exactly
+/// like its clear twin.
+///
+/// # Objects and groups
+///
+/// An object runs from one PCR packet on the clock PID to the next, and is also cut wherever a
+/// group starts. A group starts at:
+///
+/// - a packet with `random_access_indicator` on the video PID, or on the clock PID when the
+///   program has no video;
+/// - a PCR with `discontinuity_indicator` that jumps forward, since no group may hold a PCR
+///   discontinuity;
+/// - the first PCR at least one second after the group's start, for a source that never marks
+///   random access;
+/// - the first object that would take the group past half of what `moq-net` caches of one group,
+///   in bytes or in frames, so a long GOP cannot outgrow what a relay caches. Objects are never
+///   split to meet the bound.
+///
+/// Only the first of these makes a group a random access point, so any other start publishes
+/// [`random_access`](hang::catalog::M2ts::random_access) false from then on, as does any group
+/// carried while the layout allows no random access (more than one program or video stream). A
+/// group the PCR discontinuity starts is behind a break even when it is also a random access
+/// point.
+///
+/// Bytes before the first group are dropped: until the PMT, a PCR, and a group start have all
+/// been seen there is no group to put them in. The track is byte-identical to the input from its
+/// first group on, and only from there. Bytes off the 188-byte packet grid are dropped too.
+///
+/// # Timestamps
+///
+/// An object's timestamp is the PCR time of its first byte, interpolated at the rate between the
+/// PCRs either side of it, floored to microseconds. A PCR stamps the byte holding the last bit of
+/// its base, ten bytes into its packet, so even an object that starts at a PCR packet sits ten
+/// bytes of that rate before its own PCR.
+///
+/// Every timestamp is then shifted onto the catalog's [`Clock`](crate::Clock) by one offset, fixed
+/// through the reservation's [`Timebase`](crate::catalog::Timebase) by the first object: zero when
+/// that object places the clock, and otherwise whatever lands it at now on a clock already in use.
+///
+/// PCRs are unwrapped into a 64-bit count of 27 MHz ticks that never goes back. A step forward of
+/// at most half the 2^33 * 300 tick period adds to the count, across the wrap included. A PCR with
+/// `discontinuity_indicator` whose step is forward by that measure adds the step too, after the
+/// bytes before it are timed at the rate before it, and starts a group behind a break marker. Any
+/// step back ends the import: [`PcrRewind`](crate::Error::PcrRewind) without the flag,
+/// [`PcrRestart`](crate::Error::PcrRestart) with it, since a signalled restart is new content and
+/// needs a new broadcast. The timeline therefore depends only on the bytes since the importer's
+/// first PCR and its shift, and two importers of one feed started at the same packet each placing
+/// its own catalog's clock publish identical objects.
 pub struct Passthrough<E: crate::catalog::hang::CatalogExt = ()> {
 	catalog: crate::catalog::Producer<E>,
 	/// Held until the first group is written, so the first catalog already names the track with
@@ -203,20 +143,14 @@ pub struct Passthrough<E: crate::catalog::hang::CatalogExt = ()> {
 	/// Whether the PMT of the clock's program has been read.
 	mapped: bool,
 
-	timebase: Option<Timebase>,
+	timing: Clock,
 	/// A `discontinuity_indicator` on the clock PID, waiting for the PCR that it flags (normally
 	/// in the same packet).
 	pending_break: bool,
-	/// Before the first group: the PCR time the importer started waiting for a group start at.
-	waiting_since: Option<u64>,
 	/// The PCR time of the last object written, which no later one goes below.
 	written: u64,
 
-	/// The object being filled, from its first packet.
-	open: Option<Object>,
-	/// Closed objects waiting on the next PCR for their timestamps.
-	queue: VecDeque<Object>,
-	group: Option<Group>,
+	groups: Groups,
 	/// Whether every group so far started at a random access point, and the layout allowed random
 	/// access throughout.
 	all_random_access: bool,
@@ -231,6 +165,34 @@ struct Section<E: crate::catalog::hang::CatalogExt> {
 	written: hang::catalog::M2ts,
 }
 
+/// A passthrough that [finished](Passthrough::finish): its track has ended, and it can still be
+/// read or aborted, but it takes no more input.
+///
+/// Dropping it releases the track and removes the catalog's `m2ts` section.
+///
+/// ```compile_fail,E0599
+/// # fn cannot_decode(mut passthrough: moq_mux::container::ts::passthrough::Finished) {
+/// passthrough.decode(b"").unwrap();
+/// # }
+/// ```
+#[must_use = "dropping it releases the track and its catalog section"]
+pub struct Finished<E: crate::catalog::hang::CatalogExt = ()> {
+	passthrough: Passthrough<E>,
+}
+
+impl<E: crate::catalog::hang::CatalogExt> Finished<E> {
+	/// The name of the track carrying the packets.
+	pub fn track(&self) -> &str {
+		self.passthrough.track()
+	}
+
+	/// Release the track's cache, reporting `err` to readers that have not drained it; see
+	/// [`Passthrough::abort`].
+	pub fn abort(self, err: moq_net::Error) {
+		self.passthrough.abort(err);
+	}
+}
+
 impl<E: crate::catalog::hang::CatalogExt> Drop for Section<E> {
 	fn drop(&mut self) {
 		// A closed catalog has nothing left to remove it from.
@@ -242,6 +204,28 @@ impl<E: crate::catalog::hang::CatalogExt> Drop for Section<E> {
 struct Program {
 	pcr_pid: Option<u16>,
 	video: Vec<u16>,
+}
+
+/// The clock pacing the multiplex.
+enum Clock {
+	/// No PCR yet: nothing can be timed, so no object opens.
+	Unseen,
+	Seen {
+		timebase: Timebase,
+		/// The object being filled, from its first packet.
+		open: Option<Object>,
+		/// Closed objects waiting on the next PCR for their timestamps.
+		queue: VecDeque<Object>,
+	},
+}
+
+/// The groups written so far.
+enum Groups {
+	/// Before the first group: the PCR time the importer started waiting for a group start at,
+	/// once the clock's program is mapped and a PCR seen.
+	Waiting(Option<u64>),
+	/// The group being written.
+	Writing(Group),
 }
 
 /// The PCRs since the importer's first, or since the last flagged jump.
@@ -317,13 +301,10 @@ impl<E: crate::catalog::hang::CatalogExt> Passthrough<E> {
 			access_pid: None,
 			single: false,
 			mapped: false,
-			timebase: None,
+			timing: Clock::Unseen,
 			pending_break: false,
-			waiting_since: None,
 			written: 0,
-			open: None,
-			queue: VecDeque::new(),
-			group: None,
+			groups: Groups::Waiting(None),
 			all_random_access: true,
 			mux_rate: Meter::default(),
 		})
@@ -347,7 +328,7 @@ impl<E: crate::catalog::hang::CatalogExt> Passthrough<E> {
 
 	/// Append `data` and publish every whole packet it completes. A trailing partial packet is
 	/// kept for the next call.
-	pub fn decode(&mut self, data: &[u8]) -> anyhow::Result<()> {
+	pub fn decode(&mut self, data: &[u8]) -> crate::Result<()> {
 		self.scratch.extend_from_slice(data);
 		if !self.sized {
 			self.probe_packet_size(false)?;
@@ -355,11 +336,25 @@ impl<E: crate::catalog::hang::CatalogExt> Passthrough<E> {
 		self.packets()
 	}
 
-	/// Publish what is left at the end of the input and close the track.
+	/// Publish what is left at the end of the input, close the track, and return the
+	/// [`Finished`] passthrough.
 	///
 	/// No later PCR will arrive, so the objects since the last one are timed at the rate of the
-	/// interval before it. The catalog keeps the `m2ts` section until the importer drops.
-	pub fn finish(&mut self) -> anyhow::Result<()> {
+	/// interval before it. The catalog keeps the `m2ts` section until the [`Finished`] passthrough
+	/// drops.
+	///
+	/// A finish that fails ends the track with an error, so it can't be retried.
+	pub fn finish(mut self) -> crate::Result<Finished<E>> {
+		if let Err(err) = self.end() {
+			// The objects already written stay readable, then subscribers get an error.
+			let _ = self.media.end_with(Some(err.reason()));
+			return Err(err);
+		}
+		Ok(Finished { passthrough: self })
+	}
+
+	/// Publish the rest of the input and finish the track, stopping at the first failure.
+	fn end(&mut self) -> crate::Result<()> {
 		if !self.sized {
 			self.probe_packet_size(true)?;
 			self.packets()?;
@@ -367,7 +362,7 @@ impl<E: crate::catalog::hang::CatalogExt> Passthrough<E> {
 		self.close_object();
 		self.drain_queue()?;
 		self.reservation = None;
-		self.media.finish()?;
+		self.media.end_with(None)?;
 		Ok(())
 	}
 
@@ -380,7 +375,7 @@ impl<E: crate::catalog::hang::CatalogExt> Passthrough<E> {
 	}
 
 	/// Publish every whole packet in the scratch buffer, once the packet size is settled.
-	fn packets(&mut self) -> anyhow::Result<()> {
+	fn packets(&mut self) -> crate::Result<()> {
 		if !self.sized {
 			return Ok(());
 		}
@@ -400,7 +395,7 @@ impl<E: crate::catalog::hang::CatalogExt> Passthrough<E> {
 	/// arrived, so where the grid is found does not depend on how the input was chunked. At the
 	/// end of the input a shorter run settles the offsets left, so a stream too short for a full
 	/// run still publishes.
-	fn probe_packet_size(&mut self, eof: bool) -> anyhow::Result<()> {
+	fn probe_packet_size(&mut self, eof: bool) -> crate::Result<()> {
 		let scratch = &self.scratch;
 		let syncs = |k: usize, size: usize, run: usize| (0..run).all(|i| scratch.get(k + i * size) == Some(&0x47));
 		let checkable = (scratch.len() + 1).saturating_sub(SYNC_WINDOW);
@@ -431,7 +426,7 @@ impl<E: crate::catalog::hang::CatalogExt> Passthrough<E> {
 				self.scratch.drain(..k);
 				self.sized = true;
 			}
-			Some((_, size)) => return Err(PacketSizeError { size }.into()),
+			Some((_, size)) => return Err(crate::Error::TsPacketSize(size)),
 			// No grid starts at any offset tried: leading junk.
 			None => {
 				self.scratch.drain(..checkable);
@@ -440,7 +435,7 @@ impl<E: crate::catalog::hang::CatalogExt> Passthrough<E> {
 		Ok(())
 	}
 
-	fn packet(&mut self, pkt: &[u8; TsPacket::SIZE]) -> anyhow::Result<()> {
+	fn packet(&mut self, pkt: &[u8; TsPacket::SIZE]) -> crate::Result<()> {
 		let at = self.offset;
 		self.offset += TsPacket::SIZE as u64;
 		let pid = u16::from_be_bytes([pkt[1] & 0x1f, pkt[2]]);
@@ -452,7 +447,6 @@ impl<E: crate::catalog::hang::CatalogExt> Passthrough<E> {
 		{
 			self.pmt_packet(pmt_pid, pkt)?;
 		}
-		self.mux_rate.packet();
 
 		// A packet the demodulator flagged corrupt, or whose adaptation field overruns it, is
 		// carried like any other, but nothing is read from it.
@@ -474,49 +468,59 @@ impl<E: crate::catalog::hang::CatalogExt> Passthrough<E> {
 			start = Some(Start::RandomAccess);
 		}
 
-		if start.is_some() || (clock && self.started()) {
-			if !clock {
-				self.close_object();
+		let opens = start.is_some() || (clock && self.started());
+		let Clock::Seen { open, queue, .. } = &mut self.timing else {
+			return Ok(());
+		};
+		if opens {
+			// A PCR packet already closed the object before it.
+			if !clock && let Some(object) = open.take() {
+				queue.push_back(object);
 			}
 			let mut payload = BytesMut::with_capacity(TsPacket::SIZE * 8);
 			payload.extend_from_slice(pkt);
-			self.open = Some(Object {
+			*open = Some(Object {
 				at,
 				payload,
 				start,
 				discontinuity,
 			});
-		} else if let Some(open) = self.open.as_mut() {
+		} else if let Some(open) = open.as_mut() {
 			open.payload.extend_from_slice(pkt);
 		}
 
-		let waiting = self.open.as_ref().map_or(0, |open| open.payload.len() as u64)
-			+ self.queue.iter().map(|object| object.payload.len() as u64).sum::<u64>();
+		let waiting = open.as_ref().map_or(0, |open| open.payload.len() as u64)
+			+ queue.iter().map(|object| object.payload.len() as u64).sum::<u64>();
 		if waiting > GROUP_BYTES_MAX {
-			return Err(PcrGapError {
+			return Err(crate::Error::PcrGap {
 				pid: self.pcr_pid.unwrap_or_default(),
 				bytes: waiting,
-			}
-			.into());
+			});
 		}
 		Ok(())
 	}
 
 	/// A PCR at `at` on the clock PID: close the object it ends, time everything waiting on it,
 	/// and say whether its packet starts a group.
-	fn clock(&mut self, pid: u16, raw: u64, at: u64) -> anyhow::Result<Option<Start>> {
+	fn clock(&mut self, pid: u16, raw: u64, at: u64) -> crate::Result<Option<Start>> {
 		let at = at + PCR_OFFSET;
 		self.close_object();
 		let flagged = std::mem::take(&mut self.pending_break);
 
-		let Some(timebase) = self.timebase.as_mut() else {
+		let Clock::Seen { timebase, .. } = &mut self.timing else {
 			// The first PCR starts the count at its own value.
-			self.timebase = Some(Timebase {
-				raw,
-				samples: VecDeque::from([Sample { at, ticks: raw }]),
-			});
-			self.waiting_since = self.mapped.then_some(raw);
-			if self.mux_rate.pcr(raw) {
+			self.timing = Clock::Seen {
+				timebase: Timebase {
+					raw,
+					samples: VecDeque::from([Sample { at, ticks: raw }]),
+				},
+				open: None,
+				queue: VecDeque::new(),
+			};
+			if let Groups::Waiting(since) = &mut self.groups {
+				*since = self.mapped.then_some(raw);
+			}
+			if self.mux_rate.pcr(raw, self.offset / TsPacket::SIZE as u64) {
 				self.record()?;
 			}
 			return Ok(None);
@@ -528,8 +532,8 @@ impl<E: crate::catalog::hang::CatalogExt> Passthrough<E> {
 		if step > PCR_WRAP / 2 {
 			let from = timebase.raw;
 			return Err(match flagged {
-				true => PcrRestartError { pid, from, to: raw }.into(),
-				false => PcrRewindError { pid, from, to: raw }.into(),
+				true => crate::Error::PcrRestart { pid, from, to: raw },
+				false => crate::Error::PcrRewind { pid, from, to: raw },
 			});
 		}
 		let last = timebase.samples.back().expect("a timebase has a sample").ticks;
@@ -539,19 +543,24 @@ impl<E: crate::catalog::hang::CatalogExt> Passthrough<E> {
 			// and the new side carries on from there.
 			self.drain_queue()?;
 			let ticks = (last + step).max(self.written);
-			self.timebase = Some(Timebase {
-				raw,
-				samples: VecDeque::from([Sample { at, ticks }]),
-			});
+			// The object before was closed and the queue drained, so both start empty.
+			self.timing = Clock::Seen {
+				timebase: Timebase {
+					raw,
+					samples: VecDeque::from([Sample { at, ticks }]),
+				},
+				open: None,
+				queue: VecDeque::new(),
+			};
 			if self.mux_rate.discontinuity() {
 				self.record()?;
 			}
-			if self.mux_rate.pcr(raw) {
+			if self.mux_rate.pcr(raw, self.offset / TsPacket::SIZE as u64) {
 				self.record()?;
 			}
 			// The jump is not elapsed time, so the wait for the first group starts over.
-			if self.waiting_since.is_some() {
-				self.waiting_since = Some(ticks);
+			if let Groups::Waiting(Some(since)) = &mut self.groups {
+				*since = ticks;
 			}
 			return Ok(self.started().then_some(Start::Discontinuity));
 		}
@@ -563,14 +572,14 @@ impl<E: crate::catalog::hang::CatalogExt> Passthrough<E> {
 			timebase.samples.pop_front();
 		}
 		self.drain_queue()?;
-		if self.mux_rate.pcr(raw) {
+		if self.mux_rate.pcr(raw, self.offset / TsPacket::SIZE as u64) {
 			self.record()?;
 		}
 
-		let since = match &self.group {
-			Some(group) => Some(group.ticks),
-			None if self.mapped => Some(*self.waiting_since.get_or_insert(ticks)),
-			None => None,
+		let since = match &mut self.groups {
+			Groups::Writing(group) => Some(group.ticks),
+			Groups::Waiting(since) if self.mapped => Some(*since.get_or_insert(ticks)),
+			Groups::Waiting(_) => None,
 		};
 		Ok(since
 			.filter(|since| ticks.saturating_sub(*since) >= FALLBACK_TICKS && self.can_start())
@@ -580,31 +589,38 @@ impl<E: crate::catalog::hang::CatalogExt> Passthrough<E> {
 	/// Whether a group may start here: once the first one has, always; before it, only once the
 	/// clock's program is mapped and a PCR has been seen.
 	fn can_start(&self) -> bool {
-		self.started() || (self.mapped && self.timebase.is_some())
+		self.started() || (self.mapped && matches!(self.timing, Clock::Seen { .. }))
 	}
 
 	/// Whether the first group has started, written or still waiting on its timestamp.
 	fn started(&self) -> bool {
-		self.group.is_some() || self.open.is_some() || !self.queue.is_empty()
+		matches!(self.groups, Groups::Writing(_))
+			|| matches!(&self.timing, Clock::Seen { open, queue, .. } if open.is_some() || !queue.is_empty())
 	}
 
 	fn close_object(&mut self) {
-		if let Some(object) = self.open.take() {
-			self.queue.push_back(object);
+		if let Clock::Seen { open, queue, .. } = &mut self.timing
+			&& let Some(object) = open.take()
+		{
+			queue.push_back(object);
 		}
 	}
 
 	/// Time and write every waiting object against the current timebase.
-	fn drain_queue(&mut self) -> anyhow::Result<()> {
-		while let Some(object) = self.queue.pop_front() {
-			let timebase = self.timebase.as_ref().expect("an object follows a PCR");
+	fn drain_queue(&mut self) -> crate::Result<()> {
+		loop {
+			let Clock::Seen { timebase, queue, .. } = &mut self.timing else {
+				return Ok(());
+			};
+			let Some(object) = queue.pop_front() else {
+				return Ok(());
+			};
 			let ticks = locate(object.at, &timebase.samples);
 			self.write(object, ticks)?;
 		}
-		Ok(())
 	}
 
-	fn write(&mut self, object: Object, ticks: u64) -> anyhow::Result<()> {
+	fn write(&mut self, object: Object, ticks: u64) -> crate::Result<()> {
 		// Extrapolating past the last PCR before a small flagged jump can overshoot the jump.
 		let ticks = ticks.max(self.written);
 		self.written = ticks;
@@ -612,31 +628,34 @@ impl<E: crate::catalog::hang::CatalogExt> Passthrough<E> {
 		// The first object, which starts a group, anchors the shift and is live on arrival.
 		let timestamp = self.shift.shift(timestamp)?;
 		let size = object.payload.len() as u64;
-		let start = object.start.or_else(|| {
-			self.group
-				.as_ref()
-				.filter(|group| group.bytes + size > GROUP_BYTES_MAX || group.objects >= GROUP_OBJECTS_MAX)
-				.map(|_| Start::Full)
-		});
+		let start = match (object.start, &mut self.groups) {
+			(Some(start), _) => Some(start),
+			(None, Groups::Writing(group)) => {
+				if group.bytes + size > GROUP_BYTES_MAX || group.objects >= GROUP_OBJECTS_MAX {
+					Some(Start::Full)
+				} else {
+					group.bytes += size;
+					group.objects += 1;
+					None
+				}
+			}
+			// Only an object that starts a group opens before the first one.
+			(None, Groups::Waiting(_)) => Some(Start::Fallback),
+		};
 
 		if let Some(start) = start {
-			if object.discontinuity && self.group.is_some() {
+			if object.discontinuity && matches!(self.groups, Groups::Writing(_)) {
 				self.media.discontinuity()?;
 			}
 			if start != Start::RandomAccess || !self.single {
 				self.all_random_access = false;
 			}
-			self.group = Some(Group {
+			self.groups = Groups::Writing(Group {
 				ticks,
-				bytes: 0,
-				objects: 0,
+				bytes: size,
+				objects: 1,
 			});
 		}
-
-		// Only an object that starts a group is ever opened before the first one.
-		let group = self.group.as_mut().expect("the first object starts a group");
-		group.bytes += size;
-		group.objects += 1;
 		self.media.write(crate::container::Frame {
 			timestamp,
 			duration: None,
@@ -651,8 +670,8 @@ impl<E: crate::catalog::hang::CatalogExt> Passthrough<E> {
 	}
 
 	/// Write the section to the catalog if it changed. Nothing is written before the first group.
-	fn record(&mut self) -> anyhow::Result<()> {
-		if self.group.is_none() && self.section.is_none() {
+	fn record(&mut self) -> crate::Result<()> {
+		if matches!(self.groups, Groups::Waiting(_)) && self.section.is_none() {
 			return Ok(());
 		}
 		let mut section = hang::catalog::M2ts::new(self.media.name());
@@ -674,7 +693,7 @@ impl<E: crate::catalog::hang::CatalogExt> Passthrough<E> {
 		Ok(())
 	}
 
-	fn pat_packet(&mut self, pkt: &[u8; TsPacket::SIZE]) -> anyhow::Result<()> {
+	fn pat_packet(&mut self, pkt: &[u8; TsPacket::SIZE]) -> crate::Result<()> {
 		let Some(pat) = self.pat.push(pkt, &mut self.crc_errors) else {
 			return Ok(());
 		};
@@ -697,7 +716,7 @@ impl<E: crate::catalog::hang::CatalogExt> Passthrough<E> {
 		self.remap()
 	}
 
-	fn pmt_packet(&mut self, pid: Pid, pkt: &[u8; TsPacket::SIZE]) -> anyhow::Result<()> {
+	fn pmt_packet(&mut self, pid: Pid, pkt: &[u8; TsPacket::SIZE]) -> crate::Result<()> {
 		let mut sections = Vec::new();
 		self.pmt_sections.entry(pid).or_default().push(pkt, &mut sections);
 		let mut changed = false;
@@ -738,7 +757,7 @@ impl<E: crate::catalog::hang::CatalogExt> Passthrough<E> {
 
 	/// The PAT or a PMT changed: find the clock, the PID that marks random access, and whether
 	/// the layout allows random access at all.
-	fn remap(&mut self) -> anyhow::Result<()> {
+	fn remap(&mut self) -> crate::Result<()> {
 		let clock = match self.pcr_override {
 			Some(pid) => self
 				.programs

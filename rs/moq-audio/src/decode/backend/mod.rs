@@ -6,8 +6,7 @@
 //!
 //! [`open`] tries the platform decoders before the software ones, skipping any
 //! that does not advertise the catalog codec, and refuses when none opens the
-//! track. [`Kind::Named`] names the codec, not a backend, so which backend
-//! decodes it stays the library's choice. The software tier is libopus for Opus, a passthrough for PCM, and
+//! track. Which backend decodes a codec stays the library's choice. The software tier is libopus for Opus, a passthrough for PCM, and
 //! symphonia for AAC-LC mono and stereo (behind the `aac` feature). No platform
 //! decoder is wired in yet.
 
@@ -17,6 +16,10 @@ use super::Decoded;
 use super::decoder::{Config, Kind};
 use crate::{Error, Layout};
 
+#[cfg(test)]
+#[path = "../conformance.rs"]
+mod conformance;
+
 mod libopus;
 mod pcm;
 #[cfg(feature = "aac")]
@@ -24,14 +27,24 @@ mod symphonia;
 
 /// An opened decoder: packets in, interleaved `f32` PCM out.
 ///
+/// Output comes back in stream order, but a codec that pipelines (MediaCodec)
+/// may hold a packet's samples past later submissions.
+///
 /// Unwind safe because the published `Decoder` that boxes it is.
 pub(crate) trait Backend: Send + std::panic::UnwindSafe + std::panic::RefUnwindSafe {
-	/// Decode one packet into interleaved samples at [`sample_rate`](Self::sample_rate)
-	/// and [`layout`](Self::layout), untrimmed.
-	fn decode(&mut self, packet: &[u8]) -> Result<Decoded, Error>;
+	/// Submit one packet.
+	fn decode(&mut self, packet: &[u8]) -> Result<(), Error>;
 
-	/// Drop codec history after a discontinuity, so the next packet does not
-	/// predict from audio that is no longer adjacent.
+	/// Pop the oldest ready output, interleaved at [`sample_rate`](Self::sample_rate)
+	/// and [`layout`](Self::layout) and untrimmed, or `None` while the codec holds the rest.
+	fn receive(&mut self) -> Result<Option<Decoded>, Error>;
+
+	/// Mark the end of input, so [`receive`](Self::receive) returns every output
+	/// the codec still holds. The next packet submitted starts new input.
+	fn flush(&mut self) -> Result<(), Error>;
+
+	/// Drop codec history, held output included, after a discontinuity, so the
+	/// next packet does not predict from audio that is no longer adjacent.
 	fn reset(&mut self) -> Result<(), Error>;
 
 	/// The rate this backend decodes to, which may differ from the catalog's.
@@ -84,39 +97,19 @@ const SOFTWARE: &[Candidate] = &[
 	},
 ];
 
-/// The name [`Kind::Named`] uses for a catalog codec, `None` for one this crate has no name for.
-fn codec_name(codec: &AudioCodec) -> Option<&'static str> {
-	match codec {
-		AudioCodec::Opus => Some("opus"),
-		AudioCodec::Pcm => Some("pcm"),
-		AudioCodec::AAC(_) => Some("aac"),
-		_ => None,
-	}
-}
-
 /// Open the first backend that advertises the catalog codec and accepts the track.
 pub(crate) fn open(catalog: &AudioConfig, config: &Config) -> Result<Box<dyn Backend>, Error> {
-	if let Kind::Named(requested) = &config.kind
-		&& codec_name(&catalog.codec) != Some(requested)
-	{
-		return Err(Error::Unsupported(format!(
-			"audio decoder {requested:?} is unavailable for {}",
-			catalog.codec
-		)));
-	}
-
-	select(catalog, candidates(&config.kind, PLATFORM, SOFTWARE))
+	select(catalog, candidates(config.kind, PLATFORM, SOFTWARE))
 }
 
 /// The candidates `kind` allows, in the order to try them.
 ///
 /// Takes the tiers as arguments so a test can supply stubs instead of whatever
 /// this host compiles in.
-fn candidates<'a>(kind: &Kind, platform: &'a [Candidate], software: &'a [Candidate]) -> Vec<&'a Candidate> {
+fn candidates<'a>(kind: Kind, platform: &'a [Candidate], software: &'a [Candidate]) -> Vec<&'a Candidate> {
 	match kind {
 		Kind::Software => software.iter().collect(),
-		// `open` has already checked that a name matches the codec.
-		Kind::Auto | Kind::Named(_) => platform.iter().chain(software).collect(),
+		Kind::Auto => platform.iter().chain(software).collect(),
 	}
 }
 
@@ -134,10 +127,18 @@ fn select(catalog: &AudioConfig, candidates: Vec<&Candidate>) -> Result<Box<dyn 
 		}
 	}
 
-	// One refusal is the whole answer, so keep its variant: a malformed
-	// description stays a container error rather than becoming a string.
+	// One refusal is the whole answer, so keep its variant. Among several, a fault
+	// outranks the refusals: folding it into `Unsupported` would report a codec
+	// failure as a configuration another rendition could avoid.
 	if refused.len() == 1 {
 		let (_, err) = refused.remove(0);
+		return Err(err);
+	}
+	if let Some(fault) = refused
+		.iter()
+		.position(|(_, err)| !matches!(err, Error::Unsupported(_)))
+	{
+		let (_, err) = refused.swap_remove(fault);
 		return Err(err);
 	}
 	if !refused.is_empty() {
@@ -151,17 +152,21 @@ fn select(catalog: &AudioConfig, candidates: Vec<&Candidate>) -> Result<Box<dyn 
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::Activity;
 
 	/// Opens anything it advertises and reports which candidate it came from.
 	struct Stub(&'static str);
 
 	impl Backend for Stub {
-		fn decode(&mut self, _packet: &[u8]) -> Result<Decoded, Error> {
-			Ok(Decoded {
-				samples: Vec::new(),
-				activity: Activity::Active,
-			})
+		fn decode(&mut self, _packet: &[u8]) -> Result<(), Error> {
+			Ok(())
+		}
+
+		fn receive(&mut self) -> Result<Option<Decoded>, Error> {
+			Ok(None)
+		}
+
+		fn flush(&mut self) -> Result<(), Error> {
+			Ok(())
 		}
 
 		fn reset(&mut self) -> Result<(), Error> {
@@ -213,7 +218,7 @@ mod tests {
 	}
 
 	fn pick(kind: Kind, platform: &[Candidate], software: &[Candidate]) -> Result<String, Error> {
-		let backend = select(&opus(), candidates(&kind, platform, software))?;
+		let backend = select(&opus(), candidates(kind, platform, software))?;
 		Ok(backend.name().to_owned())
 	}
 
@@ -235,13 +240,6 @@ mod tests {
 		assert_eq!(name, "software");
 	}
 
-	/// A codec name is not a backend selector: it tries the same tiers as `Auto`.
-	#[test]
-	fn named_codec_picks_like_auto() {
-		let name = pick(Kind::Named("opus".into()), &[PLATFORM_STUB], &[SOFTWARE_STUB]).unwrap();
-		assert_eq!(name, "platform");
-	}
-
 	#[test]
 	fn every_refusal_is_reported() {
 		const ALSO_REFUSING: Candidate = Candidate {
@@ -257,33 +255,16 @@ mod tests {
 		);
 	}
 
-	fn named(name: &str) -> Config {
-		Config {
-			kind: Kind::Named(name.into()),
-		}
-	}
-
-	/// The codec names published moq-audio accepts still open their codec.
+	/// A backend fault is not a refusal of the track, so it is never folded into one.
 	#[test]
-	fn codec_names_open_their_codec() {
-		let pcm = AudioConfig::new(AudioCodec::Pcm, 48_000, 2);
-		assert_eq!(open(&pcm, &named("pcm")).unwrap().name(), pcm::NAME);
-		assert_eq!(open(&opus(), &named("opus")).unwrap().name(), libopus::NAME);
-	}
+	fn a_fault_outranks_refusals() {
+		const FAULTY: Candidate = Candidate {
+			name: "faulty",
+			supports: |codec| matches!(codec, AudioCodec::Opus),
+			open: |_| Err(Error::Codec("allocation failed".into())),
+		};
 
-	/// A name for another codec is refused, not quietly swapped for one that decodes.
-	#[test]
-	fn another_codecs_name_is_refused() {
-		assert!(matches!(open(&opus(), &named("pcm")), Err(Error::Unsupported(_))));
-	}
-
-	/// Backend names are internal: asking for one is refused like any unknown name.
-	#[test]
-	fn backend_names_are_refused() {
-		let message = open(&opus(), &named(libopus::NAME))
-			.err()
-			.expect("libopus is a backend, not a codec")
-			.to_string();
-		assert!(message.contains("\"libopus\"") && message.contains("opus"), "{message}");
+		let err = pick(Kind::Auto, &[REFUSING], &[FAULTY]).unwrap_err();
+		assert!(matches!(err, Error::Codec(_)), "{err:?}");
 	}
 }

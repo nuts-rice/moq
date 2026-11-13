@@ -1,7 +1,6 @@
 use std::time::Duration;
 
-use moq_quic::VarInt;
-use moq_quic::mux;
+use moq_quic::{Limits, VarInt, connection::mux};
 
 use crate::Version;
 
@@ -35,9 +34,8 @@ pub enum Protocol {
 
 /// Configuration for a QMux session.
 ///
-/// Construct with [`Config::new`] (or [`Config::negotiated`]) and set the public fields you
-/// need. For the common transports, prefer the higher-level `tcp` / `uds` builders, which
-/// wrap this.
+/// Construct with [`Config::new`] and set the public fields you
+/// need. The transport entry points take this same config.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Config {
@@ -46,30 +44,26 @@ pub struct Config {
 	/// How the application protocol is determined. See [`Protocol`].
 	pub protocol: Protocol,
 
-	/// Max concurrent bidirectional streams the peer can open.
-	pub max_streams_bidi: u64,
-	/// Max concurrent unidirectional streams the peer can open.
-	pub max_streams_uni: u64,
-	/// Connection-level receive window in bytes.
-	pub max_data: u64,
-	/// Per-stream receive window in bytes, for every stream.
-	pub max_stream_data: u64,
+	/// Flow-control windows and stream counts. Each `None` takes its default: 100 streams of
+	/// each direction, a 1 MiB connection window, a 256 KiB stream window, and 8 MiB of
+	/// unacknowledged outgoing data.
+	pub limits: Limits,
 
 	/// Close the session after this long without hearing from the peer, keeping it alive with
 	/// `QX_PING` meanwhile, or `None` to never time out. Zero is refused. The smaller of the two peers' values
 	/// applies. Only the record-framed drafts (QMux01+) negotiate it.
-	pub max_idle_timeout: Option<Duration>,
+	pub idle_timeout: Option<Duration>,
 	/// Maximum QMux Record size in bytes (draft-01+), at least the default. Default: 16382.
 	pub max_record_size: u64,
 
 	/// Largest DATAGRAM *frame* (RFC 9221: frame type + length + payload) we
-	/// advertise willingness to receive, in bytes; `0` disables datagrams.
+	/// advertise willingness to receive, in bytes; `None` disables datagrams.
 	///
 	/// This is a frame size, not a payload size: the usable payload is this value less the
 	/// per-frame overhead. A datagram must fit within a single record, so this is capped at
 	/// [`max_record_size`](Config::max_record_size). Datagrams are a record-framed-draft
 	/// feature (QMux01+), so this is ignored on QMux00. Default: 16382 bytes.
-	pub max_datagram_frame_size: u64,
+	pub max_datagram_frame_size: Option<u64>,
 
 	/// How long [`Session::connect`](crate::Session::connect) /
 	/// [`accept`](crate::Session::accept) waits for the peer's transport parameters, or
@@ -85,6 +79,11 @@ pub struct Config {
 	/// an application is actively sending. Only the record-framed drafts (QMux01+) carry
 	/// `QX_PING`. Default: 1s.
 	pub rtt_interval: Option<Duration>,
+
+	/// Keep `limits.receive_window` for the session's life, for a carrier that sizes its own
+	/// buffers by it, such as a WebRTC data channel: [`Session::set_limits`](crate::Session::set_limits)
+	/// then refuses to change it. Default: false.
+	pub fixed_receive_window: bool,
 }
 
 impl Default for Config {
@@ -92,16 +91,14 @@ impl Default for Config {
 		Self {
 			version: Version::QMux02,
 			protocol: Protocol::None,
-			max_streams_bidi: 100,
-			max_streams_uni: 100,
-			max_data: 1 << 20,
-			max_stream_data: 256 << 10,
-			max_idle_timeout: Some(Duration::from_secs(30)),
+			limits: Limits::default(),
+			idle_timeout: Some(Duration::from_secs(30)),
 			max_record_size: DEFAULT_MAX_RECORD_SIZE,
 			// Fill a full record by default; the record layer bounds the size.
-			max_datagram_frame_size: DEFAULT_MAX_RECORD_SIZE,
+			max_datagram_frame_size: Some(DEFAULT_MAX_RECORD_SIZE),
 			handshake_timeout: Some(Duration::from_secs(10)),
 			rtt_interval: Some(Duration::from_secs(1)),
+			fixed_receive_window: false,
 		}
 	}
 }
@@ -116,13 +113,8 @@ impl Config {
 		}
 	}
 
-	/// Create a config whose protocol was already negotiated out of band
-	/// (TLS / WebSocket ALPN). `protocol` is the chosen name, or `None`.
-	pub fn negotiated(version: Version, protocol: Option<String>) -> Self {
-		Self::default().with_negotiated(version, protocol)
-	}
-
 	/// This config with the out-of-band negotiation's outcome applied.
+	#[cfg(any(feature = "tls", feature = "ws"))]
 	pub(crate) fn with_negotiated(self, version: Version, protocol: Option<String>) -> Self {
 		Self {
 			version,
@@ -148,34 +140,28 @@ impl Config {
 		fn varint(value: u64) -> Result<VarInt, crate::Error> {
 			VarInt::from_u64(value).map_err(|_| crate::Error::InvalidConfig("value exceeds a QUIC varint"))
 		}
+		if self.max_datagram_frame_size == Some(0) {
+			return Err(crate::Error::InvalidConfig("zero max_datagram_frame_size; use None"));
+		}
 		// `None` is how to disable these; zero would fire on every poll
-		if self.max_idle_timeout == Some(Duration::ZERO) {
-			return Err(crate::Error::InvalidConfig("zero max_idle_timeout"));
+		if self.idle_timeout == Some(Duration::ZERO) {
+			return Err(crate::Error::InvalidConfig("zero idle_timeout"));
 		}
 		if self.rtt_interval == Some(Duration::ZERO) {
 			return Err(crate::Error::InvalidConfig("zero rtt_interval"));
 		}
 
-		// QUIC's stream count ceiling (RFC 9000 §4.6), which peers enforce on the parameter
-		const MAX_STREAM_COUNT: u64 = 1 << 60;
-		if self.max_streams_bidi > MAX_STREAM_COUNT || self.max_streams_uni > MAX_STREAM_COUNT {
-			return Err(crate::Error::InvalidConfig("stream count above 2^60"));
-		}
+		check_limits(&self.limits)?;
 
 		let mut config = mux::Config::default();
 		config.version = self.version;
-		config.max_concurrent_bidi_streams = varint(self.max_streams_bidi)?;
-		config.max_concurrent_uni_streams = varint(self.max_streams_uni)?;
-		config.receive_window = varint(self.max_data)?;
-		config.stream_receive_window = varint(self.max_stream_data)?;
-		config.max_idle_timeout = self.max_idle_timeout;
+		config.limits = self.limits;
+		config.idle_timeout = self.idle_timeout;
 		if self.version.uses_records() && self.max_record_size < DEFAULT_MAX_RECORD_SIZE {
 			return Err(crate::Error::InvalidConfig("max_record_size below 16382"));
 		}
 		config.max_record_size = varint(self.max_record_size)?;
-		config.max_datagram_frame_size = (self.max_datagram_frame_size != 0)
-			.then(|| varint(self.max_datagram_frame_size))
-			.transpose()?;
+		config.max_datagram_frame_size = self.max_datagram_frame_size.map(varint).transpose()?;
 		config.handshake_timeout = self.handshake_timeout;
 		config.rtt_interval = self.rtt_interval;
 		// Only advertise protocols when negotiating in-band; TLS/WS already chose one via
@@ -186,6 +172,21 @@ impl Config {
 		};
 		Ok(config)
 	}
+}
+
+/// Refuse limits a peer would refuse, and a receive window that cannot fit the largest unit a
+/// moq-net session assembles: incomplete messages hold leased credit, so a smaller one could
+/// stall the session.
+pub(crate) fn check_limits(limits: &Limits) -> Result<(), crate::Error> {
+	limits.validate()?;
+	if let Some(window) = limits.receive_window
+		&& window.get() < moq_net::transport::MIN_RECEIVE_WINDOW
+	{
+		return Err(crate::Error::ReceiveWindowTooSmall(
+			moq_net::transport::MIN_RECEIVE_WINDOW,
+		));
+	}
+	Ok(())
 }
 
 #[cfg(test)]
@@ -204,9 +205,23 @@ mod tests {
 	}
 
 	#[test]
+	fn datagrams_are_disabled_explicitly() {
+		let disabled = Config {
+			max_datagram_frame_size: None,
+			..Config::default()
+		};
+		assert!(disabled.to_mux().unwrap().max_datagram_frame_size.is_none());
+		let zero = Config {
+			max_datagram_frame_size: Some(0),
+			..Config::default()
+		};
+		assert!(matches!(zero.to_mux(), Err(crate::Error::InvalidConfig(_))));
+	}
+
+	#[test]
 	fn zero_timers_are_refused() {
 		let idle = Config {
-			max_idle_timeout: Some(Duration::ZERO),
+			idle_timeout: Some(Duration::ZERO),
 			..Config::default()
 		};
 		assert!(matches!(idle.to_mux(), Err(crate::Error::InvalidConfig(_))));
@@ -217,21 +232,25 @@ mod tests {
 		assert!(matches!(rtt.to_mux(), Err(crate::Error::InvalidConfig(_))));
 	}
 
+	/// Incomplete messages hold leased credit, so a window that cannot fit the largest unit is
+	/// refused rather than left to stall.
 	#[test]
-	fn stream_counts_above_quics_ceiling_are_refused() {
-		let at = Config {
-			max_streams_bidi: 1 << 60,
-			max_streams_uni: 1 << 60,
-			..Config::default()
-		};
-		assert!(at.to_mux().is_ok());
-		for (bidi, uni) in [((1 << 60) + 1, 0), (0, (1 << 60) + 1)] {
-			let over = Config {
-				max_streams_bidi: bidi,
-				max_streams_uni: uni,
-				..Config::default()
-			};
-			assert!(matches!(over.to_mux(), Err(crate::Error::InvalidConfig(_))));
-		}
+	fn a_receive_window_below_the_largest_unit_is_refused() {
+		let min = moq_net::transport::MIN_RECEIVE_WINDOW;
+		let mut config = Config::default();
+		config.limits.receive_window = std::num::NonZeroU64::new(min - 1);
+		assert!(matches!(
+			config.to_mux(),
+			Err(crate::Error::ReceiveWindowTooSmall(got)) if got == min
+		));
+		config.limits.receive_window = std::num::NonZeroU64::new(min);
+		assert!(config.to_mux().is_ok());
+	}
+
+	#[test]
+	fn limits_a_peer_would_refuse_are_refused() {
+		let mut over = Config::default();
+		over.limits.max_streams = std::num::NonZeroU64::new((1 << 60) + 1);
+		assert!(matches!(over.to_mux(), Err(crate::Error::Limits(_))));
 	}
 }

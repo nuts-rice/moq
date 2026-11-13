@@ -1,18 +1,22 @@
 //! Timing of a delayed [`Export`] on a live clock: what a receiver renders when it joins a
 //! broadcast already running, when one track loses frames, when the source falls silent and
 //! resumes, when the source's clock runs off the receiver's, and when two receivers render one
-//! broadcast for a 1+1 pair.
+//! broadcast for a 1+1 (SMPTE ST 2022-7) pair.
 //!
-//! Every case runs on the paused clock, with each frame written at the instant a live source
-//! would send it. A receiver's view is measured from its own output: the lead of each PES (its
-//! decode time less the PCR of the slot carrying it) and the instant each slot went out.
+//! Every case runs on a deadline queue the test advances itself, with each frame written at the
+//! instant a live source would send it. A receiver's view is measured from its own output: the
+//! lead of each PES (its decode time less the PCR of the slot carrying it) and the instant each
+//! slot went out.
 
 use std::io::Cursor;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Wake, Waker};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use hang::catalog::{AAC, AudioConfig, Container, H264, VideoConfig};
-use moq_clock::Instant;
+use kio::clock::Instant;
 use moq_net::Timestamp;
 use mpeg2ts::ts::{ReadTsPacket, TsPacketReader, TsPayload};
 
@@ -64,6 +68,11 @@ fn length_prefixed(nals: &[&[u8]]) -> Bytes {
 
 /// A live H.264 + AAC broadcast whose frames are written on the source's clock.
 struct Live {
+	/// The receivers' clock: every timer the broadcast and its legs arm waits here, and only
+	/// [`Self::advance`] moves it.
+	clock: kio::clock::Deadlines,
+	/// Keeps [`Self::clock`] the thread's clock, unless another broadcast's is: see [`Self::beside`].
+	_entered: Option<kio::clock::Entered>,
 	_broadcast: moq_net::broadcast::Producer,
 	catalog: crate::catalog::Producer,
 	/// Written group by group, so a group can be left open: see [`Self::run`].
@@ -78,21 +87,16 @@ struct Live {
 	scale: f64,
 	/// The multiplex rate the receivers pad to.
 	rate: u64,
-	/// The receivers render with [`Export::with_sync`].
-	sync: bool,
-	/// Video is a B-pyramid: see [`Self::reorder`].
-	reorder: bool,
-	/// The `initial_cpb_removal_delay` each group's first picture opens a buffering period with:
-	/// see [`Self::buffering`].
-	periods: Option<u32>,
-	/// A video tick whose frame is four times the size of a keyframe.
-	burst: Option<u64>,
-	/// The media time of the first frame, in µs.
-	origin: u64,
 	/// How much later than its video the source sends audio of the same media time, in µs;
 	/// negative sends the video later. A TS source sends video well ahead of its decode time
 	/// and audio just in time, so its audio lags.
 	audio_lag: i64,
+	/// Video is a B-pyramid: see [`Self::reorder`].
+	reorder: bool,
+	/// Payload bytes in each non-key video frame.
+	delta_size: usize,
+	/// Added to every timestamp written, in µs: changing it steps the timeline with no marker.
+	offset: i64,
 	start: Instant,
 	tick: u64,
 	audio_index: u64,
@@ -100,6 +104,22 @@ struct Live {
 
 impl Live {
 	async fn new(scale: f64, audio_lag: i64) -> Self {
+		let clock = kio::clock::Deadlines::new(kio::clock::now());
+		let entered = clock.enter();
+		Self::on(clock, Some(entered), scale, audio_lag).await
+	}
+
+	/// Another broadcast on this one's clock.
+	async fn beside(&self, scale: f64, audio_lag: i64) -> Self {
+		Self::on(self.clock.clone(), None, scale, audio_lag).await
+	}
+
+	async fn on(
+		clock: kio::clock::Deadlines,
+		entered: Option<kio::clock::Entered>,
+		scale: f64,
+		audio_lag: i64,
+	) -> Self {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let consumer = broadcast.consume();
 		let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
@@ -134,6 +154,7 @@ impl Live {
 			)
 			.unwrap();
 		let mut cfg = AudioConfig::new(AAC { profile: 2 }, 48_000, 2);
+		cfg.description = Some(Bytes::from_static(&[0x11, 0x90]));
 		cfg.container = Container::Legacy;
 		catalog
 			.modify()
@@ -145,6 +166,8 @@ impl Live {
 
 		Self {
 			source: crate::source::announced(&consumer).await,
+			clock,
+			_entered: entered,
 			_broadcast: broadcast,
 			catalog,
 			video,
@@ -154,13 +177,11 @@ impl Live {
 			audio,
 			scale,
 			rate: MUX_RATE,
-			sync: false,
-			reorder: false,
-			periods: None,
-			burst: None,
-			origin: 0,
 			audio_lag,
-			start: moq_clock::now(),
+			reorder: false,
+			delta_size: 400,
+			offset: 0,
+			start: kio::clock::now(),
 			tick: 0,
 			audio_index: 0,
 		}
@@ -168,7 +189,8 @@ impl Live {
 
 	/// The receivers' instant at which the source's clock reads media time `micros`.
 	fn sent(&self, micros: u64) -> Instant {
-		self.start + Duration::from_secs_f64(micros as f64 / 1e6 / self.scale)
+		self.start
+			.saturating_add(Duration::from_secs_f64(micros as f64 / 1e6 / self.scale))
 	}
 
 	/// When the source sends the video frame of media time `video` and the audio frame of
@@ -179,7 +201,7 @@ impl Live {
 			true => (Duration::ZERO, lag),
 			false => (lag, Duration::ZERO),
 		};
-		(self.sent(video) + v, self.sent(audio) + a)
+		(self.sent(video).saturating_add(v), self.sent(audio).saturating_add(a))
 	}
 
 	/// Declare that video decodes up to `jitter` before it is presented, as a deep B-pyramid's
@@ -192,7 +214,8 @@ impl Live {
 	}
 
 	/// Send video as a B-pyramid in decode order, each frame [`PYRAMID_DELAY`] frames after its
-	/// tick, under an SPS that declares the depth.
+	/// tick, under an SPS that declares the depth, and declare that depth in the catalog, so each
+	/// group decodes on its own.
 	fn reorder(&mut self) {
 		use crate::codec::h264::fixtures::{PPS as PYRAMID_PPS, SPS_PYRAMID};
 
@@ -202,39 +225,17 @@ impl Live {
 		let mut catalog = self.catalog.modify().unwrap();
 		for config in catalog.video.renditions.values_mut() {
 			config.description = Some(description.clone());
+			config.reorder = Some(2);
 		}
 		self.reorder = true;
-	}
-
-	/// Declare an 800 kb/s CBR NAL HRD with 0.4 s of buffer delay, and open each group with a
-	/// buffering period SEI giving its first picture `delay` ticks of `initial_cpb_removal_delay`.
-	fn buffering(&mut self, delay: u32) {
-		use crate::codec::h264::fixtures::SPS_HRD_SHORT;
-
-		let description =
-			crate::codec::h264::build_avcc(&[Bytes::from_static(SPS_HRD_SHORT)], &[Bytes::from_static(PPS)]).unwrap();
-		let mut catalog = self.catalog.modify().unwrap();
-		for config in catalog.video.renditions.values_mut() {
-			config.description = Some(description.clone());
-		}
-		self.periods = Some(delay);
-	}
-
-	/// Abort the open video group, as a relay does to a subscriber left too far behind: the
-	/// subscriber reads it as evicted, and loses the rest of it.
-	fn evict(&mut self) {
-		if let Some(group) = self.group.take() {
-			group.abort(moq_net::Error::Old).unwrap();
-		}
-		self.stalling = true;
 	}
 
 	/// Send nothing for `gap`, as a publisher that died, then resume at the live edge on the
 	/// same timeline from the next group, as its replacement or the other half of a 1+1 pair
 	/// would.
-	async fn fall_silent(&mut self, gap: Duration, legs: &mut [&mut Leg]) {
-		let resume = moq_clock::now() + gap;
-		advance(resume, legs).await;
+	fn fall_silent(&mut self, gap: Duration, legs: &mut [&mut Leg]) {
+		let resume = kio::clock::now().saturating_add(gap);
+		self.advance(resume, legs);
 		let media = (resume.duration_since(self.start).as_secs_f64() * self.scale * 1e6) as u64;
 		self.tick = media.div_ceil(VIDEO_US * GOP) * GOP;
 		self.audio_index = media.div_ceil(AUDIO_US);
@@ -242,19 +243,20 @@ impl Live {
 
 	/// A receiver joining now.
 	async fn join(&self, every: Duration) -> Leg {
-		let mut export = super::export_test::open_export(self.source.clone())
+		let export = super::export_test::open_export(self.source.clone(), DELAY)
 			.await
 			.unwrap()
-			.with_delay(DELAY)
 			.with_mux_rate(self.rate);
-		if self.sync {
-			export = export.with_sync();
-		}
+		let woken = Arc::new(Woken(AtomicBool::new(true)));
 		Leg {
 			export,
 			every,
-			next_poll: moq_clock::now(),
+			next_poll: kio::clock::now(),
+			waiter: kio::Waiter::new(Waker::from(woken.clone())),
+			woken,
 			out: Vec::new(),
+			sink: None,
+			busy: None,
 		}
 	}
 
@@ -265,23 +267,22 @@ impl Live {
 	/// still on its way when the next group starts, as when the relay's backlog for a joiner
 	/// arrives behind the live edge. The subscription then skips it as slow once the next
 	/// group is the delay newer, and counts a discontinuity.
-	async fn run(&mut self, until: u64, legs: &mut [&mut Leg], stall: impl Fn(u64) -> bool) {
+	fn run(&mut self, until: u64, legs: &mut [&mut Leg], stall: impl Fn(u64) -> bool) {
 		while self.tick < until {
 			let video = self.tick * VIDEO_US;
 			let audio = self.audio_index * AUDIO_US;
 			let (video_at, audio_at) = self.send_times(video, audio);
-			advance(video_at.min(audio_at), legs).await;
+			self.advance(video_at.min(audio_at), legs);
 			if audio_at < video_at {
 				self.send_audio();
 			} else {
 				let tick = self.tick;
 				let keyframe = tick.is_multiple_of(GOP);
-				if keyframe {
-					let stalled = std::mem::take(&mut self.stalling);
-					if let Some(mut group) = self.group.take() {
-						match stalled {
-							true => self.stalled.push(group),
-							false => group.finish().unwrap(),
+				if keyframe && let Some(group) = self.group.take() {
+					match std::mem::take(&mut self.stalling) {
+						true => self.stalled.push(group),
+						false => {
+							group.finish().unwrap();
 						}
 					}
 				}
@@ -291,15 +292,10 @@ impl Live {
 				if stall(tick) {
 					self.stalling = true;
 				} else if !self.stalling {
-					let slice = match (keyframe, self.burst == Some(tick)) {
-						(true, _) => vec![0x65u8; 3_000],
-						(false, true) => vec![0x41u8; 12_000],
-						(false, false) => vec![0x41u8; 400],
-					};
-					// The delay field is as wide as `SPS_HRD_SHORT` declares.
-					let sei = match self.periods {
-						Some(delay) if keyframe => crate::codec::h264::fixtures::buffering_period(&[delay], 18),
-						_ => Vec::new(),
+					let slice = if keyframe {
+						vec![0x65u8; 3_000]
+					} else {
+						vec![0x41u8; self.delta_size]
 					};
 					let presented = match self.reorder {
 						true => (tick - tick % GOP + PYRAMID[(tick % GOP) as usize] + PYRAMID_DELAY) * VIDEO_US,
@@ -310,12 +306,9 @@ impl Live {
 						.write(
 							group,
 							&[Frame {
-								timestamp: Timestamp::from_micros(self.origin + presented).unwrap(),
+								timestamp: Timestamp::from_micros(presented.strict_add_signed(self.offset)).unwrap(),
 								duration: None,
-								payload: match sei.is_empty() {
-									true => length_prefixed(&[&slice]),
-									false => length_prefixed(&[&sei, &slice]),
-								},
+								payload: length_prefixed(&[&slice]),
 								keyframe,
 							}],
 						)
@@ -334,9 +327,9 @@ impl Live {
 		let index = self.audio_index;
 		self.audio
 			.write(Frame {
-				timestamp: Timestamp::from_micros(self.origin + index * AUDIO_US).unwrap(),
+				timestamp: Timestamp::from_micros((index * AUDIO_US).strict_add_signed(self.offset)).unwrap(),
 				duration: None,
-				payload: Bytes::from_iter((0..180u16).map(|i| (i ^ index as u16) as u8)),
+				payload: audio_payload(index),
 				keyframe: index.is_multiple_of(AUDIO_GROUP),
 			})
 			.unwrap();
@@ -345,10 +338,10 @@ impl Live {
 
 	/// Send audio alone, each frame at its instant, until media time `until` (µs), as a
 	/// broadcast whose video has stopped.
-	async fn run_audio(&mut self, until: u64, legs: &mut [&mut Leg]) {
+	fn run_audio(&mut self, until: u64, legs: &mut [&mut Leg]) {
 		while self.audio_index * AUDIO_US < until {
 			let (_, at) = self.send_times(0, self.audio_index * AUDIO_US);
-			advance(at, legs).await;
+			self.advance(at, legs);
 			self.send_audio();
 			for leg in legs.iter_mut() {
 				leg.poll_now();
@@ -356,16 +349,68 @@ impl Live {
 		}
 	}
 
-	/// End the broadcast and let every leg render what it holds.
-	async fn finish(&mut self, legs: &mut [&mut Leg]) {
-		if let Some(mut group) = self.group.take() {
+	/// End the broadcast and let every leg render what it holds, side by side: a leg left
+	/// unread while another drains would be a blocked sink.
+	fn finish(&mut self, legs: &mut [&mut Leg]) {
+		self.finish_media();
+		self.catalog.finish().unwrap();
+		let mut ended = vec![false; legs.len()];
+		loop {
+			for (leg, ended) in legs.iter_mut().zip(&mut ended) {
+				*ended = *ended || leg.poll();
+			}
+			let Some(deadline) = legs
+				.iter()
+				.zip(&ended)
+				.filter(|(_, ended)| !**ended)
+				.map(|(leg, _)| {
+					leg.export
+						.next_due()
+						.expect("export parked without ending or scheduled output")
+				})
+				.min()
+			else {
+				break;
+			};
+			self.clock.advance(deadline.max(self.clock.now()));
+		}
+	}
+
+	/// End the media tracks while the catalog can still announce more.
+	fn finish_media(&mut self) {
+		if let Some(group) = self.group.take() {
 			group.finish().unwrap();
 		}
 		self.stalled.clear();
-		self.video.finish().unwrap();
-		self.audio.finish().unwrap();
+		drop(self.video.clone().finish().unwrap());
+		self.audio.end_with(None).unwrap();
+	}
+
+	/// Run the clock to `at`, letting every leg read whenever it would have on its own.
+	fn advance(&self, at: Instant, legs: &mut [&mut Leg]) {
+		while let Some(wake) = legs
+			.iter()
+			.filter_map(|leg| leg.wake())
+			.filter(|wake| *wake <= at)
+			.min()
+		{
+			self.clock.advance(wake.max(self.clock.now()));
+			let now = kio::clock::now();
+			for leg in legs.iter_mut() {
+				if leg.wake().is_some_and(|wake| wake <= now) {
+					assert!(!leg.poll(), "export ended while the broadcast is live");
+					if !leg.every.is_zero() {
+						while leg.next_poll <= now {
+							leg.next_poll = leg.next_poll.saturating_add(leg.every);
+						}
+					}
+				}
+			}
+		}
+		self.clock.advance(at.max(self.clock.now()));
+		// Read up to the instant the next frame arrives, so the arrival is timed exactly.
 		for leg in legs.iter_mut() {
-			leg.drain().await;
+			leg.poll_now();
 		}
 	}
 }
@@ -373,55 +418,86 @@ impl Live {
 /// One receiver: an exporter and what it rendered, with the instant each slot went out.
 struct Leg {
 	export: Export<crate::catalog::Consumer>,
-	/// How often it reads its subscription. Zero reads after every frame the source sends; a
-	/// coarser cadence stands for a receiver behind a burstier network or scheduler.
+	/// How often it reads its subscription. Zero reads whenever its export is woken, as by each
+	/// frame the source sends; a coarser cadence stands for a receiver behind a burstier network
+	/// or scheduler.
 	every: Duration,
 	next_poll: Instant,
+	/// What its export registers to be woken by, and whether it was since the last read.
+	waiter: kio::Waiter,
+	woken: Arc<Woken>,
 	out: Vec<(Instant, Frame)>,
+	/// The rate its output drains at, in bits per second, if it drains slower than it is read:
+	/// each frame keeps it from reading again until the frame is written.
+	sink: Option<u64>,
+	/// It reads nothing until this instant, as a sink still writing or a blocked stdout.
+	busy: Option<Instant>,
+}
+
+struct Woken(AtomicBool);
+
+impl Wake for Woken {
+	fn wake(self: Arc<Self>) {
+		self.0.store(true, Ordering::Relaxed);
+	}
+
+	fn wake_by_ref(self: &Arc<Self>) {
+		self.0.store(true, Ordering::Relaxed);
+	}
 }
 
 impl Leg {
 	/// When this leg next reads on its own.
 	fn wake(&self) -> Option<Instant> {
+		if self.busy.is_some() {
+			return self.busy;
+		}
 		match self.every.is_zero() {
 			true => self.export.next_due(),
 			false => Some(self.next_poll),
 		}
 	}
 
+	/// Read if anything woke the export since it last read, as the task polling it would: a read
+	/// nothing woke finds nothing new.
 	fn poll_now(&mut self) {
-		if !self.every.is_zero() {
-			return;
+		if self.busy.is_none() && self.every.is_zero() && self.woken.0.load(Ordering::Relaxed) {
+			assert!(!self.poll(), "export ended while the broadcast is live");
 		}
-		self.poll();
 	}
 
-	fn poll(&mut self) {
-		let waiter = kio::Waiter::noop();
-		let now = moq_clock::now();
-		while let std::task::Poll::Ready(frame) = self.export.poll_next(&waiter) {
+	/// Read everything ready now, returning whether the broadcast ended.
+	fn poll(&mut self) -> bool {
+		let now = kio::clock::now();
+		if self.busy.is_some_and(|busy| busy > now) {
+			return false;
+		}
+		self.busy = None;
+		self.woken.0.store(false, Ordering::Relaxed);
+		while let std::task::Poll::Ready(frame) = self.export.poll_next(&self.waiter) {
 			match frame.expect("exporter error") {
-				Some(frame) => self.out.push((now, frame)),
-				None => break,
+				Some(frame) => {
+					let bits = frame.payload.len() as u64 * 8;
+					self.out.push((now, frame));
+					if let Some(sink) = self.sink {
+						self.busy = Some(now.saturating_add(Duration::from_secs_f64(bits as f64 / sink as f64)));
+						return false;
+					}
+				}
+				None => return true,
 			}
 		}
+		false
 	}
 
-	/// Read to the end of the broadcast.
-	async fn drain(&mut self) {
-		loop {
-			self.poll();
-			if let Some(deadline) = self.export.next_due() {
-				moq_clock::sleep_until(deadline).await;
-				continue;
-			}
-			match tokio::time::timeout(Duration::from_millis(10), self.export.next()).await {
-				Ok(Ok(Some(frame))) => self.out.push((moq_clock::now(), frame)),
-				Ok(Ok(None)) => break,
-				Err(_) if self.export.next_due().is_none() => break,
-				Err(_) => {}
-				Ok(Err(err)) => panic!("exporter error: {err}"),
-			}
+	/// Read to the end of the broadcast, advancing only to scheduled output.
+	fn drain(&mut self, clock: &kio::clock::Deadlines) {
+		while !self.poll() {
+			let deadline = self
+				.export
+				.next_due()
+				.expect("export parked without ending or scheduled output");
+			clock.advance(deadline.max(clock.now()));
 		}
 	}
 
@@ -431,31 +507,62 @@ impl Leg {
 	}
 }
 
-/// Run the clock to `at`, letting every leg read whenever it would have on its own.
-async fn advance(at: Instant, legs: &mut [&mut Leg]) {
-	while let Some(wake) = legs
-		.iter()
-		.filter_map(|leg| leg.wake())
-		.filter(|wake| *wake <= at)
-		.min()
-	{
-		moq_clock::sleep_until(wake).await;
-		let now = moq_clock::now();
-		for leg in legs.iter_mut() {
-			if leg.wake().is_some_and(|wake| wake <= now) {
-				leg.poll();
-				if !leg.every.is_zero() {
-					while leg.next_poll <= now {
-						leg.next_poll += leg.every;
-					}
-				}
-			}
+/// Media drains while the catalog stays open; EOF needs both, in either finish order.
+#[tokio::test(start_paused = true)]
+async fn end_waits_for_catalog_and_media() {
+	for catalog_first in [false, true] {
+		let mut live = Live::new(1.0, 0).await;
+		let mut leg = live.join(Duration::ZERO).await;
+		live.run(2 * GOP, &mut [&mut leg], |_| false);
+		let expected = if catalog_first {
+			live.catalog.finish().unwrap();
+			// Catalog EOF fixes the layout, but the named tracks can still publish media.
+			live.run(3 * GOP, &mut [&mut leg], |_| false);
+			// Close the groups so their tails flush, leaving both tracks open for more.
+			live.group.take().unwrap().finish().unwrap();
+			live.audio.cut(None).unwrap();
+			3 * GOP as usize
+		} else {
+			live.finish_media();
+			2 * GOP as usize
+		};
+		loop {
+			assert!(
+				!leg.poll(),
+				"EOF before both catalog and media finish: catalog_first {catalog_first}"
+			);
+			let Some(deadline) = leg.export.next_due() else {
+				break;
+			};
+			live.clock.advance(deadline.max(live.clock.now()));
 		}
-	}
-	moq_clock::sleep_until(at).await;
-	// Read up to the instant the next frame arrives, so the arrival is timed exactly.
-	for leg in legs.iter_mut() {
-		leg.poll_now();
+		assert_eq!(
+			leg.units().iter().filter(|unit| unit.pid == VIDEO_PID).count(),
+			expected
+		);
+		let audio: Vec<Bytes> = (0..live.audio_index).map(audio_payload).collect();
+		assert_eq!(aac_frames(&leg), audio, "catalog_first {catalog_first}: audio drained");
+		if catalog_first {
+			live.finish_media();
+		} else {
+			assert!(!leg.woken.0.load(Ordering::Relaxed), "the exporter is parked");
+			live.catalog.finish().unwrap();
+			assert!(
+				leg.woken.0.load(Ordering::Relaxed),
+				"catalog EOF must wake the exporter"
+			);
+		}
+		leg.drain(&live.clock);
+		assert_eq!(leg.export.dropped(), 0);
+		assert_eq!(
+			leg.units().iter().filter(|unit| unit.pid == VIDEO_PID).count(),
+			expected
+		);
+		assert_eq!(
+			aac_frames(&leg),
+			audio,
+			"catalog_first {catalog_first}: no audio after EOF"
+		);
 	}
 }
 
@@ -463,6 +570,8 @@ async fn advance(at: Instant, legs: &mut [&mut Leg]) {
 #[derive(Debug, Clone, Copy)]
 struct Unit {
 	pid: u16,
+	/// PCR clock period, advanced by a flagged PCR.
+	period: u64,
 	/// Decode time (DTS, else PTS), 90 kHz, as carried.
 	decode: u64,
 	/// Decode time less the PCR of the slot carrying the PES start, in milliseconds: how long
@@ -493,10 +602,14 @@ fn units(out: &[(Instant, Frame)]) -> Vec<Unit> {
 	let mut reader = TsPacketReader::new(Cursor::new(bytes));
 	let mut units = Vec::new();
 	let mut pcr: Option<u64> = None;
+	let mut period = 0;
 	for sent in &slot_of {
 		let packet = reader.read_ts_packet().unwrap().expect("a packet per slot entry");
-		if let Some(clock) = packet.adaptation_field.as_ref().and_then(|af| af.pcr) {
+		if let Some(af) = packet.adaptation_field.as_ref()
+			&& let Some(clock) = af.pcr
+		{
 			pcr = Some(clock.as_u64() / 300);
+			period += u64::from(af.discontinuity_indicator);
 		}
 		if let Some(TsPayload::PesStart(pes)) = &packet.payload
 			&& let Some(pts) = pes.header.pts
@@ -505,6 +618,7 @@ fn units(out: &[(Instant, Frame)]) -> Vec<Unit> {
 			let decode = pes.header.dts.unwrap_or(pts).as_u64();
 			units.push(Unit {
 				pid: packet.header.pid.as_u16(),
+				period,
 				decode,
 				lead: diff90(decode, pcr) as f64 / 90.0,
 				sent: *sent,
@@ -586,9 +700,9 @@ const CLOCK_SLACK: f64 = 2.0 * SLOT_MS;
 /// return the leg's units.
 async fn join(lag: i64, stall: impl Fn(u64) -> bool) -> Vec<Unit> {
 	let mut live = Live::new(1.0, lag).await;
-	live.run(JOIN, &mut [], |_| false).await;
+	live.run(JOIN, &mut [], |_| false);
 	let mut leg = live.join(Duration::ZERO).await;
-	live.run(24 * GOP, &mut [&mut leg], stall).await;
+	live.run(24 * GOP, &mut [&mut leg], stall);
 	assert_eq!(leg.export.dropped(), 0, "every frame arrived inside its deadline");
 	leg.units()
 }
@@ -651,9 +765,9 @@ async fn a_track_sent_later_than_the_delay_loses_nothing() {
 	for lag in [LONG_LAG, -LONG_LAG] {
 		for join in [3 * GOP, JOIN] {
 			let mut live = Live::new(1.0, lag).await;
-			live.run(join, &mut [], |_| false).await;
+			live.run(join, &mut [], |_| false);
 			let mut leg = live.join(Duration::ZERO).await;
-			live.run(join + 20 * GOP, &mut [&mut leg], |_| false).await;
+			live.run(join + 20 * GOP, &mut [&mut leg], |_| false);
 			let dropped = leg.export.dropped();
 			if dropped > 0 {
 				lost.push(format!(
@@ -672,9 +786,89 @@ async fn a_track_sent_later_than_the_delay_loses_nothing() {
 	);
 }
 
+/// A changeover between two encoders whose clocks started hours apart steps the whole timeline
+/// forward with no marker, mid-group, as in the field. The export re-acquires its clock as at
+/// startup, rather than read the step as drift and end, and renders on without a drop. So it
+/// does for a step back, even smaller than the delay: audio never regresses on one clock, and
+/// video that declares its `reorder` restarts when the step exceeds that depth. Video that
+/// declares none is left as it is. A step back into an earlier group never reaches the export:
+/// the reader refuses it.
+#[tokio::test(start_paused = true)]
+async fn an_unmarked_step_keeps_the_export_rendering() {
+	let forward = [16_844_500_000, 2_000_000].map(|step| [(step, false), (step, true)]);
+	let cases = forward
+		.into_iter()
+		.flatten()
+		.chain([(-300_000, false), (-300_000, true), (-560_000, true)]);
+	for (step, declared) in cases {
+		for lag in [0, LAGS[0], LAGS[1]] {
+			let mut live = Live::new(1.0, lag).await;
+			if declared {
+				live.reorder();
+			}
+			let mut leg = live.join(Duration::ZERO).await;
+			live.run(8 * GOP + GOP / 2, &mut [&mut leg], |_| false);
+			live.offset += step;
+			let stepped = kio::clock::now();
+			live.run(live.tick + 8 * GOP, &mut [&mut leg], |_| false);
+
+			let case = format!("{} s step, declared {declared}, lag {lag}", step as f64 / 1e6);
+			assert_eq!(leg.export.dropped(), 0, "{case}");
+			let units = leg.units();
+			let audio: Vec<_> = units.iter().filter(|unit| unit.pid == AUDIO_PID).collect();
+			for pair in audio.windows(2) {
+				assert!(
+					pair[0].period != pair[1].period || diff90(pair[1].decode, pair[0].decode) >= 0,
+					"{case}: audio regressed on one clock: {pair:?}"
+				);
+			}
+			let video = units
+				.into_iter()
+				.filter(|unit| unit.pid == VIDEO_PID && unit.sent >= stepped)
+				.count() as u64;
+			assert!(video >= 6 * GOP, "{case}: only {video} video units after it");
+		}
+	}
+}
+
+/// The same step back, smaller than the delay, while the export is still acquiring its first
+/// clock: what it read before the step and what it reads after cannot share one clock, so
+/// audio still never regresses within a clock period, and the export renders on.
+#[tokio::test(start_paused = true)]
+async fn an_unmarked_step_while_acquiring_keeps_the_export_rendering() {
+	for declared in [false, true] {
+		for lag in [0, LAGS[0], LAGS[1]] {
+			let mut live = Live::new(1.0, lag).await;
+			// Far enough into the timeline that the step stays on it.
+			live.offset = 10_000_000;
+			if declared {
+				live.reorder();
+			}
+			let mut leg = live.join(Duration::ZERO).await;
+			live.run(4, &mut [&mut leg], |_| false);
+			let case = format!("declared {declared}, lag {lag}");
+			assert!(leg.units().is_empty(), "{case}: output began before the step");
+			live.offset -= 300_000;
+			live.run(live.tick + 8 * GOP, &mut [&mut leg], |_| false);
+
+			assert_eq!(leg.export.dropped(), 0, "{case}");
+			let units = leg.units();
+			let audio: Vec<_> = units.iter().filter(|unit| unit.pid == AUDIO_PID).collect();
+			for pair in audio.windows(2) {
+				assert!(
+					pair[0].period != pair[1].period || diff90(pair[1].decode, pair[0].decode) >= 0,
+					"{case}: audio regressed on one clock: {pair:?}"
+				);
+			}
+			let video = units.iter().filter(|unit| unit.pid == VIDEO_PID).count() as u64;
+			assert!(video >= 6 * GOP, "{case}: only {video} video units");
+		}
+	}
+}
+
 // A publisher that dies leaves the last video frames it sent held for their DTS, and nothing
 // settles them until frames come again. Where the receiver is not told the source changed (a
-// replacement on a protocol without an epoch, or the other half of a 1+1 pair), those come on the
+// replacement on a protocol under another instance, or the other half of a 1+1 pair), those come on the
 // same timeline after the silence. In the field the held frames then went into a schedule that had
 // already gone past them, and the export ended on a missed decode deadline.
 
@@ -687,35 +881,146 @@ async fn frames_held_through_a_silence_drop_as_late() {
 	let jitter = Duration::from_millis(300);
 	// The frames presented within the jitter of the last one read before the silence.
 	let held = jitter.as_micros() as u64 / VIDEO_US + 1;
-	for lag in [0, LAGS[0], LAGS[1]] {
-		let mut live = Live::new(1.0, lag).await;
-		live.declare_video_jitter(jitter);
-		let mut leg = live.join(Duration::ZERO).await;
-		live.run(8 * GOP + 5, &mut [&mut leg], |_| false).await;
-		live.fall_silent(Duration::from_secs(3), &mut [&mut leg]).await;
-		let resumed = moq_clock::now();
-		live.run(live.tick + 8 * GOP, &mut [&mut leg], |_| false).await;
+	for declared in [false, true] {
+		for lag in [0, LAGS[0], LAGS[1]] {
+			let mut live = Live::new(1.0, lag).await;
+			if declared {
+				live.reorder();
+			} else {
+				live.declare_video_jitter(jitter);
+			}
+			let mut leg = live.join(Duration::ZERO).await;
+			let tail = if declared { 2 } else { 5 };
+			live.run(8 * GOP + tail, &mut [&mut leg], |_| false);
+			live.fall_silent(Duration::from_secs(3), &mut [&mut leg]);
+			let resumed = kio::clock::now();
+			live.run(live.tick + 8 * GOP, &mut [&mut leg], |_| false);
 
-		let dropped = leg.export.dropped();
-		assert!(
-			(1..=held).contains(&dropped),
-			"lag {lag}: {dropped} dropped, where {held} were held through the silence"
-		);
-		let after: Vec<Unit> = leg.units().into_iter().filter(|unit| unit.sent >= resumed).collect();
-		let late: Vec<f64> = after
-			.iter()
-			.filter(|unit| unit.lead < 0.0)
-			.map(|unit| unit.lead)
-			.collect();
-		assert!(
-			late.is_empty(),
-			"lag {lag}: units went out after they decode, by {late:?} ms"
-		);
-		let video = after.iter().filter(|unit| unit.pid == VIDEO_PID).count() as u64;
-		assert!(
-			video >= 6 * GOP,
-			"lag {lag}: only {video} video units after the silence"
-		);
+			let dropped = leg.export.dropped();
+			assert!(
+				(1..=held).contains(&dropped),
+				"lag {lag}: {dropped} dropped, where {held} were held through the silence"
+			);
+			let after: Vec<Unit> = leg.units().into_iter().filter(|unit| unit.sent >= resumed).collect();
+			let late: Vec<f64> = after
+				.iter()
+				.filter(|unit| unit.lead < 0.0)
+				.map(|unit| unit.lead)
+				.collect();
+			assert!(
+				late.is_empty(),
+				"lag {lag}: units went out after they decode, by {late:?} ms"
+			);
+			let video = after.iter().filter(|unit| unit.pid == VIDEO_PID).count() as u64;
+			assert!(
+				video >= 6 * GOP,
+				"lag {lag}: only {video} video units after the silence"
+			);
+		}
+	}
+}
+
+/// A loss noticed after a silence releases held video against the loss time, while a
+/// prompt eviction preserves on-time frames, for both decode clocks.
+#[tokio::test(start_paused = true)]
+async fn a_cut_judges_held_video_when_the_loss_is_observed() {
+	for declared in [false, true] {
+		for silence in [Duration::ZERO, Duration::from_secs(3)] {
+			// A PCR slot of audio skew puts held video at the schedule's next slot.
+			let mut live = Live::new(1.0, 25_000).await;
+			live.delta_size = 1_000;
+			if declared {
+				live.reorder();
+			} else {
+				live.declare_video_jitter(Duration::from_millis(400));
+			}
+			let mut leg = live.join(Duration::ZERO).await;
+			// The declared clock holds only the group's first depth frames.
+			let tail = if declared { 2 } else { 8 };
+			live.run(8 * GOP + tail, &mut [&mut leg], |_| false);
+			live.fall_silent(silence, &mut [&mut leg]);
+			let observed = kio::clock::now();
+			live.group.take().unwrap().abort(moq_net::Error::Unroutable).unwrap();
+			leg.poll_now();
+			live.run(live.tick + 8 * GOP, &mut [&mut leg], |_| false);
+			assert_eq!(
+				leg.export.dropped() > 0,
+				!silence.is_zero(),
+				"declared {declared}, silence {silence:?}"
+			);
+			let after: Vec<_> = leg
+				.units()
+				.into_iter()
+				.filter(|unit| unit.pid == VIDEO_PID && unit.sent >= observed)
+				.collect();
+			assert!(after.len() >= (6 * GOP) as usize, "video resumes after the cut");
+			assert!(
+				after.iter().all(|unit| unit.lead >= 0.0),
+				"video never goes out after its decode time"
+			);
+		}
+	}
+}
+
+/// A resumed frame supplies the settling arrival across either a skipped group or a
+/// declared restart, including when both boundaries are read in the same poll.
+#[tokio::test(start_paused = true)]
+async fn a_successor_settles_held_video_across_a_skip_or_restart() {
+	for declared in [false, true] {
+		for restart in [false, true] {
+			let mut live = Live::new(1.0, 25_000).await;
+			if declared {
+				live.reorder();
+			} else {
+				live.declare_video_jitter(Duration::from_millis(400));
+			}
+			let mut leg = live.join(Duration::ZERO).await;
+			let tail = if declared { 2 } else { 8 };
+			live.run(8 * GOP + tail, &mut [&mut leg], |_| false);
+			live.fall_silent(Duration::from_secs(3), &mut [&mut leg]);
+			if restart {
+				live.group.take().unwrap().finish().unwrap();
+				let mut marker = live.video.append_group().unwrap();
+				HangContainer::Legacy(crate::container::Kind::Video)
+					.write(
+						&mut marker,
+						&[crate::container::test_util::raw_frame(live.tick * VIDEO_US, b"", true)],
+					)
+					.unwrap();
+				marker.finish().unwrap();
+			} else {
+				// Leave the old group blocked so the successor makes the consumer skip it.
+				live.stalling = true;
+			}
+			// Deliver the successor with its boundary, so no clean-end Pending flush
+			// runs before the new frame can settle the held tail.
+			live.run(live.tick + 1, &mut [], |_| false);
+			leg.poll_now();
+			live.run(live.tick + 8 * GOP, &mut [&mut leg], |_| false);
+			assert!(leg.export.dropped() > 0, "declared {declared}, restart {restart}");
+		}
+	}
+}
+
+/// A clean group end followed by Pending settles its tail immediately, before a later
+/// silence, under either decode clock.
+#[tokio::test(start_paused = true)]
+async fn a_clean_group_end_settles_held_video_before_a_silence() {
+	for declared in [false, true] {
+		let mut live = Live::new(1.0, 25_000).await;
+		if declared {
+			live.reorder();
+		} else {
+			live.declare_video_jitter(Duration::from_millis(400));
+		}
+		let mut leg = live.join(Duration::ZERO).await;
+		let tail = if declared { 2 } else { 8 };
+		live.run(8 * GOP + tail, &mut [&mut leg], |_| false);
+		live.group.take().unwrap().finish().unwrap();
+		leg.poll_now();
+		live.fall_silent(Duration::from_secs(3), &mut [&mut leg]);
+		live.run(live.tick + 8 * GOP, &mut [&mut leg], |_| false);
+		assert_eq!(leg.export.dropped(), 0, "declared {declared}");
 	}
 }
 
@@ -727,7 +1032,7 @@ async fn video_held_for_most_of_the_delay_drops_nothing() {
 		let mut live = Live::new(1.0, lag).await;
 		live.declare_video_jitter(DELAY * 4 / 5);
 		let mut leg = live.join(Duration::ZERO).await;
-		live.run(20 * GOP, &mut [&mut leg], |_| false).await;
+		live.run(20 * GOP, &mut [&mut leg], |_| false);
 		assert_eq!(leg.export.dropped(), 0, "lag {lag}: frames dropped on a clean source");
 	}
 }
@@ -737,61 +1042,24 @@ async fn video_held_for_most_of_the_delay_drops_nothing() {
 /// the stream is not a missed deadline, so they go out rather than drop.
 #[tokio::test(start_paused = true)]
 async fn the_video_held_at_the_end_goes_out() {
-	for lag in [0, LAGS[0], LAGS[1]] {
-		let mut live = Live::new(1.0, lag).await;
-		live.declare_video_jitter(Duration::from_millis(300));
-		let mut leg = live.join(Duration::ZERO).await;
-		let last = 8 * GOP + 5;
-		live.run(last, &mut [&mut leg], |_| false).await;
-		live.run_audio((last + 3 * GOP) * VIDEO_US, &mut [&mut leg]).await;
-		live.finish(&mut [&mut leg]).await;
+	for declared in [false, true] {
+		for lag in [0, LAGS[0], LAGS[1]] {
+			let mut live = Live::new(1.0, lag).await;
+			if declared {
+				live.reorder();
+			} else {
+				live.declare_video_jitter(Duration::from_millis(300));
+			}
+			let mut leg = live.join(Duration::ZERO).await;
+			let last = 8 * GOP + if declared { 2 } else { 5 };
+			live.run(last, &mut [&mut leg], |_| false);
+			live.run_audio((last + 3 * GOP) * VIDEO_US, &mut [&mut leg]);
+			live.finish(&mut [&mut leg]);
 
-		assert_eq!(leg.export.dropped(), 0, "lag {lag}: frames dropped");
-		let video = leg.units().iter().filter(|unit| unit.pid == VIDEO_PID).count() as u64;
-		assert_eq!(video, last, "lag {lag}: {video} of {last} video units went out");
-	}
-}
-
-/// The last PCR a leg carried, 90 kHz.
-fn last_pcr(out: &[(Instant, Frame)]) -> u64 {
-	let bytes: Vec<u8> = out
-		.iter()
-		.flat_map(|(_, frame)| frame.payload.iter().copied())
-		.collect();
-	let mut reader = TsPacketReader::new(Cursor::new(bytes));
-	let mut pcr = None;
-	while let Some(packet) = reader.read_ts_packet().unwrap() {
-		if let Some(clock) = packet.adaptation_field.as_ref().and_then(|af| af.pcr) {
-			pcr = Some(clock.as_u64() / 300);
+			assert_eq!(leg.export.dropped(), 0, "lag {lag}: frames dropped");
+			let video = leg.units().iter().filter(|unit| unit.pid == VIDEO_PID).count() as u64;
+			assert_eq!(video, last, "lag {lag}: {video} of {last} video units went out");
 		}
-	}
-	pcr.expect("a PCR")
-}
-
-/// The media goes out up to the delay ahead of its decode time, so at the end of the broadcast
-/// the clock runs on alone until the last unit decodes, with or without `--sync`: a receiver
-/// removes a unit from its buffer only once the clock reaches its decode time.
-#[tokio::test(start_paused = true)]
-async fn the_clock_runs_on_to_the_last_decode_time() {
-	for sync in [false, true] {
-		let mut live = Live::new(1.0, LAGS[0]).await;
-		live.sync = sync;
-		live.origin = 10_000_000;
-		let mut leg = live.join(Duration::ZERO).await;
-		live.run(4 * GOP, &mut [&mut leg], |_| false).await;
-		live.finish(&mut [&mut leg]).await;
-
-		let last = leg
-			.units()
-			.iter()
-			.map(|unit| unit.decode)
-			.max()
-			.expect("units went out");
-		let short = diff90(last, last_pcr(&leg.out)) as f64 / 90.0;
-		assert!(
-			short <= SLOT_MS,
-			"sync {sync}: the clock stops {short} ms before the last decode time"
-		);
 	}
 }
 
@@ -800,22 +1068,23 @@ async fn the_clock_runs_on_to_the_last_decode_time() {
 // turn once the walk passes the delay, and one running fast makes the buffer grow without bound.
 // The output's clock may follow it only as fast as 13818-1 lets a system clock change, so
 // reaching a source 30 ppm off takes hours (the jitter buffer's own tests run a day); these
-// cases run five minutes of a source at the limit, long enough to measure its rate.
+// cases run a minute of a source at the limit, long enough to measure its rate: frames arrive
+// on the source's exact clock, so the measurement settles within a few steering steps.
 
 /// How far the instant each slot goes out may wander against the source over a run: what
 /// reaching a source at the limit costs under the slew limit (30 ppm squared over twice
 /// 0.075 Hz/s of 27 MHz), and a slot.
 const DRIFT_SLACK: Duration = Duration::from_millis(162 + 25);
 
-/// Five minutes of media.
-const DRIFT_TICKS: u64 = 300_000_000 / VIDEO_US;
+/// A minute of media.
+const DRIFT_TICKS: u64 = 60_000_000 / VIDEO_US;
 
 /// The spread of (slot sent − source's clock at the slot) after the first 10 s over `ticks`
 /// of media, the drops, and the export's stats at the end.
 async fn on_a_scaled_clock(scale: f64, ticks: u64) -> (Duration, u64, Stats) {
 	let mut live = Live::new(scale, 0).await;
 	let mut leg = live.join(Duration::ZERO).await;
-	live.run(ticks, &mut [&mut leg], |_| false).await;
+	live.run(ticks, &mut [&mut leg], |_| false);
 
 	let first = leg.out.first().expect("output").1.timestamp.as_micros() as u64;
 	let held: Vec<Duration> = leg
@@ -853,7 +1122,7 @@ async fn a_fast_source_clock_keeps_the_delay() {
 /// A source 400 ppm off, past what the output's clock may follow, is measured and counted.
 #[tokio::test(start_paused = true)]
 async fn a_source_past_the_limit_is_counted() {
-	let (_, _, stats) = on_a_scaled_clock(1.0004, 300_000_000 / VIDEO_US).await;
+	let (_, _, stats) = on_a_scaled_clock(1.0004, DRIFT_TICKS).await;
 	let drift = stats.release.drift.expect("a measurement");
 	assert!((drift - 400.0).abs() < 1.0, "measured {drift} ppm");
 	assert!(stats.release.out_of_tolerance > 0, "not counted");
@@ -861,13 +1130,107 @@ async fn a_source_past_the_limit_is_counted() {
 
 /// A source 22% slow, as an importer starved of CPU, fails the export within seconds. Past the
 /// limit, a source fails once it has used half the delay however far off it runs; the jitter
-/// buffer's own tests time that at 40 and 400 ppm.
+/// buffer's own tests time that at 40 and 400 ppm. On the few floors there are by then, the
+/// video's wandering lead fits its envelope as well as the audio does, and the one measuring
+/// less drift names the rate, so only its order is checked.
 #[tokio::test(start_paused = true)]
-#[should_panic(expected = "the source's clock runs -220")]
+#[should_panic(expected = "the source's clock runs -2")]
 async fn a_source_far_off_real_time_fails_within_seconds() {
 	let mut live = Live::new(1.0 / 1.22, 0).await;
 	let mut leg = live.join(Duration::ZERO).await;
-	live.run(10_000_000 / VIDEO_US, &mut [&mut leg], |_| false).await;
+	live.run(10_000_000 / VIDEO_US, &mut [&mut leg], |_| false);
+}
+
+// A padded output writes every slot of its grid, so a sink that stops reading, or reads slower
+// than the multiplex rate, would otherwise face every slot it missed at once, and the backlog's
+// own wait would read to the jitter buffer as a source clock running far slow.
+
+/// How far a padded export may fall behind before it sheds: half the delay.
+const BUDGET: Duration = Duration::from_millis(DELAY.as_millis() as u64 / 2);
+
+/// How long after the source's clock each slot written at or after `from` went out.
+fn holds(live: &Live, leg: &Leg, from: Instant) -> Vec<Duration> {
+	leg.out
+		.iter()
+		.filter(|(sent, _)| *sent >= from)
+		.map(|(sent, frame)| sent.saturating_duration_since(live.sent(frame.timestamp.as_micros() as u64)))
+		.collect()
+}
+
+/// How many PCRs flag a discontinuity in the slots written at or after `from`.
+fn flagged(leg: &Leg, from: Instant) -> usize {
+	leg.out
+		.iter()
+		.filter(|(sent, _)| *sent >= from)
+		.flat_map(|(_, frame)| frame.payload.chunks(188).map(<[u8]>::to_vec).collect::<Vec<_>>())
+		.filter(|packet| packet[3] & 0x20 != 0 && packet[4] > 0 && packet[5] & 0x10 != 0 && packet[5] & 0x80 != 0)
+		.count()
+}
+
+/// A sink that blocks for ten seconds resumes on the current slot, the jump flagged once, rather
+/// than being handed every slot it missed.
+#[tokio::test(start_paused = true)]
+async fn a_blocked_sink_resumes_on_the_current_slot() {
+	let mut live = Live::new(1.0, 0).await;
+	let mut leg = live.join(Duration::ZERO).await;
+	live.run(10 * GOP, &mut [&mut leg], |_| false);
+	let normal = *holds(&live, &leg, live.start).iter().max().unwrap();
+
+	let resume = kio::clock::now().saturating_add(Duration::from_secs(10));
+	leg.busy = Some(resume);
+	live.run(10 * GOP + 10_000_000 / VIDEO_US + 10 * GOP, &mut [&mut leg], |_| false);
+
+	let burst = leg.out.iter().filter(|(sent, _)| *sent == resume).count();
+	let slots = (BUDGET.as_millis() / PCR_INTERVAL.as_millis()) as usize + 2;
+	assert!(
+		burst <= slots,
+		"{burst} slots went out on resuming, past the {slots} the budget holds"
+	);
+	assert_eq!(flagged(&leg, resume), 1, "the jump is flagged once");
+	let worst = *holds(&live, &leg, resume.saturating_add(BUDGET)).iter().max().unwrap();
+	assert!(
+		worst <= normal + PCR_INTERVAL,
+		"held {worst:?} after resuming, {normal:?} before"
+	);
+	assert!(
+		leg.units()
+			.iter()
+			.any(|unit| unit.sent > resume && unit.pid == VIDEO_PID),
+		"video resumed"
+	);
+}
+
+/// A sink draining at half the multiplex rate keeps a bounded lag, shedding what it cannot
+/// write, and never reads to the jitter buffer as a slow source clock. The export lays at most
+/// the budget's worth of missed slots at once, which this sink takes twice as long to write, so
+/// it falls up to a delay behind.
+#[tokio::test(start_paused = true)]
+async fn a_slow_sink_sheds_and_keeps_its_lag() {
+	let mut live = Live::new(1.0, 0).await;
+	let mut leg = live.join(Duration::ZERO).await;
+	live.run(10 * GOP, &mut [&mut leg], |_| false);
+	let normal = *holds(&live, &leg, live.start).iter().max().unwrap();
+
+	let slow = kio::clock::now();
+	leg.sink = Some(MUX_RATE / 2);
+	live.run(10 * GOP + 120_000_000 / VIDEO_US, &mut [&mut leg], |_| false);
+
+	let worst = *holds(&live, &leg, slow).iter().max().unwrap();
+	assert!(
+		worst <= normal + DELAY,
+		"held {worst:?} at half the rate, {normal:?} before"
+	);
+	let video = leg
+		.units()
+		.iter()
+		.filter(|unit| unit.sent > slow && unit.pid == VIDEO_PID)
+		.count();
+	assert!(video > 0, "no video went out");
+	assert_eq!(
+		leg.export.stats().release.out_of_tolerance,
+		0,
+		"the sink read as source drift"
+	);
 }
 
 // A 1+1 pair is two receivers of one broadcast whose outputs a seamless switch compares packet
@@ -896,13 +1259,20 @@ fn assert_same_packets(a: &Leg, b: &Leg, from: u64) {
 			"slot at {:?} rendered to a different size",
 			a.timestamp
 		);
-		for (offset, (x, y)) in a.payload.iter().zip(b.payload.iter()).enumerate() {
-			// Only the low nibble of byte 3 is the counter.
-			assert!(
-				x == y || (offset % 188 == 3 && (x ^ y) & 0xf0 == 0),
-				"slot at {:?} differs outside the continuity counter: offset {offset}, {x:#04x} vs {y:#04x}",
-				a.timestamp,
-			);
+		for (packet, (x, y)) in a.payload.chunks(188).zip(b.payload.chunks(188)).enumerate() {
+			// Only the low nibble of byte 3 is the counter. Compared a packet at a time, then
+			// byte by byte only to name the offset that differs.
+			if x.len() > 3 && x[..3] == y[..3] && (x[3] ^ y[3]) & 0xf0 == 0 && x[4..] == y[4..] {
+				continue;
+			}
+			for (offset, (x, y)) in x.iter().zip(y).enumerate() {
+				assert!(
+					x == y || (offset == 3 && (x ^ y) & 0xf0 == 0),
+					"slot at {:?} differs outside the continuity counter: offset {}, {x:#04x} vs {y:#04x}",
+					a.timestamp,
+					packet * 188 + offset,
+				);
+			}
 		}
 	}
 }
@@ -918,10 +1288,10 @@ async fn pair_at(rate: u64, scale: f64, lag: i64, ticks: u64, stall: impl Fn(u64
 	let mut live = Live::new(scale, lag).await;
 	live.rate = rate;
 	let mut a = live.join(Duration::ZERO).await;
-	live.run(JOIN, &mut [&mut a], stall).await;
+	live.run(JOIN, &mut [&mut a], stall);
 	let mut b = live.join(Duration::from_millis(100)).await;
-	live.run(ticks, &mut [&mut a, &mut b], stall).await;
-	live.finish(&mut [&mut a, &mut b]).await;
+	live.run(ticks, &mut [&mut a, &mut b], stall);
+	live.finish(&mut [&mut a, &mut b]);
 	let joined = b.out.first().expect("the joiner rendered").1.timestamp.as_micros() as u64;
 	(a, b, joined + 2_000_000)
 }
@@ -941,358 +1311,6 @@ async fn two_legs_render_the_same_packets() {
 async fn two_legs_pad_the_same_slots_at_a_fractional_rate() {
 	let (a, b, from) = pair_at(2_000_000, 1.0, 0, 12 * GOP, |_| false).await;
 	assert_same_packets(&a, &b, from);
-}
-
-/// A slow group reaches both legs, and each skips it when its own reads find the next group
-/// far enough ahead, so each may render a different part of it. What both render is the same,
-/// continuity counters included, and what one lacks is stuffing.
-#[tokio::test(start_paused = true)]
-async fn two_legs_render_a_skip_the_same_way() {
-	for lag in LAGS {
-		let (a, b, from) = synced(lag, JOIN, 12 * GOP, |tick| (6 * GOP + 7..7 * GOP).contains(&tick)).await;
-		assert_same_synced(&a, &b, from);
-	}
-}
-
-// Under `--sync` every byte a leg renders is a function of the objects it holds, their media
-// time, the catalog and the rate, so the continuity counters match too, and content one leg
-// lacks leaves stuffing in its positions rather than moving what follows.
-
-/// Two `--sync` legs of one broadcast on `lag`: one there from the start and reading after
-/// every frame, the other joining at video tick `join` and reading every 100 ms. Returns them
-/// with the slot time 2 s after the second joined, from which they must agree.
-async fn synced(lag: i64, join: u64, ticks: u64, stall: impl Fn(u64) -> bool + Copy) -> (Leg, Leg, u64) {
-	synced_on(1.0, 0, lag, join, ticks, stall).await
-}
-
-async fn synced_on(
-	scale: f64,
-	origin: u64,
-	lag: i64,
-	join: u64,
-	ticks: u64,
-	stall: impl Fn(u64) -> bool + Copy,
-) -> (Leg, Leg, u64) {
-	let mut live = Live::new(scale, lag).await;
-	live.origin = origin;
-	synced_with(live, join, ticks, stall).await
-}
-
-async fn synced_with(mut live: Live, join: u64, ticks: u64, stall: impl Fn(u64) -> bool + Copy) -> (Leg, Leg, u64) {
-	live.sync = true;
-	let mut a = live.join(Duration::ZERO).await;
-	live.run(join, &mut [&mut a], stall).await;
-	let mut b = live.join(Duration::from_millis(100)).await;
-	live.run(ticks, &mut [&mut a, &mut b], stall).await;
-	live.finish(&mut [&mut a, &mut b]).await;
-	let joined = b.out.first().expect("the joiner rendered").1.timestamp.as_micros() as u64;
-	(a, b, joined + 2_000_000)
-}
-
-/// Each slot a leg rendered from media time `from` (µs), keyed by that time.
-fn slots(leg: &Leg, from: u64) -> std::collections::BTreeMap<u64, Bytes> {
-	leg.out
-		.iter()
-		.map(|(_, frame)| (frame.timestamp.as_micros() as u64, frame.payload.clone()))
-		.filter(|(at, _)| *at >= from)
-		.collect()
-}
-
-fn pid(packet: &[u8]) -> u16 {
-	u16::from(packet[1] & 0x1f) << 8 | u16::from(packet[2])
-}
-
-/// Assert two `--sync` legs rendered the same packets, continuity counters included, in every
-/// slot from media time `from` (µs), compared by the slot's media time: a position may hold
-/// stuffing in one leg where the other has content, and nothing else may differ. Returns how
-/// many positions held content in one leg alone.
-fn assert_same_synced(a: &Leg, b: &Leg, from: u64) -> usize {
-	for leg in [a, b] {
-		let stats = leg.export.stats().release;
-		assert_eq!((stats.overruns, stats.late), (0, 0), "a lane fell behind");
-	}
-	same_synced(a, b, from)
-}
-
-/// As [`assert_same_synced`], whatever the legs counted.
-fn same_synced(a: &Leg, b: &Leg, from: u64) -> usize {
-	let (a, b) = (slots(a, from), slots(b, from));
-	let common: Vec<u64> = a.keys().filter(|at| b.contains_key(at)).copied().collect();
-	assert!(
-		common.len() > 40,
-		"not enough overlap to be worth comparing: {}",
-		common.len()
-	);
-	assert_eq!(
-		common.len(),
-		a.len().min(b.len()),
-		"a slot one leg rendered is missing from the other"
-	);
-	let mut alone = 0;
-	for at in common {
-		let (x, y) = (&a[&at], &b[&at]);
-		assert_eq!(x.len(), y.len(), "slot at {at} µs rendered to a different size");
-		for (n, (p, q)) in x.chunks(188).zip(y.chunks(188)).enumerate() {
-			if p == q {
-				continue;
-			}
-			let offset = p.iter().zip(q).position(|(x, y)| x != y).unwrap_or(0);
-			assert!(
-				pid(p) == 0x1fff || pid(q) == 0x1fff,
-				"slot at {at} µs differs at packet {n}, byte {offset}: PID {:#x} vs {:#x}, {:#04x} vs {:#04x}",
-				pid(p),
-				pid(q),
-				p[offset],
-				q[offset],
-			);
-			alone += 1;
-		}
-	}
-	alone
-}
-
-/// Whether a leg sent the PAT before any media, wherever its first slot fell on the grid.
-fn leads_with_the_tables(leg: &Leg) -> bool {
-	let mut pids = leg.out.iter().flat_map(|(_, frame)| frame.payload.chunks(188).map(pid));
-	pids.find(|&pid| pid == 0 || pid == VIDEO_PID || pid == AUDIO_PID) == Some(0)
-}
-
-/// Legs that joined mid-group and a group later, read on different cadences with each track
-/// lagging in turn, render the same packets, continuity counters included, and the joiner
-/// starts on the tables.
-#[tokio::test(start_paused = true)]
-async fn synced_legs_render_the_same_packets() {
-	for lag in LAGS {
-		for join in [JOIN, JOIN + GOP, 4 * GOP] {
-			let (a, b, from) = synced(lag, join, 12 * GOP, |_| false).await;
-			let alone = assert_same_synced(&a, &b, from);
-			assert_eq!(
-				alone, 0,
-				"lag {lag}, join {join}: clean legs differ in {alone} positions"
-			);
-			assert!(leads_with_the_tables(&b), "lag {lag}, join {join}");
-		}
-	}
-}
-
-/// Legs of a B-pyramid render the same packets when the first lost a group's tail before the
-/// other joined, cut after a frame presented below one it never received.
-#[tokio::test(start_paused = true)]
-async fn synced_legs_render_reordered_video_the_same_way() {
-	let stall = |tick: u64| (2 * GOP + 8..3 * GOP).contains(&tick);
-	for lag in LAGS {
-		for join in [JOIN, JOIN + GOP, 4 * GOP + 2] {
-			let mut live = Live::new(1.0, lag).await;
-			live.reorder();
-			let (a, b, from) = synced_with(live, join, 12 * GOP, stall).await;
-			let alone = assert_same_synced(&a, &b, from);
-			assert_eq!(
-				alone, 0,
-				"lag {lag}, join {join}: clean legs differ in {alone} positions"
-			);
-		}
-	}
-}
-
-/// Each leg loses groups the other receives. Each renders the other's packets wherever it
-/// holds them, so one leg's stuffing is the other's content, and the two merged are a clean
-/// leg's output.
-#[tokio::test(start_paused = true)]
-async fn complementary_losses_stay_complementary() {
-	complementary_losses(false, false).await;
-}
-
-/// As [`complementary_losses_stay_complementary`] on a B-pyramid, with leg A's loss cutting
-/// it between a reference and a frame presented before it.
-#[tokio::test(start_paused = true)]
-async fn complementary_losses_of_reordered_video_stay_complementary() {
-	complementary_losses(true, false).await;
-}
-
-/// Legs of a B-pyramid stopped in turn, as receiver processes can be: each falls behind, the
-/// relay evicts the group it was reading, and what its decode clock still held from that
-/// group goes. The legs stay complementary.
-#[tokio::test(start_paused = true)]
-async fn legs_stopped_in_turn_stay_complementary() {
-	complementary_losses(true, true).await;
-}
-
-/// Each leg loses part of the broadcast the other receives: with `stop`, by reading nothing
-/// for over a second while the relay evicts its group, else by the source stalling a group
-/// for that leg alone.
-async fn complementary_losses(reorder: bool, stop: bool) {
-	let lost_a = |tick: u64| (5 * GOP + 8..6 * GOP).contains(&tick);
-	let lost_b = |tick: u64| (7 * GOP + 5..8 * GOP).contains(&tick);
-	let stopped_a = |tick: u64| (5 * GOP + 8..7 * GOP).contains(&tick);
-	let stopped_b = |tick: u64| (8 * GOP + 5..10 * GOP).contains(&tick);
-	for lag in LAGS {
-		let mut paths = Vec::new();
-		for _ in 0..3 {
-			let mut live = Live::new(1.0, lag).await;
-			live.sync = true;
-			if reorder {
-				live.reorder();
-			}
-			paths.push(live);
-		}
-		let [mut clean, mut path_a, mut path_b] = <[Live; 3]>::try_from(paths).ok().unwrap();
-		assert!(clean.start == path_a.start && clean.start == path_b.start);
-		let mut c = clean.join(Duration::ZERO).await;
-		let mut a = path_a.join(Duration::ZERO).await;
-		let mut b = path_b.join(Duration::from_millis(100)).await;
-		for tick in 1..=12 * GOP {
-			clean.run(tick, &mut [&mut c], |_| false).await;
-			match (stop, stopped_a(tick)) {
-				(false, _) => path_a.run(tick, &mut [&mut a], lost_a).await,
-				(true, false) => path_a.run(tick, &mut [&mut a], |_| false).await,
-				(true, true) => {
-					if !stopped_a(tick - 1) {
-						path_a.evict();
-					}
-					path_a.run(tick, &mut [], |_| false).await
-				}
-			}
-			match (stop, stopped_b(tick)) {
-				(false, _) => path_b.run(tick, &mut [&mut b], lost_b).await,
-				(true, false) => path_b.run(tick, &mut [&mut b], |_| false).await,
-				(true, true) => {
-					if !stopped_b(tick - 1) {
-						path_b.evict();
-					}
-					path_b.run(tick, &mut [], |_| false).await
-				}
-			}
-		}
-		clean.finish(&mut [&mut c]).await;
-		path_a.finish(&mut [&mut a]).await;
-		path_b.finish(&mut [&mut b]).await;
-
-		let from = 2 * GOP * VIDEO_US;
-		// A stopped leg may resume behind the slots it laid, and drop what it reads for them.
-		for (leg, stopped) in [(&a, stop), (&b, stop), (&c, false)] {
-			let stats = leg.export.stats().release;
-			assert_eq!(stats.overruns, 0, "lag {lag}: a lane fell behind");
-			assert!(stopped || stats.late == 0, "lag {lag}: {} packets late", stats.late);
-		}
-		assert!(same_synced(&a, &c, from) > 0, "lag {lag}: leg A lost nothing");
-		assert!(same_synced(&b, &c, from) > 0, "lag {lag}: leg B lost nothing");
-		assert!(same_synced(&a, &b, from) > 0);
-		let (a, b, c) = (slots(&a, from), slots(&b, from), slots(&c, from));
-		for (at, clean) in &c {
-			let (Some(a), Some(b)) = (a.get(at), b.get(at)) else {
-				continue;
-			};
-			let merged: Vec<u8> = a
-				.chunks(188)
-				.zip(b.chunks(188))
-				.flat_map(|(a, b)| if pid(a) == 0x1fff { b } else { a })
-				.copied()
-				.collect();
-			assert_eq!(
-				&merged[..],
-				&clean[..],
-				"lag {lag}: the merged legs differ from a clean leg at {at} µs"
-			);
-		}
-	}
-}
-
-/// A group ending in a burst still fills its lane at the next group's release, so a leg holding
-/// it would lay the next group behind where a leg that lost it does. When the next group's
-/// first picture opens a buffering period, it goes out late enough for neither leg's lane to be
-/// busy, and both lay it alike.
-#[tokio::test(start_paused = true)]
-async fn a_leg_that_lost_a_burst_lays_the_next_buffering_period_alike() {
-	let lost = |tick: u64| (5 * GOP + 8..6 * GOP).contains(&tick);
-	for lag in LAGS {
-		let mut paths = Vec::new();
-		for _ in 0..2 {
-			let mut live = Live::new(1.0, lag).await;
-			live.sync = true;
-			// A lane the HRD's Rx narrows cannot carry the first keyframe by a decode time of zero.
-			live.origin = 10_000_000;
-			// Half the HRD's buffer delay: a group's first picture waits 0.2 s before it decodes.
-			live.buffering(18_000);
-			live.burst = Some(6 * GOP - 1);
-			paths.push(live);
-		}
-		let [mut whole, mut lossy] = <[Live; 2]>::try_from(paths).ok().unwrap();
-		assert!(whole.start == lossy.start);
-		let mut a = whole.join(Duration::ZERO).await;
-		let mut b = lossy.join(Duration::from_millis(100)).await;
-		for tick in 1..=10 * GOP {
-			whole.run(tick, &mut [&mut a], |_| false).await;
-			lossy.run(tick, &mut [&mut b], lost).await;
-		}
-		whole.finish(&mut [&mut a]).await;
-		lossy.finish(&mut [&mut b]).await;
-		assert!(
-			assert_same_synced(&a, &b, 2 * GOP * VIDEO_US) > 0,
-			"lag {lag}: the lossy leg lost nothing"
-		);
-	}
-}
-
-/// A broadcast timeline crossing the 33-bit PTS and PCR wrap while both legs run, with the
-/// second joining just after it, renders the same packets.
-#[tokio::test(start_paused = true)]
-async fn synced_legs_render_the_same_packets_across_the_wrap() {
-	// 2^33 ticks of 90 kHz, in µs: the wrap falls 3.7 s in, and the joiner's first group is
-	// the first to start after it.
-	let wrap = (1u64 << 33) * 100 / 9;
-	let origin = (wrap - 3_700_000) / VIDEO_US * VIDEO_US;
-	let join = (wrap - origin).div_ceil(VIDEO_US * GOP) * GOP + 1;
-	let first = |leg: &Leg| leg.units().iter().find(|unit| unit.pid == VIDEO_PID).unwrap().decode;
-	for lag in LAGS {
-		let (a, b, from) = synced_on(1.0, origin, lag, join, join + 12 * GOP, |_| false).await;
-		assert!(
-			first(&a) > (1 << 33) - 10 * 90_000,
-			"the first leg started after the wrap"
-		);
-		assert!(first(&b) < 10 * 90_000, "the joiner started before the wrap");
-		assert_eq!(assert_same_synced(&a, &b, from), 0);
-		assert!(leads_with_the_tables(&a) && leads_with_the_tables(&b));
-	}
-}
-
-/// A source clock 30 ppm off the receivers' moves when slots go out, never what they carry.
-#[tokio::test(start_paused = true)]
-async fn synced_legs_render_a_drifting_source_the_same_way() {
-	for scale in [1.0 - 30e-6, 1.0 + 30e-6] {
-		let (a, b, from) = synced_on(scale, 0, 0, JOIN, 120_000_000 / VIDEO_US, |_| false).await;
-		assert_eq!(assert_same_synced(&a, &b, from), 0, "scale {scale}");
-	}
-}
-
-/// A rate the catalog does not record and no override names is measured, which would give
-/// each leg a grid of its own, so `--sync` refuses it.
-#[tokio::test(start_paused = true)]
-#[should_panic(expected = "--sync needs a constant multiplex rate")]
-async fn sync_refuses_an_output_without_a_constant_rate() {
-	let mut live = Live::new(1.0, 0).await;
-	let export = super::export_test::open_export(live.source.clone())
-		.await
-		.unwrap()
-		.with_delay(DELAY)
-		.with_sync();
-	let mut leg = Leg {
-		export,
-		every: Duration::ZERO,
-		next_poll: Instant::now(),
-		out: Vec::new(),
-	};
-	live.run(2 * GOP, &mut [&mut leg], |_| false).await;
-}
-
-/// A rate too low for the tracks' lanes is refused at the program tables.
-#[tokio::test(start_paused = true)]
-#[should_panic(expected = "cannot carry its lanes")]
-async fn sync_refuses_a_rate_its_lanes_do_not_fit() {
-	let mut live = Live::new(1.0, 0).await;
-	live.sync = true;
-	live.rate = 14 * 188 * 8 * 40;
-	let mut leg = live.join(Duration::ZERO).await;
-	live.run(2 * GOP, &mut [&mut leg], |_| false).await;
 }
 
 /// Whatever follows the source's clock has to follow it identically on both legs, though they
@@ -1315,10 +1333,9 @@ async fn two_legs_render_a_drifting_source_the_same_way() {
 async fn a_joiner_keeps_the_system_clock_in_tolerance() {
 	const WINDOW: u64 = 30_000_000;
 	let mut live = Live::new(1.0, 0).await;
-	live.run(JOIN, &mut [], |_| false).await;
+	live.run(JOIN, &mut [], |_| false);
 	let mut leg = live.join(Duration::ZERO).await;
-	live.run(JOIN + 300_000_000 / VIDEO_US, &mut [&mut leg], |_| false)
-		.await;
+	live.run(JOIN + 300_000_000 / VIDEO_US, &mut [&mut leg], |_| false);
 
 	// The instant each slot first went out, by its PCR time.
 	let mut first = std::collections::BTreeMap::new();
@@ -1363,9 +1380,9 @@ async fn a_joiner_keeps_the_system_clock_in_tolerance() {
 #[tokio::test(start_paused = true)]
 async fn a_joiner_runs_at_the_delay_from_its_first_output() {
 	let mut live = Live::new(1.0, DELAY.as_micros() as i64).await;
-	live.run(JOIN, &mut [], |_| false).await;
+	live.run(JOIN, &mut [], |_| false);
 	let mut leg = live.join(Duration::ZERO).await;
-	live.run(JOIN + 10_000_000 / VIDEO_US, &mut [&mut leg], |_| false).await;
+	live.run(JOIN + 10_000_000 / VIDEO_US, &mut [&mut leg], |_| false);
 	assert_eq!(leg.export.dropped(), 0, "every frame arrived inside its deadline");
 
 	let held: Vec<Duration> = leg
@@ -1394,7 +1411,7 @@ async fn live_audio_shares_its_pes() {
 	for lag in [DELAY.as_micros() as i64, LAGS[0], LAGS[1]] {
 		let mut live = Live::new(1.0, lag).await;
 		let mut leg = live.join(Duration::ZERO).await;
-		live.run(10_000_000 / VIDEO_US, &mut [&mut leg], |_| false).await;
+		live.run(10_000_000 / VIDEO_US, &mut [&mut leg], |_| false);
 		assert_eq!(
 			leg.export.dropped(),
 			0,
@@ -1413,5 +1430,130 @@ async fn live_audio_shares_its_pes() {
 			let frames = ((pair[1] - pair[0]) as f64 / at90(AUDIO_US) as f64).round() as u64;
 			assert!(matches!(frames, 12 | 7), "lag {lag}: a PES carried {frames} frames");
 		}
+	}
+}
+
+/// The raw AAC of the fixture's audio frame `index`.
+fn audio_payload(index: u64) -> Bytes {
+	Bytes::from_iter((0..180u16).map(|i| (i ^ index as u16) as u8))
+}
+
+/// Each AAC frame a leg rendered, in output order, with its ADTS header removed.
+fn aac_frames(leg: &Leg) -> Vec<Bytes> {
+	let bytes: Vec<u8> = leg
+		.out
+		.iter()
+		.flat_map(|(_, frame)| frame.payload.iter().copied())
+		.collect();
+	let mut reader = TsPacketReader::new(Cursor::new(bytes));
+	let mut pes: Vec<Vec<u8>> = Vec::new();
+	while let Some(packet) = reader.read_ts_packet().unwrap() {
+		if packet.header.pid.as_u16() != AUDIO_PID {
+			continue;
+		}
+		match packet.payload {
+			Some(TsPayload::PesStart(start)) => pes.push(start.data.to_vec()),
+			Some(TsPayload::PesContinuation(rest)) => {
+				pes.last_mut().expect("a PES start first").extend_from_slice(&rest)
+			}
+			_ => {}
+		}
+	}
+	let mut frames = Vec::new();
+	for data in &pes {
+		// One PES carries several frames.
+		let mut data = &data[..];
+		while !data.is_empty() {
+			let header = super::adts::Header::parse(data).unwrap();
+			frames.push(Bytes::copy_from_slice(&data[header.header_len..header.frame_len]));
+			data = &data[header.frame_len..];
+		}
+	}
+	frames
+}
+
+/// Each video frame's DTS (else PTS) by its PTS, in 90 kHz ticks, as a leg rendered it.
+fn decode_times(leg: &Leg) -> std::collections::BTreeMap<u64, u64> {
+	let bytes: Vec<u8> = leg
+		.out
+		.iter()
+		.flat_map(|(_, frame)| frame.payload.iter().copied())
+		.collect();
+	let mut reader = TsPacketReader::new(Cursor::new(bytes));
+	let mut out = std::collections::BTreeMap::new();
+	while let Some(packet) = reader.read_ts_packet().unwrap() {
+		if let Some(TsPayload::PesStart(pes)) = &packet.payload
+			&& packet.header.pid.as_u16() == VIDEO_PID
+			&& let Some(pts) = pes.header.pts
+		{
+			out.insert(pts.as_u64(), pes.header.dts.unwrap_or(pts).as_u64());
+		}
+	}
+	out
+}
+
+/// Legs that joined at different groups, one after reading a group cut short below a frame it
+/// never received, author the same DTS for every frame both render once the rendition declares
+/// its reorder depth: each group decodes from its own frames alone.
+#[tokio::test(start_paused = true)]
+async fn declared_legs_author_the_same_dts() {
+	let stall = |tick: u64| (2 * GOP + 8..3 * GOP).contains(&tick);
+	for join in [JOIN, 4 * GOP + 2] {
+		let mut live = Live::new(1.0, 0).await;
+		live.reorder();
+		let mut a = live.join(Duration::ZERO).await;
+		live.run(join, &mut [&mut a], stall);
+		let mut b = live.join(Duration::from_millis(100)).await;
+		live.run(12 * GOP, &mut [&mut a, &mut b], stall);
+		live.finish(&mut [&mut a, &mut b]);
+		let (a, b) = (decode_times(&a), decode_times(&b));
+		let shared: Vec<_> = b.iter().filter(|(pts, _)| a.contains_key(pts)).collect();
+		assert!(
+			shared.len() > 6 * GOP as usize,
+			"join {join}: {} shared frames",
+			shared.len()
+		);
+		for (pts, dts) in shared {
+			assert_eq!(a[pts], *dts, "join {join}: the frame presented at {pts}");
+		}
+	}
+}
+
+/// A warm replacement joins mid-GOP with tracks arriving at different leads.
+#[tokio::test(start_paused = true)]
+async fn a_stitch_keeps_slots_continuous_across_different_track_leads() {
+	for lag in [0, LONG_LAG, -LONG_LAG] {
+		let mut old = Live::new(1.0, lag).await;
+		let mut new = old.beside(1.0, lag).await;
+		let mut leg = old.join(Duration::ZERO).await;
+		for tick in 0..20 * GOP {
+			old.run(tick + 1, &mut [&mut leg], |_| false);
+			new.run(tick + 1, &mut [], |tick| (JOIN + 1..5 * GOP).contains(&tick));
+			if tick == JOIN {
+				let catalog = new.source.catalog::<()>(Default::default()).await.unwrap();
+				leg.export
+					.followed(&new.source.broadcast(), catalog, Duration::from_secs(10))
+					.unwrap();
+			}
+		}
+		assert_eq!(leg.export.discontinuity(), 1, "replacement lag={lag}");
+		let (index, gap) = leg
+			.out
+			.windows(2)
+			.enumerate()
+			.map(|(index, pair)| (index, pair[1].0.duration_since(pair[0].0)))
+			.max_by_key(|(_, gap)| *gap)
+			.unwrap();
+		eprintln!(
+			"GAP lag={lag}, now={:?}->{:?}, stamp={:?}->{:?}",
+			leg.out[index].0,
+			leg.out[index + 1].0,
+			leg.out[index].1.timestamp,
+			leg.out[index + 1].1.timestamp
+		);
+		assert!(
+			gap <= PCR_INTERVAL + Duration::from_micros(VIDEO_US),
+			"lag={lag}: output gap={gap:?}"
+		);
 	}
 }

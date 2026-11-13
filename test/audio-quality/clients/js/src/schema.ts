@@ -97,19 +97,32 @@ export const METRICS = {
 		description:
 			"Audio the ring failed to supply while playing: the missing samples at the device rate. `max` is the longest episode.",
 	},
-	skip_aheads: {
+	player_underruns: {
 		unit: "count",
-		clock: "viewer",
+		clock: "render",
 		aggregations: ["total", "per_min"],
 		description:
-			"Re-anchors that discarded buffered audio: a forward step in the lag between the viewer clock and the playhead.",
+			"The player's own count, which its stats panel shows: each time the ring ran dry mid-playback and re-stalled to refill, plus each quantum it filled only part-way. `underruns` leaves out the run-dry ones, since the quanta after them render while stalled.",
 	},
-	discarded_ms: {
+	player_skips: {
+		unit: "count",
+		clock: "render",
+		aggregations: ["total", "per_min"],
+		description:
+			"The player's own count of skips: each jump that dropped buffered audio rather than playing it faster.",
+	},
+	trimmed_ms: {
 		unit: "ms",
 		clock: "media",
 		aggregations: ["total", "per_min"],
 		description:
-			"Media time the skip-aheads jumped over without playing. Audio dropped before it reached the ring moves no playhead and is not counted.",
+			"The player's own count of media its skips dropped unplayed: the audio a listener lost. A time stretch's accelerate is not in it.",
+	},
+	accelerated_ms: {
+		unit: "ms",
+		clock: "media",
+		aggregations: ["total", "per_min"],
+		description: "The player's own count of media its time stretch removed by playing faster.",
 	},
 	stalled: {
 		unit: "share",
@@ -124,6 +137,20 @@ export const METRICS = {
 		aggregations: ["share"],
 		description:
 			"Share of rendered quanta under the silence floor at the player's output, whatever the cause. The published tone is never quiet, so any of it is a gap or a stall.",
+	},
+	av_lag_ms: {
+		unit: "ms",
+		clock: "media",
+		aggregations: ["p50", "p95"],
+		description:
+			"How far the audio playhead trails the shared clock video plays from (`sync.now()`), sampled while playing: latency audio adds beyond the resolved target. Negative is audio ahead.",
+	},
+	recover_ms: {
+		unit: "ms",
+		clock: "viewer",
+		aggregations: ["max"],
+		description:
+			"The longest audio spent off its resting point: from the ring stalling, or audio trailing the shared clock by more than one bucket past the window's median lag, to audio back within it.",
 	},
 	target_ms: {
 		unit: "ms",
@@ -233,27 +260,20 @@ export type Drift = {
 
 // ── the row ─────────────────────────────────────────────────────────────────
 
-/**
- * The output path that played. In the browser, which ring the page ran, decided by whether the
- * document is cross-origin isolated. Natively, the audio backend under the player's one ring:
- * `pulse` is the production ALSA/cpal output into a private PulseAudio null sink.
- */
-export type Ring = "isolated" | "plain" | "pulse";
-
 /** The audio codecs the matrix publishes. */
 export type Codec = "opus" | "aac";
 
 /**
  * Where a row played: a headless browser over the shaper, the shipped native player (`moq play`)
- * over the same shaper, or a {@link Trace} replayed through the browser player's rings on a
- * simulated clock, whose profile is the trace's name.
+ * over the same shaper into a private PulseAudio null sink, or a {@link Trace} replayed through the
+ * browser player's ring on a simulated clock, whose profile is the trace's name.
  */
 export type Runtime = "chromium" | "native" | "replay";
 
 /**
  * One matrix cell.
  *
- * A budget is keyed by the whole thing. The codec, its rate, and the ring each move the expected
+ * A budget is keyed by the whole thing. The runtime, the codec, and its rate each move the expected
  * floor as much as the profile does, so a profile-only key would grade one cell against another's
  * threshold.
  */
@@ -263,50 +283,47 @@ export type Row = {
 	/** Sample rate in Hz. */
 	rate: number;
 	profile: string;
-	ring: Ring;
 };
 
 /** The row as a flat string: a file name and a table label. */
-export const rowKey = (row: Row): string => `${row.runtime}-${row.codec}-${row.rate}-${row.profile}-${row.ring}`;
+export const rowKey = (row: Row): string => `${row.runtime}-${row.codec}-${row.rate}-${row.profile}`;
 
 /** Parse {@link rowKey}. The profile is the only field that may contain a dash. */
 export function parseRow(key: string): Row {
 	const parts = key.split("-");
 	const [runtime, codec, rate] = parts;
-	const ring = parts.at(-1);
-	const profile = parts.slice(3, -1).join("-");
+	const profile = parts.slice(3).join("-");
 	const hz = Number.parseInt(rate ?? "", 10);
 	if (
 		(runtime !== "chromium" && runtime !== "native" && runtime !== "replay") ||
 		(codec !== "opus" && codec !== "aac") ||
-		(ring !== "isolated" && ring !== "plain" && ring !== "pulse") ||
 		!Number.isFinite(hz) ||
 		profile === ""
 	) {
 		throw new Error(`not a row key: ${key}`);
 	}
-	return { runtime, codec, rate: hz, profile, ring };
+	return { runtime, codec, rate: hz, profile };
 }
 
 // ── what the recorder keeps ─────────────────────────────────────────────────
 
 /**
  * One audio frame reaching the viewer's container consumer: when, on the `viewer` clock; its
- * timestamp, on the `media` clock; and the group that carried it.
+ * timestamp, on the `media` clock; the group that carried it; and its encoded duration.
  */
-export type Arrival = [at: Ms, timestamp: Ms, group: number];
+export type Arrival = [at: Ms, timestamp: Ms, group: number, duration: Ms];
 
 /** A recorded arrival trace, as checked in under `traces/`. The file name is its profile. */
 export type Trace = {
 	/** Bumped when a field's meaning changes. */
-	version: 2;
+	version: 3;
 	/** Where it was recorded: the relay, the broadcast, its publisher, the date. */
 	source: string;
 	/** The shape it carries, and why it is kept. */
 	description: string;
 	/** The transport the session negotiated. */
 	transport: string;
-	/** The smallest round trip the connection's PROBE reported, which "auto" sizes from. */
+	/** The smallest round trip the connection's PROBE reported, retained as a diagnostic. */
 	rtt: Ms | null;
 	/** The audio rendition, as the catalog advertised it. */
 	config: {
@@ -352,6 +369,14 @@ export type Stall = {
 	stalled: boolean;
 };
 
+/** Native only: audio resuming after a silence the publisher declared, such as a push-to-talk mute. */
+export type Utterance = {
+	/** When the player wrote it to the speaker, on the `viewer` clock. */
+	at: Ms;
+	/** Its first sample's publisher timestamp, on the `media` clock. */
+	timestamp: Ms;
+};
+
 /**
  * One probe sample: what the player could read at that instant, plus what the tap reported since.
  *
@@ -378,12 +403,27 @@ export type Sample = {
 	 * is only a sink with nothing written yet, or none at all.
 	 */
 	stalled?: boolean;
+	/** `sync.now()`: where the shared clock puts video, on the `media` clock. Natively, `sync::Consumer::position`. */
+	clock?: Ms;
 	/** `sync.out.delay`: the resolved playout target. Natively, the target the speaker is held on. */
 	delay?: Ms;
-	/** The current connection PROBE round trip, before Sync keeps its minimum. */
+	/**
+	 * `audio.out.stats.underruns`, cumulative: the player's own count, which the stats panel shows.
+	 * Unset natively.
+	 */
+	playerUnderruns?: number;
+	/**
+	 * `audio.out.stats.skips`, cumulative: the player's own count of jumps that dropped buffered audio
+	 * rather than playing it faster. Natively, each trim of the ring, skip at the stretch's fast
+	 * threshold, or write a full ring refused.
+	 */
+	playerSkips?: number;
+	/** `audio.out.stats.trimmed`, cumulative: the media those skips dropped unplayed. */
+	trimmed?: Ms;
+	/** `audio.out.stats.accelerated`, cumulative: media the time stretch removed by playing faster. */
+	accelerated?: Ms;
+	/** The current connection PROBE round trip. */
 	rtt?: Ms;
-	/** `sync.out.jitter`: the network portion in auto mode, or the configured fixed delay. */
-	networkJitter?: Ms;
 	/** The selected rendition's advertised jitter at this sample. */
 	jitter?: Ms;
 	/** The selected rendition's advertised delay at this sample. */
@@ -407,12 +447,14 @@ export type Sample = {
 	gaps?: Gap[];
 	/** Stall changes since the previous sample. */
 	stalls?: Stall[];
+	/** Native only: cumulative device time filled with comfort noise for a declared silence. */
+	comfort?: Ms;
+	/** Native only: utterances resumed since the previous sample. */
+	utterances?: Utterance[];
 };
 
 /** What the page, or the native driver, reports once the session is up. */
 export type Environment = {
-	/** Whether the document is cross-origin isolated, and therefore which ring runs. Browser only. */
-	crossOriginIsolated?: boolean;
 	/** The transport the session negotiated. Anything but WebTransport never crossed the UDP shaper. */
 	transport?: string;
 	/** The audio rendition's codec string. */

@@ -14,10 +14,10 @@
 //!
 //! [`quic`] stacks a sans-IO QUIC stack on that path: a [`quic::Endpoint`]
 //! serves many connections on one socket (demuxed by connection id, dials
-//! included), each a [`quic::Connection`] wrapped by [`transport::Session`],
-//! so `moq_net::Client::connect_lite` and `Server::accept_lite` run real
-//! moq-lite sessions on the worker, and [`transport::Local`] lets the
-//! `Send`-bounded moq-transport paths run there too. The socket is the identity: whatever is
+//! included), each a [`quic::Connection`] wrapped by [`quic::web::Session`]
+//! and [`transport::Local`], which meets moq-net's `Send` bound by checking the
+//! thread on every use, so `moq_net::Client::connect` and `Server::accept` run
+//! real MoQ sessions on the worker. The socket is the identity: whatever is
 //! built on it runs on the worker that adopted it, and a socket adopted as a
 //! member of a steered reuseport group ([`udp::Bound`]) issues connection ids
 //! that steer back to it. [`Handle::run`] supplies time and schedules driver
@@ -35,8 +35,13 @@
 //! error instead of degrading. The crate compiles to nothing off Linux.
 
 #![warn(missing_docs)]
-// Off Linux the crate compiles to nothing, so these doc links have no target.
-#![cfg_attr(not(target_os = "linux"), allow(rustdoc::broken_intra_doc_links))]
+#![cfg_attr(
+	not(target_os = "linux"),
+	allow(
+		rustdoc::broken_intra_doc_links,
+		reason = "off Linux the crate compiles to nothing, so these doc links have no target"
+	)
+)]
 #![cfg(target_os = "linux")]
 
 mod clock;
@@ -54,9 +59,3 @@ mod worker;
 pub use error::Error;
 pub use timer::Timer;
 pub use worker::{Config, Handle, Worker};
-
-/// The `url` crate, re-exported because
-/// [`quic::web::Request::url`](crate::quic::web::Request::url) hands one back.
-/// Naming that type otherwise means depending on a matching `url` version
-/// directly, so a major bump here is a breaking change for this crate.
-pub use url;

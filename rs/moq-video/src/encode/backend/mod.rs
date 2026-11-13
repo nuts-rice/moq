@@ -8,9 +8,9 @@
 //! the right importer.
 //!
 //! Output is stamped with the timestamp of the frame it was encoded from, not
-//! whichever frame happened to be going in. A backend that flushes each frame
-//! before returning just echoes the input timestamp; one that buffers (Media
-//! Foundation, MediaCodec) correlates through the codec's own sample clock.
+//! whichever frame happened to be going in. A backend that readies each frame's
+//! output as it is submitted just echoes the input timestamp; one that buffers
+//! (Media Foundation, MediaCodec) correlates through the codec's own sample clock.
 //!
 //! [`open`] picks the best backend for a [`Codec`](super::Codec) +
 //! [`Kind`](super::Kind): only candidates that support the requested codec are
@@ -45,20 +45,29 @@ mod v4l2;
 #[cfg(all(target_os = "linux", feature = "vaapi"))]
 mod vaapi;
 
-/// An opened video encoder. Feed it frames at the configured resolution; get
-/// back zero or more access units in the codec's wire framing, each stamped with
-/// the timestamp of the frame it came from and marked when it is a keyframe,
-/// whether forced by `cut` or placed by the backend's own GOP cadence.
+/// An opened video encoder. Submit frames at the configured resolution, then
+/// receive zero or more access units in the codec's wire framing, each stamped
+/// with the timestamp of the frame it came from and marked when it is a
+/// keyframe, whether forced by `cut` or placed by the backend's own GOP cadence.
+///
+/// A backend that readies output synchronously holds it in a reused queue, so
+/// no call allocates to hand it back.
 pub(crate) trait Backend {
-	/// Encode one frame, opening a group at it (an IDR) when `cut` is set.
-	/// Backends place group boundaries on their own per [`Config::gop`], so this
-	/// is only the caller's extra request, arriving via
-	/// [`Encoder::cut`](super::Encoder::cut), and only on a backend whose
-	/// [`can_cut`](Self::can_cut) said yes.
-	fn encode(&mut self, frame: &Frame, cut: bool) -> Result<Vec<Encoded>, Error>;
+	/// Submit one frame, opening a group at it (an IDR) when `cut` is set.
+	/// Backends place group boundaries on their own every
+	/// [`Config::keyframe_interval`] frames, so this is only the encoder's extra
+	/// request: a caller's [`Encoder::cut`](super::Encoder::cut), or a
+	/// [`Config::join`] that a source slower than its frame rate reached first. It
+	/// arrives only on a backend whose [`can_cut`](Self::can_cut) said yes. A
+	/// backend that drops the frame carries the cut to the next one it encodes,
+	/// or the group waits a whole join for its keyframe.
+	fn encode(&mut self, frame: &Frame, cut: bool) -> Result<(), Error>;
 
-	/// Return every access unit the codec is still holding, leaving the encoder
-	/// usable for the frames that follow.
+	/// Pop the oldest ready access unit, or `None` while the codec holds the rest.
+	fn receive(&mut self) -> Result<Option<Encoded>, Error>;
+
+	/// Mark the end of input, so [`receive`](Self::receive) returns every access
+	/// unit the codec still holds. The next frame submitted starts new input.
 	///
 	/// The caller reaches for this at a boundary the output has to respect, which
 	/// on a live track is a group: a codec that pipelines would otherwise carry the
@@ -68,10 +77,40 @@ pub(crate) trait Backend {
 	/// No default, even though most backends have nothing to hold: a pipelined one
 	/// that inherited an empty implementation would drop frames at every boundary
 	/// and look like it worked.
-	fn flush(&mut self) -> Result<Vec<Encoded>, Error>;
+	fn flush(&mut self) -> Result<(), Error>;
 
-	/// Flush the encoder for the last time, returning any buffered access units.
-	fn finish(&mut self) -> Result<Vec<Encoded>, Error>;
+	/// Submit one frame and collect everything it readied.
+	#[cfg(all(
+		test,
+		any(
+			feature = "openh264",
+			apple,
+			all(target_os = "android", feature = "mediacodec"),
+			all(target_os = "linux", feature = "vaapi"),
+		)
+	))]
+	fn encode_all(&mut self, frame: &Frame, cut: bool) -> Result<Vec<Encoded>, Error> {
+		self.encode(frame, cut)?;
+		self.receive_all()
+	}
+
+	/// Flush and collect the tail.
+	#[cfg(test)]
+	#[allow(dead_code, reason = "only the platform backends' tests use it")]
+	fn flush_all(&mut self) -> Result<Vec<Encoded>, Error> {
+		self.flush()?;
+		self.receive_all()
+	}
+
+	/// Collect everything ready.
+	#[cfg(test)]
+	fn receive_all(&mut self) -> Result<Vec<Encoded>, Error> {
+		let mut encoded = Vec::new();
+		while let Some(unit) = self.receive()? {
+			encoded.push(unit);
+		}
+		Ok(encoded)
+	}
 
 	/// Retune the live encoder to `bitrate` bits per second, taking effect from
 	/// roughly the next frame. Called as the congestion controller's estimate
@@ -167,6 +206,21 @@ pub const NAMES: &[&str] = &[
 	"openh264",
 ];
 
+/// Whether the backend called `name` reads, in place, the GPU surface this
+/// platform's render export hands over: a Vulkan image on Linux, a pixel buffer
+/// on Apple platforms, a Direct3D11 texture on Windows.
+#[cfg_attr(not(feature = "render"), allow(dead_code, reason = "only the render export asks"))]
+pub(crate) fn reads_export(name: &str) -> bool {
+	HARDWARE.iter().any(|candidate| {
+		#[cfg(target_os = "linux")]
+		let reads = candidate.vulkan;
+		// Every hardware encoder on these takes the platform's surface.
+		#[cfg(not(target_os = "linux"))]
+		let reads = cfg!(any(apple, target_os = "windows"));
+		candidate.name == name && reads
+	})
+}
+
 /// A backend constructor: name, the codecs it can emit, an opener, and whether it can always cut.
 struct Candidate {
 	name: &'static str,
@@ -174,7 +228,10 @@ struct Candidate {
 	open: fn(&Config) -> Result<Box<dyn Backend>, Error>,
 	/// Whether every encoder this opens honors a cut ([`Backend::can_cut`]), known before
 	/// opening one. V4L2 learns it from the driver at open, so it cannot promise.
-	#[cfg_attr(not(feature = "capture"), allow(dead_code))]
+	#[cfg_attr(
+		not(feature = "capture"),
+		allow(dead_code, reason = "only the `capture` feature uses it")
+	)]
 	cuts: bool,
 	#[cfg(target_os = "linux")]
 	vulkan: bool,
@@ -222,7 +279,7 @@ const HARDWARE: &[Candidate] = &[
 	#[cfg(all(target_os = "linux", feature = "vaapi"))]
 	Candidate {
 		name: vaapi::NAME,
-		codecs: &[Codec::H264],
+		codecs: &[Codec::H264, Codec::H265],
 		open: vaapi::Vaapi::open,
 		cuts: true,
 		#[cfg(target_os = "linux")]
@@ -315,10 +372,23 @@ pub(crate) fn open(config: &Config) -> Result<Box<dyn Backend>, Error> {
 
 /// Whether whichever backend [`open`] picks for `codec` + `kind` honors a cut, answered
 /// before opening one: every candidate it may fall to must promise it.
-#[cfg_attr(not(feature = "capture"), allow(dead_code))]
+#[cfg_attr(
+	not(feature = "capture"),
+	allow(dead_code, reason = "only the `capture` feature uses it")
+)]
 pub(crate) fn always_cuts(codec: Codec, kind: &Kind) -> bool {
 	let attempts = attempts(codec, kind);
 	!attempts.is_empty() && attempts.iter().all(|attempt| attempt.candidate.cuts)
+}
+
+/// The encoders [`open`] tries for `codec` + `kind`, in order: each name, and
+/// whether it is hardware.
+#[cfg_attr(not(feature = "render"), allow(dead_code, reason = "only the render export asks"))]
+pub(crate) fn candidates(codec: Codec, kind: &Kind) -> Vec<(&'static str, bool)> {
+	attempts(codec, kind)
+		.iter()
+		.map(|attempt| (attempt.candidate.name, attempt.hardware))
+		.collect()
 }
 
 /// The candidates [`open`] tries for `codec` + `kind`, in order.
@@ -406,22 +476,25 @@ fn select(attempts: Vec<Attempt>, config: &Config) -> Result<Box<dyn Backend>, E
 		)));
 	}
 	if tried.is_empty() {
-		let available = available_names(config.codec);
-		return match &config.kind {
-			Kind::Named(name) => Err(Error::UnknownEncoder {
-				name: name.clone(),
-				codec: config.codec,
-				available: available.join(", "),
-			}),
-			kind => Err(Error::NoEncoder(format!(
-				"nothing compiled in for {:?} at {kind:?} (this build has: {})",
-				config.codec,
-				available.join(", "),
-			))),
-		};
+		return Err(missing(config.codec, &config.kind));
 	}
 
 	Err(Error::NoEncoder(tried.join(", ")))
+}
+
+/// Why no encoder this build has answers `codec` + `kind`, naming those it has.
+pub(crate) fn missing(codec: Codec, kind: &Kind) -> Error {
+	let available = available_names(codec).join(", ");
+	match kind {
+		Kind::Named(name) => Error::UnknownEncoder {
+			name: name.clone(),
+			codec,
+			available,
+		},
+		kind => Error::NoEncoder(format!(
+			"nothing compiled in for {codec:?} at {kind:?} (this build has: {available})"
+		)),
+	}
 }
 
 /// Returns the encoders this build has for `codec`, in priority order.
@@ -438,7 +511,10 @@ fn available_names(codec: Codec) -> Vec<&'static str> {
 }
 
 #[cfg(test)]
-#[cfg_attr(not(feature = "openh264"), allow(dead_code))]
+#[cfg_attr(
+	not(feature = "openh264"),
+	allow(dead_code, reason = "only the `openh264` feature uses it")
+)]
 pub(crate) mod test_util {
 	use h264_reader::nal::sps::SeqParameterSet;
 	use h264_reader::nal::{Nal, RefNal, UnitType};
@@ -519,7 +595,10 @@ pub(crate) mod test_util {
 
 #[cfg(test)]
 mod tests {
-	#![cfg_attr(not(feature = "openh264"), allow(dead_code, unused_imports))]
+	#![cfg_attr(
+		not(feature = "openh264"),
+		allow(dead_code, unused_imports, reason = "only the `openh264` feature uses it")
+	)]
 
 	use super::*;
 
@@ -534,16 +613,16 @@ mod tests {
 	}
 
 	impl Backend for Stub {
-		fn encode(&mut self, _frame: &Frame, _cut: bool) -> Result<Vec<Encoded>, Error> {
-			Ok(Vec::new())
+		fn encode(&mut self, _frame: &Frame, _cut: bool) -> Result<(), Error> {
+			Ok(())
 		}
 
-		fn flush(&mut self) -> Result<Vec<Encoded>, Error> {
-			Ok(Vec::new())
+		fn receive(&mut self) -> Result<Option<Encoded>, Error> {
+			Ok(None)
 		}
 
-		fn finish(&mut self) -> Result<Vec<Encoded>, Error> {
-			Ok(Vec::new())
+		fn flush(&mut self) -> Result<(), Error> {
+			Ok(())
 		}
 
 		fn set_bitrate(&mut self, _bitrate: u64) -> Result<(), Error> {
@@ -573,14 +652,14 @@ mod tests {
 	const REFUSING: Candidate = Candidate {
 		name: "driverless",
 		codecs: &[Codec::H264],
-		open: |_| Err(Error::Codec(anyhow::anyhow!("driver libraries not found"))),
+		open: |_| Err(Error::codec(anyhow::anyhow!("driver libraries not found"))),
 		cuts: true,
 		#[cfg(target_os = "linux")]
 		vulkan: false,
 	};
 
 	fn config() -> Config {
-		Config::new(320, 240, crate::Rate::new(30, 1).unwrap())
+		Config::new(320, 240, crate::FrameRate::new(30, 1).unwrap())
 	}
 
 	/// Only a selection whose every candidate promises cuts may advertise them, and a

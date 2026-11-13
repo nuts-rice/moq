@@ -1,8 +1,6 @@
 import tailwindcss from "@tailwindcss/vite";
 import { resolve } from "path";
 import { defineConfig } from "vite";
-import solidPlugin from "vite-plugin-solid";
-import { crossOriginIsolation } from "../../js/common/vite-plugin-isolate.ts";
 import { worklet } from "../../js/common/vite-plugin-worklet.ts";
 import { consoleOverlay } from "./console-overlay.ts";
 import { openTabs } from "./open-tabs.ts";
@@ -12,9 +10,7 @@ export default defineConfig({
 	envDir: resolve(import.meta.dirname),
 	plugins: [
 		tailwindcss(),
-		solidPlugin(),
 		worklet(),
-		crossOriginIsolation(),
 		consoleOverlay(),
 		// Open the stats, publish, and watch demos each in their own tab.
 		// Order matters: the browser focuses the last tab, so watch ends up in front.

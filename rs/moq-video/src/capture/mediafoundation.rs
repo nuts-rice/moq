@@ -89,7 +89,7 @@ struct Camera {
 	device: Option<ID3D11Device>,
 	width: u32,
 	height: u32,
-	framerate: Option<crate::Rate>,
+	framerate: Option<crate::FrameRate>,
 	device_name: String,
 	// Keep the DXGI manager alive for the reader's lifetime (the reader holds its
 	// own ref, but we own the pairing). Drops before `_com`.
@@ -176,13 +176,13 @@ impl Camera {
 		let (width, height) = unpack_2x32(frame_size);
 		// I420 chroma is 2x2 subsampled, so the encoder needs even dimensions.
 		if width % 2 != 0 || height % 2 != 0 {
-			return Err(Error::Codec(anyhow::anyhow!(
+			return Err(Error::codec(anyhow::anyhow!(
 				"camera resolution {width}x{height} must be even for H.264 encoding"
 			)));
 		}
 		let framerate = unsafe { current.GetUINT64(&MF_MT_FRAME_RATE).ok() }.and_then(|packed| {
 			let (num, den) = unpack_2x32(packed);
-			crate::Rate::new(num, den).ok()
+			crate::FrameRate::new(num, den).ok()
 		});
 
 		let (device, manager) = match gpu {
@@ -324,7 +324,7 @@ fn create_attributes(capacity: u32) -> Result<IMFAttributes, Error> {
 	unsafe {
 		MFCreateAttributes(&mut attrs, capacity).map_err(|e| mf_err("create attributes", e))?;
 	}
-	attrs.ok_or_else(|| Error::Codec(anyhow::anyhow!("MFCreateAttributes returned null")))
+	attrs.ok_or_else(|| Error::codec(anyhow::anyhow!("MFCreateAttributes returned null")))
 }
 
 /// Which device to open.

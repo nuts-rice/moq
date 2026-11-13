@@ -1,7 +1,9 @@
-import { now as clockNow, sleepUntil as clockSleepUntil, Instant, Micro, Nano, Second } from "@moq/clock";
+import { Duration, Instant, now } from "@moq/clock";
 import * as Util from "@moq/hang/util";
 import { Effect, type Getter, getter, type Inputs, type Readonlys, readonlys, Signal } from "@moq/signals";
 import type { InputAudioTrack, InputVideoTrack, VideoSample } from "mediabunny";
+import { hosted } from "../assets";
+import { pace, sleepUntil } from "./pace";
 import { Timeline } from "./timeline";
 import type { Media } from "./types";
 
@@ -17,7 +19,8 @@ export interface FileProps extends Inputs<FileInput> {
 	file?: globalThis.File | Signal<globalThis.File | undefined>;
 }
 
-type FileOutput = {
+/** Signals the file source derives. */
+export type FileOutput = {
 	// The sources decoded from the file, undefined while disabled or undecodable.
 	source: Signal<Media | undefined>;
 };
@@ -106,23 +109,33 @@ export class File {
 		const zero = now();
 		let index = 0;
 
-		const frames = new ReadableStream<VideoFrame>({
-			async pull(controller) {
-				const offset = Micro.fromSecond((index / IMAGE_FRAME_RATE) as Second);
-				const timestamp = (zero + offset) as Micro;
-				index++;
+		const frames = new ReadableStream<VideoFrame>(
+			{
+				async pull(controller) {
+					// Every repeat is the same picture, so a reader returning after a gap skips to the
+					// slot due now instead of replaying each one it missed.
+					const due = Math.floor(now().since(zero).asSecs() * IMAGE_FRAME_RATE);
+					index = Math.max(index, due);
 
-				await sleepUntil(timestamp, signal);
+					const at = zero.saturatingAdd(Duration.secs(index / IMAGE_FRAME_RATE));
+					index++;
 
-				// The bitmap is closed on teardown, so stop before building a frame from a dead one.
-				if (signal.aborted) {
-					controller.close();
-					return;
-				}
+					await sleepUntil(at, signal);
 
-				controller.enqueue(new VideoFrame(bitmap, { timestamp }));
+					// The bitmap is closed on teardown, so stop before building a frame from a dead one.
+					if (signal.aborted) {
+						controller.close();
+						return;
+					}
+
+					controller.enqueue(
+						new VideoFrame(bitmap, { timestamp: Math.round(at.since(Instant.ZERO).asMicros()) }),
+					);
+				},
 			},
-		});
+			// Prefetching would park a stale frame in the queue while nothing reads, and hand it out on resume.
+			{ highWaterMark: 0 },
+		);
 
 		effect.set(this.#out.source, { video: { frames, frameRate: IMAGE_FRAME_RATE } }, undefined);
 	}
@@ -147,7 +160,7 @@ export class File {
 		// Install the WebCodecs polyfill before probing: canDecode() reports false when AudioDecoder
 		// is missing rather than throwing, so probing first would drop the audio track on an engine
 		// the polyfill could have covered. A no-op wherever WebCodecs is native.
-		if (audio) await Util.Libav.polyfill();
+		if (audio) await Util.Libav.polyfill(hosted.url);
 
 		// A codec this browser can't decode drops just its own track: the other one is usually still
 		// publishable, and a video-only publish beats failing outright.
@@ -162,6 +175,11 @@ export class File {
 		// The encoder sizes its bitrate off this, and a file's real cadence beats assuming 30fps.
 		const frameRate =
 			video && videoOk ? (await video.computePacketStats(FRAME_RATE_SAMPLES)).averagePacketRate : undefined;
+		const toFrame = video && videoOk ? await converter(video) : undefined;
+		const format =
+			audio && audioOk
+				? { sampleRate: await audio.getSampleRate(), channelCount: await audio.getNumberOfChannels() }
+				: undefined;
 
 		// Pin the clock last. Probing the file takes a moment, and anchoring before that would leave
 		// the first samples already overdue, so playback would open with a catch-up burst.
@@ -171,19 +189,14 @@ export class File {
 
 		const source: Media = {
 			video:
-				video && videoOk
+				video && toFrame
 					? {
-							frames: pace(
-								new VideoSampleSink(video),
-								timeline,
-								video.rotation === 0 ? (sample) => sample.toVideoFrame() : rotator(video),
-								signal,
-							),
+							frames: pace(new VideoSampleSink(video), timeline, toFrame, signal),
 							frameRate,
 						}
 					: undefined,
 			audio:
-				audio && audioOk
+				audio && format
 					? {
 							samples: pace(
 								new AudioSampleSink(audio),
@@ -191,8 +204,7 @@ export class File {
 								(sample) => sample.toAudioData(),
 								signal,
 							),
-							sampleRate: audio.sampleRate,
-							channelCount: audio.numberOfChannels,
+							...format,
 							// A file is whatever the user picked, so leave the Opus tuning to the encoder.
 							kind: "auto",
 						}
@@ -209,94 +221,12 @@ export class File {
 	}
 }
 
-// The bits of a mediabunny sample the pacing loop touches. Video and audio samples only differ in
-// what they convert to, which the caller supplies.
-interface Sample {
-	readonly microsecondTimestamp: number;
-	setTimestamp(seconds: number): void;
-	close(): void;
-}
-
-interface Sink<S extends Sample> {
-	samples(startTimestamp?: number): AsyncGenerator<S, void, unknown>;
-}
-
-/**
- * Reads decoded samples out of a sink in real time, restarting the file when it ends.
- *
- * Decoding runs far faster than realtime, so holding each sample until its presentation time is
- * what makes this publish at 1x instead of blasting the whole file out at once. It also applies
- * backpressure: the sink only decodes ahead as far as the reader pulls.
- */
-function pace<S extends Sample, T>(
-	sink: Sink<S>,
-	timeline: Timeline,
-	convert: (sample: S) => T,
-	signal: AbortSignal,
-): ReadableStream<T> {
-	let samples = sink.samples();
-	let loop = 0;
-
-	return new ReadableStream<T>({
-		async pull(controller) {
-			for (;;) {
-				if (signal.aborted) {
-					controller.close();
-					return;
-				}
-
-				let next: IteratorResult<S, void>;
-				try {
-					next = await samples.next();
-				} catch (err) {
-					// Teardown disposes the Input, which makes any decode still in flight throw.
-					if (!signal.aborted) throw err;
-					controller.close();
-					return;
-				}
-
-				if (next.done) {
-					if (!timeline.loops) {
-						controller.close();
-						return;
-					}
-
-					// A fresh generator seeks back to the start; the offset keeps timestamps rising.
-					loop++;
-					samples = sink.samples();
-					continue;
-				}
-
-				const sample = next.value;
-				const timestamp = timeline.at(sample.microsecondTimestamp as Micro, loop);
-
-				// A sample that's already late goes out immediately, letting a stalled reader catch up.
-				await sleepUntil(timestamp, signal);
-				if (signal.aborted) {
-					sample.close();
-					controller.close();
-					return;
-				}
-
-				// Restamp onto our wall clock, the same epoch live capture uses, so a publish that
-				// mixes sources keeps one timeline.
-				sample.setTimestamp(Second.fromMicro(timestamp));
-				controller.enqueue(convert(sample));
-				sample.close();
-				return;
-			}
-		},
-
-		async cancel() {
-			await samples.return();
-		},
-	});
-}
-
 // Phone footage is usually stored sideways with rotation metadata, which toVideoFrame() ignores
 // because a VideoFrame can't carry it. Drawing through a canvas is the only way to bake it in.
-function rotator(track: InputVideoTrack): (sample: VideoSample) => VideoFrame {
-	const canvas = new OffscreenCanvas(track.displayWidth, track.displayHeight);
+async function converter(track: InputVideoTrack): Promise<(sample: VideoSample) => VideoFrame> {
+	if ((await track.getRotation()) === 0) return (sample) => sample.toVideoFrame();
+
+	const canvas = new OffscreenCanvas(await track.getDisplayWidth(), await track.getDisplayHeight());
 
 	const ctx = canvas.getContext("2d");
 	if (!ctx) throw new Error("Failed to create 2D canvas context");
@@ -314,20 +244,7 @@ async function decodable(track: InputVideoTrack | InputAudioTrack | null, file: 
 	if (await track.canDecode()) return true;
 
 	console.warn(
-		`Publishing "${file.name}" without its ${track.type} track: this browser can't decode ${track.codec}.`,
+		`Publishing "${file.name}" without its ${track.type} track: this browser can't decode ${await track.getCodec()}.`,
 	);
 	return false;
-}
-
-// The installed clock in microseconds, the epoch capture stamps frames against (see video/processor.ts).
-function now(): Micro {
-	return Nano.toMicro(Nano(clockNow()));
-}
-
-// Wait until the given clock time, or until the effect tears down.
-//
-// A plain sleep rather than effect.timer because this runs once per sample: effect.timer registers a
-// cleanup that only releases on teardown, which would pile up for as long as the file publishes.
-function sleepUntil(timestamp: Micro, signal: AbortSignal): Promise<void> {
-	return clockSleepUntil(Instant(Micro.toNano(timestamp)), { signal }).catch(() => {});
 }

@@ -5,15 +5,15 @@
  * @module
  */
 
-import { type Hop, HopSchema } from "../hop.ts";
+import { type Hop, HopSchema, wireHop } from "../hop.ts";
 import { encodeVarint, Reader, type Writer } from "../stream.ts";
 import { decodeUtf8 } from "../util/utf8.ts";
 import * as Message from "./message.ts";
-import { hasSetupStream, type Version } from "./version.ts";
+import { hasAuth, hasImplementation, hasRouteKey, hasRoutes, hasSetupStream, type Version } from "./version.ts";
 
 const clientParameters = new WeakSet<Setup>();
 
-/** Whether the peer's SETUP carried Path or Role; raw presence matters even when an unknown Role decodes as Both. */
+/** Whether the peer's SETUP carried Path, Role, or Token; raw presence matters even when an unknown Role decodes as Both. */
 export function hasClientParameters(setup: Setup): boolean {
 	return clientParameters.has(setup);
 }
@@ -24,11 +24,18 @@ const PARAM_PROBE = 0x1n;
 const PARAM_PATH = 0x2n;
 /** Setup Parameter id for the client's intended {@link Role} (client-only). */
 const PARAM_ROLE = 0x3n;
-/** Setup Parameter id for the endpoint's Hop ID. */
+/** Setup Parameter id for the endpoint's Hop ID, or from lite-07 its Node ID. */
 const PARAM_HOP = 0x5n;
-
-/** Cap on the number of parameters in a bag, matching the Rust decoder. */
-const MAX_PARAMS = 64;
+/** The top bit, which marks a Node ID a relay qualified; an endpoint never declares one. */
+const QUALIFIED = 1n << 63n;
+/** Setup Parameter id for the endpoint's implementation name and version. */
+const PARAM_IMPLEMENTATION = 0x6n;
+/** Setup Parameter id for the client's connection credential (client-only, lite-07+). */
+const PARAM_TOKEN = 0x7n;
+/** Setup Parameter id for the sender's route key proof (lite-07+). */
+const PARAM_ROUTE_KEY = 0x8n;
+/** A route key proof's size: an Ed25519 public key, then its signature. */
+const ROUTE_KEY_PROOF_SIZE = 96;
 
 /** SETUP only carries negotiation parameters, so it gets a far smaller cap than other messages. */
 const MAX_SETUP_SIZE = 0xffff;
@@ -138,10 +145,6 @@ class Parameters {
 	}
 
 	async encode(w: Writer) {
-		if (this.#entries.size > MAX_PARAMS) {
-			throw new Error("too many parameters");
-		}
-
 		await w.u53(this.#entries.size);
 		for (const [id, value] of this.#entries) {
 			await w.u62(id);
@@ -154,10 +157,6 @@ class Parameters {
 		const params = new Parameters();
 
 		const count = await r.u53();
-		if (count > MAX_PARAMS) {
-			throw new Error("too many parameters");
-		}
-
 		for (let i = 0; i < count; i++) {
 			const id = await r.u62();
 			if (params.#entries.has(id)) {
@@ -182,6 +181,12 @@ export interface SetupProps {
 	role?: Role;
 	/** See {@link Setup.hop}. Omitted by default. */
 	hop?: Hop;
+	/** See {@link Setup.token}. Omitted by default. */
+	token?: Uint8Array;
+	/** See {@link Setup.implementation}. Omitted by default. */
+	implementation?: string;
+	/** See {@link Setup.routeKey}. Omitted by default. */
+	routeKey?: Uint8Array;
 }
 
 /**
@@ -215,15 +220,38 @@ export class Setup {
 	 * This endpoint's Hop ID. The peer uses it to filter announcements and
 	 * subscriptions whose route flows through this endpoint (lite-06 removed the
 	 * per-stream `exclude_hop` in its favor). `undefined` when the endpoint declares
-	 * no identity; a wire value of 0 decodes the same way.
+	 * no identity; a wire value of 0 decodes the same way. From lite-07 it is the
+	 * endpoint's Node ID instead, never 0 or with the top bit set, so a peer that
+	 * receives its own has reached itself.
 	 */
 	hop?: Hop;
 
-	constructor({ probe, path, role, hop }: SetupProps = {}) {
+	/**
+	 * The connection credential (lite-07+), which the empty-token Auth Stream names. Sent
+	 * only by the client. Never empty: an empty value is no credential.
+	 */
+	token?: Uint8Array;
+
+	/**
+	 * This endpoint's implementation and version, such as `moq-net-js/0.4.2`. Opaque and
+	 * peer-controlled, so only for logs and rollout counts. `undefined` or empty sends nothing.
+	 */
+	implementation?: string;
+
+	/**
+	 * Proof that the sender holds its route key, bound to this session (lite-07+): the
+	 * Ed25519 public key, then its signature over keying material exported from the session.
+	 */
+	routeKey?: Uint8Array;
+
+	constructor({ probe, path, role, hop, token, implementation, routeKey }: SetupProps = {}) {
 		this.probe = probe ?? ProbeLevel.None;
 		this.path = path;
 		this.role = role ?? Role.Both;
 		this.hop = hop;
+		this.token = token;
+		this.implementation = implementation;
+		this.routeKey = routeKey;
 	}
 
 	static #guard(version: Version) {
@@ -246,7 +274,21 @@ export class Setup {
 			params.setVarint(PARAM_ROLE, this.role, version);
 		}
 		if (this.hop !== undefined && this.hop !== 0n) {
-			params.setVarint(PARAM_HOP, this.hop, version);
+			if (hasRoutes(version) && this.hop >= QUALIFIED) throw new Error("setup Node ID cannot be qualified");
+			params.setVarint(PARAM_HOP, wireHop(this.hop, version), version);
+		}
+		if (this.implementation) {
+			params.setBytes(PARAM_IMPLEMENTATION, new TextEncoder().encode(this.implementation));
+		}
+		if (this.token !== undefined) {
+			if (!hasAuth(version)) throw new Error("setup token not supported for this version");
+			if (this.token.byteLength === 0) throw new Error("setup token cannot be empty");
+			params.setBytes(PARAM_TOKEN, this.token);
+		}
+		if (this.routeKey !== undefined) {
+			if (!hasRouteKey(version)) throw new Error("setup route key not supported for this version");
+			if (this.routeKey.byteLength !== ROUTE_KEY_PROOF_SIZE) throw new Error("setup route key must be 96 bytes");
+			params.setBytes(PARAM_ROUTE_KEY, this.routeKey);
 		}
 		await params.encode(w);
 	}
@@ -265,12 +307,29 @@ export class Setup {
 		const roleCode = await params.getVarint(PARAM_ROLE, version);
 		const role = roleCode === undefined ? Role.Both : roleFromCode(roleCode);
 
-		// 0 carries no identity (it cannot be excluded), so it decodes as absent.
+		// Before lite-07, 0 carries no identity (it cannot be excluded), so it decodes as
+		// absent. A lite-07 Node ID is never 0 or qualified.
 		const hopRaw = await params.getVarint(PARAM_HOP, version);
+		if (hopRaw !== undefined && hasRoutes(version) && (hopRaw === 0n || hopRaw >= QUALIFIED)) {
+			throw new Error("setup Node ID must be non-zero and unqualified");
+		}
 		const hop = hopRaw === undefined || hopRaw === 0n ? undefined : HopSchema.parse(hopRaw);
 
-		const setup = new Setup({ probe, path, role, hop });
-		if (pathBytes !== undefined || roleCode !== undefined) clientParameters.add(setup);
+		// An older version does not know the token parameter, so it ignores it like any other.
+		const token = hasAuth(version) ? params.getBytes(PARAM_TOKEN) : undefined;
+		if (token?.byteLength === 0) throw new Error("setup token cannot be empty");
+
+		const implementationBytes = hasImplementation(version) ? params.getBytes(PARAM_IMPLEMENTATION) : undefined;
+		const implementation = implementationBytes === undefined ? undefined : decodeUtf8(implementationBytes);
+
+		// Kept but not verified: nothing here files routes under the sender's key.
+		const routeKey = hasRouteKey(version) ? params.getBytes(PARAM_ROUTE_KEY) : undefined;
+		if (routeKey !== undefined && routeKey.byteLength !== ROUTE_KEY_PROOF_SIZE) {
+			throw new Error("setup route key must be 96 bytes");
+		}
+
+		const setup = new Setup({ probe, path, role, hop, token, implementation, routeKey });
+		if (pathBytes !== undefined || roleCode !== undefined || token !== undefined) clientParameters.add(setup);
 		return setup;
 	}
 

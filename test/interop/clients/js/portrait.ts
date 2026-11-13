@@ -21,18 +21,18 @@ try {
 	);
 	await page.evaluate(() => {
 		const watch = document.querySelector("moq-watch") as MoqWatch;
-		watch.controls.target.set({ name: "video/360p" });
+		watch.controls.video.target.set({ name: "video/360p" });
 	});
 	// The real renderer's frame and clock prove the rung was downloaded, decoded and painted.
 	await page.waitForFunction(
 		() => {
 			const watch = document.querySelector("moq-watch") as MoqWatch;
-			const frame = watch.renderer.out.frame.peek();
+			const frame = watch.renderer.painted.peek();
 			return (
 				watch.video.source.out.track.peek() === "video/360p" &&
 				frame?.displayWidth === 360 &&
 				frame.displayHeight === 640 &&
-				(watch.renderer.out.timestamp.peek() ?? 0) > 1000
+				(watch.renderer.out.timestamp.peek()?.asMillis() ?? 0) > 1000
 			);
 		},
 		undefined,

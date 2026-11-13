@@ -17,8 +17,8 @@ import moq
 async def main():
     async with moq.Client("https://cdn.moq.dev/anon") as client:
         async for event in client.announced():
-            if isinstance(event, moq.AnnounceEventStart):
-                broadcast = await client.request_broadcast(event.announce.prefix)
+            if isinstance(event, moq.AnnounceEventPresent):
+                broadcast = await client.request(event.announce.prefix)
                 print(await moq.media.catalog(broadcast))
 
 
@@ -36,12 +36,16 @@ asyncio.run(main())
 
    Client
    connect
+   ClientTls
+   QuicConfig
+   WebSocketConfig
+   Backoff
    Server
    Session
    Request
    Transport
-   Auth
-   AuthToken
+   GrantConsumer
+   Tokens
    Grant
 ```
 
@@ -55,15 +59,17 @@ asyncio.run(main())
    :nosignatures:
 
    BroadcastProducer
-   BroadcastDynamic
+   BroadcastRequests
    BroadcastRequest
    TrackProducer
+   DatagramProducer
+   DatagramRequests
+   DatagramRequest
    TrackDemand
-   TrackDynamic
+   TrackRequests
    TrackRequest
    GroupProducer
-   GroupRequest
-   GroupDemand
+   Fill
 ```
 
 ## Subscribing
@@ -77,7 +83,31 @@ asyncio.run(main())
 
    BroadcastConsumer
    TrackConsumer
+   DatagramConsumer
    GroupConsumer
+```
+
+## Bandwidth
+
+A session's estimates, split among what shares the connection: an `Allocator`
+divides the send estimate among tracks, which a `RateControl` turns into each sender's
+`RateTarget`, and `Viewers` divides the receive estimate among watched broadcasts,
+whose ceilings summed ask the peer to probe for more.
+
+```{eval-rst}
+.. currentmodule:: moq
+
+.. autosummary::
+   :toctree: api
+   :nosignatures:
+
+   Allocator
+   Reservation
+   RateControl
+   RateTarget
+   BandwidthConsumer
+   Viewers
+   Viewer
 ```
 
 ## Native codecs
@@ -124,6 +154,7 @@ Every importer takes a broadcast; single-track imports choose a `Named` or `Requ
    TrackStreamProducer
    ContainerProducer
    ContainerInit
+   VideoInit
    Timebase
    TrackConsumer
    GroupConsumer
@@ -152,19 +183,6 @@ broadcast, and producers advertise it in the catalog.
    Timed
 ```
 
-## Opaque data
-
-```{eval-rst}
-.. currentmodule:: moq.flate
-
-.. autosummary::
-   :toctree: api
-   :nosignatures:
-
-   SnapshotProducer
-   StreamProducer
-```
-
 ## Origin and announcements
 
 ```{eval-rst}
@@ -176,21 +194,20 @@ broadcast, and producers advertise it in the catalog.
 
    OriginProducer
    OriginConsumer
-   OriginDynamic
+   Route
+   Claim
    AnnounceConsumer
-   AnnouncedBroadcast
+   Following
    Announce
    AnnounceEvent
-   AnnounceEventStart
-   AnnounceEventUpdate
-   AnnounceEventEnd
-   AnnounceEventRestart
+   AnnounceEventPresent
+   AnnounceEventAbsent
 ```
 
 ## Data types
 
 These records, enums, and objects are re-exported from the native `moq_ffi` bindings; the
-wrapper groups them under `moq` and `moq.media`, with owned duration records at the boundary. Their fields are defined on the
+wrapper groups them under `moq` and `moq.media`, with owned duration and timestamp records at the boundary. Their fields are defined on the
 Rust side ([`moq-ffi`](https://crates.io/crates/moq-ffi)).
 
 ```{eval-rst}
@@ -202,6 +219,7 @@ Rust side ([`moq-ffi`](https://crates.io/crates/moq-ffi)).
 
    media.Catalog
    media.Container
+   Timestamp
    Frame
    media.MediaFrame
    Datagram
@@ -210,6 +228,7 @@ Rust side ([`moq-ffi`](https://crates.io/crates/moq-ffi)).
    media.VideoProperties
    VideoCodec
    VideoPixelFormat
+   video.FrameRate
    VideoEncoderInput
    VideoEncoderOutput
    VideoEncoderKind
@@ -221,7 +240,8 @@ Rust side ([`moq-ffi`](https://crates.io/crates/moq-ffi)).
    Subscription
    TrackInfo
    FetchGroupOptions
-   Route
+   RouteInfo
+   Instance
    ConnectionStats
 ```
 
@@ -239,8 +259,6 @@ Rust side ([`moq-ffi`](https://crates.io/crates/moq-ffi)).
    is_shutdown
    protocol_error
    log_level
-   mint_epoch
-   epoch_time
 ```
 
 ```{toctree}
@@ -248,4 +266,23 @@ Rust side ([`moq-ffi`](https://crates.io/crates/moq-ffi)).
 :maxdepth: 2
 
 self
+```
+
+## Sockets
+
+`moq.socket` connects endpoints through relays, using the same origin for both
+publishing and consuming. See the [socket convention](https://doc.moq.dev/concept/socket).
+
+```{eval-rst}
+.. currentmodule:: moq.socket
+
+.. autosummary::
+   :toctree: api
+   :nosignatures:
+
+   Endpoint
+   IncomingTcp
+   IncomingTrack
+   TcpStream
+   TrackStream
 ```

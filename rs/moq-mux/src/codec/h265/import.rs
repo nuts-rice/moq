@@ -2,8 +2,9 @@
 //!
 //! Publishes H.265 frames on a single moq track and resolves the catalog
 //! rendition, in either wire shape: Annex-B with inline VPS/SPS/PPS ("hev1"), or
-//! length-prefixed NALU with an out-of-band hvcC ("hvc1"). Only single-layer
-//! streams are supported (VPS is cached but not parsed).
+//! length-prefixed NALU with an out-of-band hvcC ("hvc1"). A layered stream
+//! (MV-HEVC, SHVC) imports as its base layer: only a base-layer SPS configures the
+//! rendition, while every layer's NAL units pass through (VPS is cached but not parsed).
 //!
 //! The codec config comes from exactly one of two places: an hvcC handed to
 //! [`initialize`](Import::initialize) (the hvc1 shape), or the SPS the splitter
@@ -16,20 +17,19 @@
 
 use bytes::Bytes;
 
-use super::{Error, split::nal_unit_type};
+use super::{Error, NalType};
 use crate::Result;
 use crate::catalog::hang::CatalogExt;
 use crate::codec::annexb::NalIterator;
 use crate::container::Frame;
 
-/// A pure-publisher importer for H.265.
-/// Only supports single layer streams (VPS is cached but not parsed).
+/// A pure-publisher importer for H.265, configured from the base layer of a layered stream.
 ///
 /// Build it with [`new`](Self::new), passing the track producer and the
 /// [`catalog::Reserved`](crate::catalog::Reserved) it reserves its rendition from, and feed it
 /// frames a [`Split`](super::Split) produced via [`decode`](Self::decode). The
 /// catalog rendition fills in lazily once the codec config is known (hvcC via
-/// [`initialize`](Self::initialize) for hvc1, the first SPS for hev1).
+/// [`initialize`](Self::initialize) for hvc1, the first base-layer SPS for hev1).
 pub struct Import {
 	/// The NALU length size for the hvc1 shape, whose codec config is out-of-band (hvcC), so
 	/// frame payloads are length-prefixed rather than Annex-B. `None` for Annex-B.
@@ -72,7 +72,7 @@ impl Import {
 	/// - **hvc1** (no leading start code): parsed as an `HEVCDecoderConfigurationRecord`,
 	///   which resolves the config and is stored as the catalog `description`. Required
 	///   for hvc1.
-	/// - **hev1** (leading start code): parsed as Annex-B; any SPS resolves the config.
+	/// - **hev1** (leading start code): parsed as Annex-B; the first base-layer SPS resolves the config.
 	///   Optional, since hev1 also self-initializes from the first keyframe.
 	///
 	/// Takes a read-only slice: the dispatcher-owned [`Split`](super::Split) is what
@@ -97,19 +97,11 @@ impl Import {
 		Ok(())
 	}
 
-	/// Resolve the config from any SPS in the buffer.
+	/// Resolve the config from the first base-layer SPS in the buffer, if it holds any SPS.
 	fn initialize_hev1(&mut self, buf: &[u8]) -> Result<()> {
-		let mut scan = Bytes::copy_from_slice(buf);
-		let mut nals = NalIterator::new(&mut scan);
-		while let Some(nal) = nals.next().transpose()? {
-			if is_sps(&nal) {
-				self.seed_sps(&nal)?;
-			}
-		}
-		if let Some(nal) = nals.flush()?
-			&& is_sps(&nal)
-		{
-			self.seed_sps(&nal)?;
+		let nals = crate::codec::annexb::complete_nals(buf)?;
+		if let Some(sps) = super::base_sps(nals.iter().filter(|nal| is_sps(nal)))? {
+			self.seed_sps(sps)?;
 		}
 		Ok(())
 	}
@@ -125,7 +117,8 @@ impl Import {
 		Ok(())
 	}
 
-	/// The MoQ track name this importer publishes on.
+	/// The MoQ track name this importer publishes on, which a decoder identity change replaces
+	/// with a newly minted one.
 	pub fn name(&self) -> &str {
 		self.track.name()
 	}
@@ -135,9 +128,15 @@ impl Import {
 		self.track.track().demand()
 	}
 
+	/// The track this importer publishes on, which a decoder identity change replaces with a
+	/// newly named one.
+	pub fn track(&self) -> &moq_net::track::Producer {
+		self.track.track()
+	}
+
 	/// Finish the track, flushing the current group.
 	pub fn finish(&mut self) -> Result<()> {
-		self.track.finish()?;
+		self.track.end_with(None)?;
 		Ok(())
 	}
 
@@ -147,8 +146,6 @@ impl Import {
 		self.track.abort(err);
 	}
 
-	/// Publish what the track measured (bitrate, jitter) into the catalog rendition, filling only
-	/// the fields its config didn't supply.
 	/// Cut the current group at `end` without finishing the track.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> Result<()> {
 		self.track.cut(end)?;
@@ -163,15 +160,30 @@ impl Import {
 		Ok(())
 	}
 
+	/// Advertise whether this rendition is being produced, as the catalog's
+	/// [`enabled`](hang::catalog::VideoConfig::enabled): a publisher that stops encoding it
+	/// disables it, so viewers select another rendition rather than wait for frames.
+	pub fn set_enabled(&mut self, enabled: bool) -> Result<()> {
+		self.catalog.set_enabled(&mut self.track, enabled)?;
+		Ok(())
+	}
+
+	/// Report frames the encoder feeding this track skipped. See
+	/// [`Producer::report_skipped`](crate::container::Producer::report_skipped).
+	pub fn report_skipped(&self, frames: u64) {
+		self.track.report_skipped(frames);
+	}
+
+	/// Report the target bitrate of the encoder feeding this track. See
+	/// [`Producer::report_bitrate`](crate::container::Producer::report_bitrate).
+	pub fn report_bitrate(&self, bitrate: moq_net::bandwidth::Rate) {
+		self.track.report_bitrate(bitrate);
+	}
+
 	/// Close the current group and open the next one at `sequence`.
 	pub fn seek(&mut self, sequence: u64) -> Result<()> {
 		self.track.seek(sequence)?;
 		Ok(())
-	}
-
-	/// Record a locally encoded frame's transport handoff for catalog jitter measurement.
-	pub fn flush(&mut self, timestamp: moq_net::Timestamp, now: moq_clock::Instant) -> crate::Result<()> {
-		self.track.flush(timestamp, now)
 	}
 
 	/// Record a frame's reorder delay (`PTS - DTS`) so the catalog `jitter` reflects the
@@ -189,15 +201,14 @@ impl Import {
 			return Ok(());
 		}
 		let config = super::config_from_sps(sps_nal, true)?;
-		self.last_sps = Some(sps_nal.clone());
+		// Own just the parameter set: the access unit it was found in is far larger.
+		self.last_sps = Some(Bytes::copy_from_slice(sps_nal));
 		self.apply_config(config)?;
 		Ok(())
 	}
 
-	/// Apply a resolved config, updating the catalog rendition in place.
+	/// Apply a resolved config, minting a track when the decoder identity changes.
 	///
-	/// A changed config just re-mirrors the rendition; there are no fixed tracks to reject a
-	/// reconfiguration.
 	fn apply_config(&mut self, config: hang::catalog::VideoConfig) -> crate::Result<()> {
 		self.catalog.publish(&mut self.track, config)
 	}
@@ -206,22 +217,7 @@ impl Import {
 	/// keyframe's inline SPS and refining the catalog jitter as it goes.
 	fn write_frames(&mut self, frames: impl IntoIterator<Item = Frame>) -> Result<()> {
 		for frame in frames {
-			if frame.keyframe {
-				let hdr = crate::codec::color::access_unit(&frame.payload, self.length_size, 2, |h| {
-					nal_unit_type(h) == scuffle_h265::NALUnitType::PrefixSeiNut
-				});
-				// hvc1 config arrives out-of-band via initialize(); hev1 carries the SPS inline.
-				// Scanning an hvc1 payload as Annex-B would misread a length prefix as a start
-				// code (a 322-byte NAL prefixes as `00 00 01 42`, an SPS NAL header).
-				let sps = self.length_size.is_none().then(|| find_sps(&frame.payload)).flatten();
-				// A new SPS starts a coded sequence whose HDR metadata replaces the last one's. It goes
-				// first, so a keyframe that also configures publishes once.
-				let sequence = sps.as_ref().is_some_and(|sps| self.last_sps.as_ref() != Some(sps));
-				self.catalog.hdr(&mut self.track, hdr, sequence)?;
-				if let Some(sps) = sps {
-					self.configure_from_sps(&sps)?;
-				}
-			}
+			self.configure(&frame)?;
 
 			// A keyframe we still can't configure (no SPS) is undecodable.
 			if frame.keyframe && !self.catalog.configured() {
@@ -231,6 +227,37 @@ impl Import {
 			// A pre-keyframe delta has no group to anchor it: the producer returns
 			// MissingKeyframe, which the caller (e.g. a TS mid-stream join) skips.
 			self.track.write(frame)?;
+		}
+		Ok(())
+	}
+
+	/// Account for a frame its caller drops rather than writes: a keyframe still configures the
+	/// rendition. The splitter re-injects the VPS, SPS, and PPS into the next keyframe itself.
+	pub(crate) fn dropped(&mut self, frame: &Frame) -> Result<()> {
+		self.configure(frame)
+	}
+
+	/// Resolve the config and HDR metadata a keyframe carries inline, without publishing it.
+	fn configure(&mut self, frame: &Frame) -> Result<()> {
+		if !frame.keyframe {
+			return Ok(());
+		}
+		let hdr = crate::codec::color::access_unit(&frame.payload, self.length_size, 2, |h| {
+			NalType::of(h) == NalType::PREFIX_SEI
+		});
+		// hvc1 config arrives out-of-band via initialize(); hev1 carries the SPS inline.
+		// Scanning an hvc1 payload as Annex-B would misread a length prefix as a start
+		// code (a 322-byte NAL prefixes as `00 00 01 42`, an SPS NAL header).
+		let sps = match self.length_size {
+			Some(_) => None,
+			None => find_sps(&frame.payload)?,
+		};
+		// A new SPS starts a coded sequence whose HDR metadata replaces the last one's. It goes
+		// first, so a keyframe that also configures publishes once.
+		let sequence = sps.as_ref().is_some_and(|sps| self.last_sps.as_ref() != Some(sps));
+		self.catalog.hdr(&mut self.track, hdr, sequence)?;
+		if let Some(sps) = sps {
+			self.configure_from_sps(&sps)?;
 		}
 		Ok(())
 	}
@@ -250,25 +277,25 @@ pub fn config(buf: &[u8]) -> Result<hang::catalog::VideoConfig> {
 	if crate::codec::annexb::is_config_record(buf) {
 		return Ok(super::config_from_hvcc(buf)?);
 	}
-	let sps = find_sps(buf).ok_or(Error::NotInitialized)?;
+	let sps = find_sps(buf)?.ok_or(Error::NotInitialized)?;
 	Ok(super::config_from_sps(&sps, true)?)
 }
 
 fn is_sps(nal: &[u8]) -> bool {
-	nal.first()
-		.is_some_and(|h| nal_unit_type(*h) == scuffle_h265::NALUnitType::SpsNut)
+	nal.first().is_some_and(|h| NalType::of(*h) == NalType::SPS)
 }
 
-/// Find the first SPS NAL in an Annex-B payload, if any.
-fn find_sps(payload: &[u8]) -> Option<Bytes> {
+/// Find the first base-layer SPS NAL in an Annex-B payload, if it carries any SPS.
+fn find_sps(payload: &[u8]) -> super::Result<Option<Bytes>> {
 	let mut buf = Bytes::copy_from_slice(payload);
 	let mut nals = NalIterator::new(&mut buf);
-	while let Some(Ok(nal)) = nals.next() {
-		if is_sps(&nal) {
-			return Some(nal);
-		}
-	}
-	nals.flush().ok().flatten().filter(|nal| is_sps(nal))
+	let mut sps: Vec<Bytes> = nals
+		.by_ref()
+		.map_while(|nal| nal.ok())
+		.filter(|nal| is_sps(nal))
+		.collect();
+	sps.extend(nals.flush().ok().flatten().filter(|nal| is_sps(nal)));
+	Ok(super::base_sps(&sps)?.cloned())
 }
 
 #[cfg(test)]
@@ -306,14 +333,16 @@ mod tests {
 		let mut frames = split.decode(&au, pts).unwrap();
 		frames.extend(split.flush(pts).unwrap());
 		import.decode(frames).unwrap();
-		let color = || catalog.snapshot().video.renditions["video"].color.clone();
-		assert!(color().unwrap().mastering.is_some());
+		let color = |name: &str| catalog.snapshot().video.renditions[name].color.clone();
+		assert!(color("video").unwrap().mastering.is_some());
 
-		// An SPS that signals no colour: nothing is left once the stale metadata goes.
+		// An SPS that signals no colour: nothing is left once the stale metadata goes. It is also a
+		// new profile and level, so it publishes a new track.
 		import
 			.initialize(&annexb(&[fixtures::VPS, fixtures::SPS, fixtures::PPS]))
 			.unwrap();
-		assert_eq!(color(), None);
+		assert_eq!(import.name(), "video/1");
+		assert_eq!(color("video/1"), None);
 	}
 
 	/// An HDR10 keyframe publishes its VUI colour and the static HDR metadata its SEI carries.
@@ -347,7 +376,7 @@ mod tests {
 			.expect("colour");
 		assert_eq!(
 			(color.primaries, color.transfer, color.matrix, color.range),
-			(Some(9), Some(16), Some(9), Some(hang::catalog::Range::Limited))
+			(Some(9), Some(16), Some(9), Some(hang::catalog::ColorRange::Limited))
 		);
 		let hdr = crate::codec::color::test::hdr10();
 		assert_eq!(
@@ -376,6 +405,14 @@ mod tests {
 		let mut ceiling = vec![0, 0, 0, 1];
 		ceiling.extend_from_slice(fixtures::SPS);
 		assert_eq!(config(&ceiling).unwrap().framerate, None);
+	}
+
+	/// The SPS's reorder depth at its highest sub-layer becomes the catalog's declaration.
+	#[test]
+	fn config_declares_the_sps_reorder_depth() {
+		let mut pyramid = vec![0, 0, 0, 1];
+		pyramid.extend_from_slice(fixtures::SPS_PYRAMID);
+		assert_eq!(config(&pyramid).unwrap().reorder, Some(2));
 	}
 
 	/// Square samples carry no display aspect, so the picture is shown at its own size.
@@ -516,5 +553,84 @@ mod tests {
 		assert!(cfg.description.is_none(), "hev1 has no out-of-band description");
 		assert_eq!(cfg.coded_width, Some(1280));
 		assert_eq!(cfg.coded_height, Some(720));
+	}
+
+	/// A layered stream configures from its base layer's SPS wherever it lists the enhancement
+	/// layer's first: an hvcC, an hev1 init, or a keyframe. One whose only SPS is an enhancement
+	/// layer's is refused.
+	#[tokio::test(start_paused = true)]
+	async fn layered_stream_configures_from_the_base_layer() {
+		let annexb = |nals: &[&[u8]]| {
+			let mut buf = BytesMut::new();
+			for nal in nals {
+				buf.extend_from_slice(&[0, 0, 0, 1]);
+				buf.extend_from_slice(nal);
+			}
+			buf
+		};
+		let idr: &[u8] = &[0x26, 0x01, 0x80, 0xaa]; // IdrWRadl (19)
+		let size = |catalog: &crate::catalog::Producer| {
+			let snapshot = catalog.snapshot();
+			let config = &snapshot.video.renditions["video"];
+			(config.coded_width, config.coded_height)
+		};
+		let pts = moq_net::Timestamp::from_micros(0).unwrap();
+		let layered: &[&[u8]] = &[
+			fixtures::VPS,
+			fixtures::MV_SPS_LAYER1,
+			fixtures::MV_SPS,
+			fixtures::PPS,
+			fixtures::MV_PPS_LAYER1,
+		];
+
+		let hvcc = super::super::build_hvcc(
+			&[Bytes::from_static(fixtures::VPS)],
+			&[
+				Bytes::from_static(fixtures::MV_SPS_LAYER1),
+				Bytes::from_static(fixtures::MV_SPS),
+			],
+			&[Bytes::from_static(fixtures::PPS)],
+		)
+		.unwrap();
+		let (track, catalog) = setup("video");
+		let mut import = Import::new(track, catalog.reserve(), Default::default()).unwrap();
+		import.initialize(&hvcc).unwrap();
+		assert_eq!(size(&catalog), (Some(128), Some(64)));
+
+		let (track, catalog) = setup("video");
+		let mut import = Import::new(track, catalog.reserve(), Default::default()).unwrap();
+		import.initialize(&annexb(layered)).unwrap();
+		assert_eq!(size(&catalog), (Some(128), Some(64)));
+		assert_eq!(
+			config(&annexb(layered)).unwrap().coded_width,
+			Some(128),
+			"config() reads the base layer too"
+		);
+
+		let (track, catalog) = setup("video");
+		let mut import = Import::new(track, catalog.reserve(), Default::default()).unwrap();
+		let mut split = Split::new();
+		let mut frames = split.decode(&annexb(&[layered, &[idr]].concat()), pts).unwrap();
+		frames.extend(split.flush(pts).unwrap());
+		import.decode(frames).unwrap();
+		assert_eq!(size(&catalog), (Some(128), Some(64)));
+
+		// A later keyframe redefining only the enhancement layer keeps the base layer's config.
+		let update = annexb(&[fixtures::MV_SPS_LAYER1, fixtures::MV_PPS_LAYER1, idr]);
+		let mut frames = split.decode(&update, pts).unwrap();
+		frames.extend(split.flush(pts).unwrap());
+		import.decode(frames).unwrap();
+		assert_eq!(size(&catalog), (Some(128), Some(64)));
+
+		let enhancement = annexb(&[fixtures::VPS, fixtures::MV_SPS_LAYER1, fixtures::MV_PPS_LAYER1, idr]);
+		let (track, catalog) = setup("video");
+		let mut import = Import::new(track, catalog.reserve(), Default::default()).unwrap();
+		let err = import.initialize(&enhancement).unwrap_err();
+		assert!(matches!(err, crate::Error::H265(Error::NoBaseLayerSps)), "{err:?}");
+		let mut split = Split::new();
+		let mut frames = split.decode(&enhancement, pts).unwrap();
+		frames.extend(split.flush(pts).unwrap());
+		let err = import.decode(frames).unwrap_err();
+		assert!(matches!(err, crate::Error::H265(Error::NoBaseLayerSps)), "{err:?}");
 	}
 }

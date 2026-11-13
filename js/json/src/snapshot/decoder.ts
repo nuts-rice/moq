@@ -1,6 +1,3 @@
-import { Decoder as Flate } from "@moq/flate";
-
-import { isDeflate } from "../compression.ts";
 import { merge } from "../diff.ts";
 import { MissingSnapshot } from "../error.ts";
 import { parse } from "../parse.ts";
@@ -14,35 +11,26 @@ import type { Config } from "./encoder.ts";
  * every group is a {@link snapshot}, the rest are {@link delta}s.
  *
  * Applying and materializing are separate on purpose. Frames must be applied in order (the merge
- * patches and the DEFLATE window are both sequential), but a consumer catching up on a backlog only
+ * patches are sequential), but a consumer catching up on a backlog only
  * wants the value at the head, so it applies every frame and calls {@link decode} once. A caller
  * that wants a value per frame just calls it every time.
  */
 export class Decoder<T> {
 	#schema?: Config<T>["schema"];
-	// Whether frames are `deflate-raw` compressed. Must match the encoder's {@link Config.compression}.
-	#decompress: boolean;
-
-	// The current group's DEFLATE window, rebuilt at each snapshot.
-	#flate?: Flate;
 	// The reconstructed value, `undefined` until the first snapshot.
 	#current?: unknown;
 
-	constructor(config: Pick<Config<T>, "schema" | "compression"> = {}) {
+	constructor(config: Pick<Config<T>, "schema"> = {}) {
 		this.#schema = config.schema;
-		this.#decompress = isDeflate(config.compression);
 	}
 
 	/**
 	 * Apply a group's first frame: a full snapshot that replaces the current value.
 	 *
-	 * Also starts the group's DEFLATE window, so this must be called at every group boundary, not
-	 * only the first.
+	 * Call this at every group boundary, not only the first.
 	 */
 	snapshot(payload: Uint8Array): void {
-		// Each group is its own compressed stream, so the window starts cold here.
-		this.#flate = this.#decompress ? new Flate() : undefined;
-		this.#current = this.#parse(payload);
+		this.#current = parse(payload);
 	}
 
 	/**
@@ -52,7 +40,7 @@ export class Decoder<T> {
 	 */
 	delta(payload: Uint8Array): void {
 		if (this.#current === undefined) throw new MissingSnapshot();
-		this.#current = merge(this.#current, this.#parse(payload));
+		this.#current = merge(this.#current, parse(payload));
 	}
 
 	/**
@@ -68,17 +56,12 @@ export class Decoder<T> {
 	/**
 	 * Materialize the reconstructed value, or `undefined` before the first snapshot.
 	 *
-	 * The result is the caller's own copy, for the same reason as {@link value}. (A schema already
-	 * produces a fresh object, so it only needs cloning without one. The Rust decoder deserializes a
-	 * fresh `T` every call and never exposes its internal state at all.)
+	 * The result is the caller's own copy, for the same reason as {@link value}. The state is cloned
+	 * even with a schema, since `z.unknown()` fields and loose-object extras pass references through.
 	 */
 	decode(): T | undefined {
 		if (this.#current === undefined) return undefined;
-		return this.#schema ? this.#schema.parse(this.#current) : (structuredClone(this.#current) as T);
-	}
-
-	// Decompress a frame against the group's window when compressing, then parse it as JSON.
-	#parse(payload: Uint8Array): unknown {
-		return parse(this.#flate ? this.#flate.frame(payload) : payload);
+		const value = structuredClone(this.#current);
+		return this.#schema ? this.#schema.parse(value) : (value as T);
 	}
 }

@@ -35,7 +35,6 @@ type UnmapVideoFrame64 = unsafe extern "C" fn(CUvideodecoder, c_ulonglong) -> CU
 /// ([`create_video_parser`](Self::create_video_parser)), feed it bitstream
 /// packets, and inside the parser callbacks create a decoder, decode pictures,
 /// and map/unmap the decoded frames. All calls require a current CUDA context.
-#[allow(missing_debug_implementations)]
 pub struct Api {
 	/// Creates a bitstream parser.
 	#[doc(alias = "cuvidCreateVideoParser")]
@@ -76,14 +75,12 @@ impl Api {
 
 	fn load() -> Result<Api, String> {
 		// `.so.1` is the versioned SONAME present at runtime; `.so` is the dev
-		// symlink. Windows ships the DLL with the NVIDIA driver.
+		// symlink.
 		#[cfg(target_os = "linux")]
 		const CANDIDATES: &[&str] = &["libnvcuvid.so.1", "libnvcuvid.so"];
-		#[cfg(target_os = "windows")]
-		const CANDIDATES: &[&str] = &["nvcuvid.dll"];
-		// No NVDEC library exists on other platforms (e.g. macOS); loading
-		// always fails there with a clear error.
-		#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+		// The bindings are Linux's, so other platforms never load the driver;
+		// loading always fails there with a clear error.
+		#[cfg(not(target_os = "linux"))]
 		const CANDIDATES: &[&str] = &[];
 
 		// SAFETY: loading the NVIDIA driver library runs its initializers, which

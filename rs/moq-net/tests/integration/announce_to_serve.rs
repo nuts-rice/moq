@@ -15,7 +15,7 @@ use crate::support;
 use std::time::Duration;
 
 use futures::{StreamExt, channel::mpsc};
-use moq_net::{Error, Hop, Timestamp, Version, origin};
+use moq_net::{Error, Timestamp, Version, origin};
 use support::harness::{MockConnectOptions, MockPair, connect_mock};
 
 /// A millisecond track: the frames written here carry timestamps.
@@ -29,9 +29,9 @@ const SETTLE: Duration = Duration::from_secs(1);
 const PATH: &str = "bcast";
 
 fn produce_origin(hop: u64) -> origin::Producer {
-	let (producer, driver) = origin::Producer::new(origin::Config::new(Hop::new(hop).unwrap()));
+	let (producer, driver) = origin::Producer::new(origin::Config::new(std::num::NonZeroU64::new(hop).unwrap()));
 	support::harness::spawn(driver);
-	producer
+	producer.with_proxy(true)
 }
 
 /// Where the observing consumer sits relative to the publisher.
@@ -43,25 +43,17 @@ enum Observer {
 }
 
 /// Drain every route event the cursor has pending, as `kind prefix` lines.
-fn drain(announced: &mut moq_net::announce::Consumer) -> Vec<String> {
-	use moq_net::announce::Event;
-
+fn drain(announced: &mut moq_net::origin::Routes) -> Vec<String> {
 	let mut seen = Vec::new();
 	while let Some(event) = announced.try_next() {
-		let (kind, announce) = match event {
-			Event::Start(announce) => ("Start", announce),
-			Event::Update(announce) => ("Update", announce),
-			Event::Restart(announce) => ("Restart", announce),
-			Event::End(announce) => ("End", announce),
-		};
-		seen.push(format!("{kind} {}", announce.prefix));
+		seen.push(format!("{:?} {}", event.kind, event.announce.prefix));
 	}
 	seen
 }
 
 /// How a request for the path answers.
 async fn request(consumer: &origin::Consumer) -> Result<moq_net::broadcast::Consumer, String> {
-	consumer.request_broadcast(PATH, None).await.map_err(|err| match err {
+	consumer.request(PATH, None).await.map_err(|err| match err {
 		Error::Unroutable => "unroutable".to_string(),
 		err => err.to_string(),
 	})
@@ -78,7 +70,7 @@ fn outcome(result: &Result<moq_net::broadcast::Consumer, String>) -> String {
 /// group's frames and then how the subscription ended. Read continuously, as a
 /// real subscriber would, so the subscription is driven the whole time.
 async fn read(broadcast: &moq_net::broadcast::Consumer, name: &str) -> mpsc::UnboundedReceiver<String> {
-	let subscription = moq_net::track::Subscription::default().with_groups(0..);
+	let subscription = moq_net::track::Subscription::default().with_range(0..);
 	let mut sub = broadcast
 		.track(name)
 		.unwrap()
@@ -86,7 +78,7 @@ async fn read(broadcast: &moq_net::broadcast::Consumer, name: &str) -> mpsc::Unb
 		.await
 		.expect("subscribe");
 	let (tx, rx) = mpsc::unbounded();
-	moq_clock::sim::spawn(async move {
+	kio::clock::sim::spawn(async move {
 		loop {
 			let mut group = match sub.recv_group().await {
 				Ok(Some(group)) => group,
@@ -113,7 +105,7 @@ async fn read(broadcast: &moq_net::broadcast::Consumer, name: &str) -> mpsc::Unb
 
 /// The reader's next report, or `stalled` if nothing arrives in time.
 async fn next(rx: &mut mpsc::UnboundedReceiver<String>) -> String {
-	match moq_clock::timeout(SETTLE, rx.next()).await {
+	match kio::clock::timeout(SETTLE, rx.next()).await {
 		Ok(Some(report)) => report,
 		_ => "stalled".to_string(),
 	}
@@ -140,13 +132,13 @@ async fn lifecycle(observer: Observer) -> Vec<String> {
 			(subscriber.consume(), Some(pair))
 		}
 	};
-	let mut announced = consumer.announced();
+	let mut announced = consumer.routes();
 	let mut log = Vec::new();
 
 	// Created, not yet announced: nobody can see or reach it.
-	let broadcast = publisher.create_broadcast(PATH).unwrap();
-	let track = broadcast.create_track("video", timed()).unwrap();
-	moq_clock::sleep(SETTLE).await;
+	let broadcast = publisher.route(PATH, moq_net::origin::RouteOptions::hidden()).unwrap();
+	let track = broadcast.broadcast().create_track("video", timed()).unwrap();
+	kio::clock::sleep(SETTLE).await;
 	log.push(format!(
 		"created: {:?} {}",
 		drain(&mut announced),
@@ -154,15 +146,15 @@ async fn lifecycle(observer: Observer) -> Vec<String> {
 	));
 
 	// Announced: listed, and a request resolves.
-	broadcast.announce(Default::default()).unwrap();
-	moq_clock::sleep(SETTLE).await;
+	broadcast.announce().unwrap();
+	kio::clock::sleep(SETTLE).await;
 	let first = request(&consumer).await;
 	log.push(format!("announced: {:?} {}", drain(&mut announced), outcome(&first)));
 	let first = first.expect("an announced broadcast resolves");
 
 	// A track in flight across the unannounce.
 	let mut reader = read(&first, "video").await;
-	moq_clock::timeout(SETTLE, crate::support::wanted(track.demand()))
+	kio::clock::timeout(SETTLE, crate::support::wanted(track.demand()))
 		.await
 		.expect("no subscriber appeared")
 		.unwrap();
@@ -172,8 +164,8 @@ async fn lifecycle(observer: Observer) -> Vec<String> {
 	// Unannounced: retracted for everyone. A fresh request is refused rather
 	// than joining the broadcast still draining, which ends, while the track
 	// already in flight carries on to its own end.
-	broadcast.unannounce();
-	moq_clock::sleep(SETTLE).await;
+	broadcast.withdraw();
+	kio::clock::sleep(SETTLE).await;
 	log.push(format!(
 		"unannounced: {:?} {} closed={}",
 		drain(&mut announced),
@@ -181,7 +173,7 @@ async fn lifecycle(observer: Observer) -> Vec<String> {
 		first.is_closed(),
 	));
 	write_group(&track, "after");
-	track.finish().unwrap();
+	let _track = track.finish().unwrap();
 	log.push(format!(
 		"draining: {} then {}",
 		next(&mut reader).await,
@@ -189,8 +181,8 @@ async fn lifecycle(observer: Observer) -> Vec<String> {
 	));
 
 	// Announced again: listed and servable, through a fresh broadcast.
-	broadcast.announce(Default::default()).unwrap();
-	moq_clock::sleep(SETTLE).await;
+	broadcast.announce().unwrap();
+	kio::clock::sleep(SETTLE).await;
 	let again = request(&consumer).await;
 	log.push(format!(
 		"reannounced: {:?} {} fresh={}",
@@ -200,9 +192,9 @@ async fn lifecycle(observer: Observer) -> Vec<String> {
 	));
 	let again = again.expect("a reannounced broadcast resolves");
 
-	let audio = broadcast.create_track("audio", timed()).unwrap();
+	let audio = broadcast.broadcast().create_track("audio", timed()).unwrap();
 	let mut reader = read(&again, "audio").await;
-	moq_clock::timeout(SETTLE, crate::support::wanted(audio.demand()))
+	kio::clock::timeout(SETTLE, crate::support::wanted(audio.demand()))
 		.await
 		.expect("no subscriber appeared after reannouncing")
 		.unwrap();
@@ -222,31 +214,21 @@ const EXPECTED: &[&str] = &[
 	"serving again: again",
 ];
 
-#[moq_clock::test]
+#[kio::test]
 async fn local_consumer_sees_only_announced_broadcasts() {
 	assert_eq!(lifecycle(Observer::Local).await, EXPECTED);
 }
 
-#[moq_clock::test]
+#[kio::test]
 async fn remote_lite_consumer_sees_what_a_local_one_does() {
 	assert_eq!(lifecycle(Observer::Remote("moq-lite-05")).await, EXPECTED);
 }
 
-#[moq_clock::test]
+#[kio::test]
 async fn remote_ietf_consumer_sees_what_a_local_one_does() {
-	// Drafts 14 to 16 carry each request over the control stream; 17 and later give it
-	// its own stream. Both have to end a finished track the way moq-lite does.
-	for version in [
-		"moq-transport-14",
-		"moq-transport-15",
-		"moq-transport-16",
-		"moq-transport-17",
-		"moq-transport-18",
-		"moq-transport-19",
-		"moq-transport-20",
-		"moq-transport-21",
-		"moq-transport-22",
-	] {
+	// Each request has its own stream, which has to end a finished track the way
+	// moq-lite does.
+	for version in ["moq-transport-18", "moq-transport-22"] {
 		assert_eq!(lifecycle(Observer::Remote(version)).await, EXPECTED, "{version}");
 	}
 }

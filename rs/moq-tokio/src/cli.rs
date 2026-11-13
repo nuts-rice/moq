@@ -5,12 +5,14 @@
 //! `parse()` is expected to take them first. A binary that parses more than once
 //! never reaches that code, so it has to answer them itself. Both shapes exist here:
 //! a TOML merge that layers CLI, env, and file with recorded provenance, and
-//! moq-cli's repeated `--` stage grammar. A private duration adapter parses the
-//! human-readable values used by those flags and TOML keys.
+//! moq-cli's repeated `--` stage grammar. [`Duration`] parses the human-readable
+//! values used by those flags and TOML keys, and [`check_env`] refuses `MOQ_*`
+//! variables a binary does not read.
 
 #[path = "deprecated.rs"]
 mod deprecated;
 pub(crate) mod duration;
+mod env;
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -24,10 +26,8 @@ use usage_rs::config::{
 };
 
 pub use deprecated::Deprecated;
-pub(crate) use duration::Duration;
-
-/// Re-exported because [`Merge`] and [`answer`] use Usage types in their APIs.
-pub use usage_rs;
+pub use duration::Duration;
+pub use env::{UnknownEnv, check_env};
 
 /// What a Usage parse result asks the process to do.
 #[non_exhaustive]
@@ -114,10 +114,11 @@ pub fn answer(
 /// `parsed` is the struct Usage filled from argv+env+defaults. File keys that
 /// neither the command line nor the environment set replace those defaults.
 ///
-/// The merge is a TOML round-trip, so a `#[serde(skip)]` field comes back as its
-/// default. The released CLI spellings live on such fields: collect
-/// [`Deprecated`] from `parsed` before calling this, and from
-/// the result for the file's own released keys.
+/// With a file, the merge is a TOML round-trip, so a `#[serde(skip)]` field comes
+/// back as its default; without one, `parsed` is returned unchanged. The released
+/// CLI spellings live on such fields: collect [`Deprecated`] from `parsed` before
+/// calling this, and from the result for the file's own released keys
+/// ([`Deprecated::extend`] drops the repeats when no file was given).
 pub struct Merge<'a> {
 	/// The settings declared by the root CLI.
 	pub registry: Registry,
@@ -145,11 +146,13 @@ impl Merge<'_> {
 		}
 		let resolved = resolve(self.registry, layers).map_err(|err| err.to_string())?;
 
+		// Only a file needs the TOML round trip, which refuses non-UTF-8 paths.
+		let Some(source) = self.file else {
+			return Ok((parsed, resolved));
+		};
 		let occupied = occupied_keys(self.registry, &resolved);
 		let mut merged = toml::Value::try_from(&parsed).map_err(|err| err.to_string())?;
-		if let Some(source) = self.file {
-			overlay_unoccupied(&mut merged, source.value, "", &occupied);
-		}
+		overlay_unoccupied(&mut merged, source.value, "", &occupied);
 		let config: T = merged.try_into().map_err(|err: toml::de::Error| err.to_string())?;
 		Ok((config, resolved))
 	}
@@ -216,9 +219,6 @@ fn overlay_unoccupied(base: &mut toml::Value, overlay: &toml::Value, path: &str,
 				} else {
 					format!("{path}.{key}")
 				};
-				if !occupied.contains(child.as_str()) {
-					base.remove(&format!("__cli_{key}"));
-				}
 				match base.get_mut(key) {
 					Some(existing) => overlay_unoccupied(existing, value, &child, occupied),
 					None if occupied.contains(child.as_str()) => {}

@@ -11,7 +11,7 @@
  *     bun drain.ts --a-port 4470 --b-port 4471 --proxy-port 4472 --a-pid 1234 --timeout 60
  *
  * The viewer subscribes once, at no latency budget, and reads the same subscription throughout:
- * the publisher mints an epoch, so B's route serves the same broadcast and the origin resumes the
+ * the publisher's instance reaches A through B, so both routes serve one stream and the origin resumes the
  * track there from the first group the viewer lacks.
  *
  * Exits 0 once the viewer has migrated, read groups through both relays with none missing in
@@ -21,7 +21,7 @@
  */
 import * as net from "node:net";
 import { parseArgs } from "node:util";
-import { Milli } from "@moq/clock";
+import { Duration } from "@moq/clock";
 import * as Moq from "@moq/net";
 
 const { values } = parseArgs({
@@ -51,10 +51,10 @@ const GROUPS_PER_RELAY = 10;
 const GROUP_INTERVAL_MS = 100;
 // How long the viewer's old session may keep serving after the GOAWAY. Well inside the relay's
 // 20s drain window, so the relay's exit log can prove the viewer left on its own.
-const HANDOVER = Milli(2000);
+const HANDOVER = Duration.millis(2000);
 
 const path = Moq.Path.from("drain");
-// Publisher epochs travel on the work-in-progress moq-lite-07 only, which nothing offers by default.
+// Publisher instances travel on the work-in-progress moq-lite-07 only, which nothing offers by default.
 const versions = ["moq-lite-07-wip"];
 const trackName = "seq";
 
@@ -109,10 +109,11 @@ await new Promise<void>((resolve, reject) => {
 
 // ── publisher on B ────────────────────────────────────────────────────────────
 const published = new Moq.Origin.Producer();
-const broadcast = published.createBroadcast(path);
+const broadcastRoute = published.route(path, { hidden: true });
+const broadcast = broadcastRoute.broadcast;
 const track = broadcast.createTrack(trackName, { timescale: Moq.Time.Timescale.MILLI });
-// The epoch is what says B's route serves the same broadcast as A's.
-broadcast.announce({ epoch: Moq.Epoch.mint() });
+// The instance the publication mints is what says B's route serves the same stream as A's.
+broadcastRoute.announce();
 const publisher = new Moq.Connection({
 	url: new URL(`http://127.0.0.1:${bPort}/`),
 	publish: published.consume(),
@@ -126,8 +127,8 @@ const ticker = setInterval(() => {
 		payload: new TextEncoder().encode(String(group.sequence)),
 		timestamp: Moq.Time.Timestamp.now(),
 	});
-	group.close();
-	lastPublished = group.sequence;
+	group.finish();
+	lastPublished = Number(group.sequence);
 }, GROUP_INTERVAL_MS);
 
 // ── viewer through the name ───────────────────────────────────────────────────
@@ -148,7 +149,7 @@ const viewer = new Moq.Connection({
 
 // One request and one subscription, at the default zero budget, read for the whole run: the
 // route moving from A to B re-sources the track underneath.
-const request = watched.request(path, { announced: true });
+const request = watched.follow(path);
 await until("the broadcast to resolve", () => request.active.peek() !== undefined);
 const active = request.active.peek() as Moq.Broadcast.Consumer;
 log("watching");
@@ -166,7 +167,7 @@ void (async () => {
 				corrupt ??= `group ${group.sequence} carried ${text}`;
 				return;
 			}
-			seen.set(group.sequence, (seen.get(group.sequence) ?? 0) + 1);
+			seen.set(Number(group.sequence), (seen.get(Number(group.sequence)) ?? 0) + 1);
 		}
 	} catch (err) {
 		ended = err instanceof Error ? err.message : String(err);
@@ -185,7 +186,7 @@ try {
 	process.kill(aPid, "SIGTERM");
 
 	// The old session leaves at the handover cap, before A's own deadline would cut it.
-	await until("the viewer to leave relay A", () => a.open === 0, HANDOVER * 3);
+	await until("the viewer to leave relay A", () => a.open === 0, HANDOVER.mul(3).asMillis());
 	// Counted past the newest group when A went: only B can have delivered these. Bounded well
 	// inside A's 20s drain window: a viewer that only reconnects once A cuts it off at the
 	// deadline would otherwise pass, just late.
@@ -193,7 +194,7 @@ try {
 	await until(
 		`${GROUPS_PER_RELAY} new groups through relay B`,
 		() => newest() >= left + GROUPS_PER_RELAY,
-		HANDOVER * 3,
+		HANDOVER.mul(3).asMillis(),
 	);
 
 	if (a.dialed !== 1) throw new Error(`the viewer redialed the withdrawn relay (${a.dialed} dials)`);

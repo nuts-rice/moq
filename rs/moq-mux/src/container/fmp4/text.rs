@@ -1,7 +1,7 @@
 use moq_net::{Timescale, Timestamp};
 use mp4_atom::{Any, DecodeMaybe};
 
-use super::{Error, sample};
+use super::{Error, edit::Edit, sample};
 use crate::container::text::{self, Cue};
 use crate::container::ttml;
 
@@ -37,89 +37,85 @@ pub(super) struct Track {
 	pub format: Format,
 	pub defaults: sample::Defaults,
 	pub timescale: Timescale,
+	/// The edit list, applied to every cue's presentation time.
+	pub edit: Edit,
 	/// The exclusive decode end of the previous fragment; the next one may not start before it.
 	pub end_decode_time: Option<u64>,
 	pub discontinuity: bool,
 }
 
-pub(super) struct Fragment<'a> {
-	pub traf: &'a mp4_atom::Traf,
-	pub data: &'a [u8],
-	pub moof_size: usize,
-	pub header_size: usize,
+pub(super) struct Sample {
+	pub range: std::ops::Range<usize>,
+	source: Timestamp,
+	timestamp: Timestamp,
+	duration: Timestamp,
 }
 
 impl Track {
-	pub fn extract<E: crate::catalog::hang::CatalogExt>(
+	pub fn prepare<E: crate::catalog::hang::CatalogExt>(
 		&mut self,
-		input: Fragment<'_>,
+		traf: &mp4_atom::Traf,
+		resolver: &mut sample::Resolver,
 		timebase: &mut crate::catalog::Timebase<E>,
-	) -> crate::Result<()> {
-		let traf = input.traf;
+	) -> crate::Result<Vec<Sample>> {
 		let mut dts = traf.tfdt.as_ref().ok_or(Error::MissingTfdt)?.base_media_decode_time;
 		if self.end_decode_time.is_some_and(|end| dts < end) {
 			return Err(Error::InvalidSubtitle("subtitle fragment overlaps the previous one").into());
 		}
-		if traf.trun.is_empty() {
-			return Err(Error::MissingTrun.into());
+		let mut samples = Vec::with_capacity(sample::count(traf) as usize);
+		for resolved in resolver.resolve(traf, self.defaults)? {
+			let sample::Resolved { sample, cts, range } = resolved?;
+			// A text sample is staged whole before it is rewritten.
+			if range.len() > super::MAX_HELD_BYTES {
+				return Err(Error::TextSampleTooLarge(range.len()).into());
+			}
+			let duration = sample.duration.ok_or(Error::MissingSampleDuration)?;
+			let pts = dts.checked_add_signed(cts).ok_or(Error::PtsOverflow)?;
+			let duration = Timestamp::new(duration as u64, self.timescale)?;
+			dts = dts.checked_add(duration.value()).ok_or(Error::PtsOverflow)?;
+			let Some(presented) = self.edit.present(pts)? else {
+				continue;
+			};
+			samples.push(Sample {
+				range,
+				source: Timestamp::new(pts, self.timescale)?,
+				timestamp: timebase.shift(Timestamp::new(presented, self.timescale)?)?,
+				duration,
+			});
 		}
+		self.end_decode_time = Some(dts);
+		Ok(samples)
+	}
+
+	pub fn write(&mut self, sample: &Sample, data: &[u8]) -> crate::Result<()> {
 		if self.discontinuity {
 			self.producer.discontinuity()?;
 			self.discontinuity = false;
 		}
-		let base: usize = traf
-			.tfhd
-			.base_data_offset
-			.unwrap_or_default()
-			.try_into()
-			.map_err(|_| Error::InvalidDataOffset)?;
-		let mut offset = base;
-		for trun in &traf.trun {
-			if let Some(value) = trun.data_offset {
-				let value: usize = value.try_into().map_err(|_| Error::InvalidDataOffset)?;
-				offset = value
-					.checked_sub(input.moof_size)
-					.and_then(|value| value.checked_sub(input.header_size))
-					.and_then(|value| value.checked_add(base))
-					.ok_or(Error::InvalidDataOffset)?;
-			}
-			for entry in &trun.entries {
-				let sample = self.defaults.resolve(&traf.tfhd, entry);
-				let duration = sample.duration.ok_or(Error::MissingSampleDuration)?;
-				let pts = dts
-					.checked_add_signed(entry.cts.unwrap_or_default() as i64)
-					.ok_or(Error::PtsOverflow)?;
-				let source = Timestamp::new(pts, self.timescale)?;
-				let timestamp = timebase.shift(source)?;
-				let duration = Timestamp::new(duration as u64, self.timescale)?;
-				let end = timestamp.checked_add(duration)?;
-				let next = offset
-					.checked_add(sample.size as usize)
-					.ok_or(Error::InvalidDataOffset)?;
-				let data = input.data.get(offset..next).ok_or(Error::InvalidDataOffset)?;
-				let payload = match &self.format {
-					Format::Vtt { header } => vtt(header, data, timestamp, end)?,
-					// The frame timestamp is serialized in hang's scale, which the body's begin must match.
-					Format::Ttml => ttml::rewrite(
-						data,
-						source,
-						timestamp.convert(hang::container::TIMESCALE)?..end.convert(hang::container::TIMESCALE)?,
-					)
-					.map_err(Error::InvalidSubtitle)?
-					.into(),
-				};
-				self.producer.write(crate::container::Frame {
-					timestamp,
-					duration: Some(duration),
-					keyframe: true,
-					payload,
-				})?;
-				self.producer.cut(None)?;
-				offset = next;
-				dts = dts.checked_add(duration.value()).ok_or(Error::PtsOverflow)?;
-			}
-		}
-		self.end_decode_time = Some(dts);
+		let Sample {
+			source,
+			timestamp,
+			duration,
+			..
+		} = *sample;
+		let end = timestamp.checked_add(duration)?;
+		let payload = match &self.format {
+			Format::Vtt { header } => vtt(header, data, timestamp, end)?,
+			Format::Ttml => ttml::rewrite(
+				data,
+				source,
+				timestamp.convert(hang::container::TIMESCALE)?..end.convert(hang::container::TIMESCALE)?,
+			)
+			.map_err(Error::InvalidSubtitle)?
+			.into(),
+		};
+		self.producer.write(crate::container::Frame {
+			timestamp,
+			duration: Some(duration),
+			keyframe: true,
+			payload,
+		})?;
+		self.producer.cut(None)?;
 		Ok(())
 	}
 }
@@ -131,7 +127,7 @@ fn vtt(header: &str, mut data: &[u8], start: Timestamp, end: Timestamp) -> crate
 	let mut output = header.to_string();
 	while !data.is_empty() {
 		let atom = Any::decode_maybe(&mut data)
-			.map_err(Error::from)?
+			.map_err(Error::mp4)?
 			.ok_or(Error::InvalidSubtitle("truncated WebVTT sample box"))?;
 		let Any::Unknown(kind, body) = atom else {
 			return Err(Error::InvalidSubtitle("unsupported WebVTT sample box").into());
@@ -146,7 +142,7 @@ fn vtt(header: &str, mut data: &[u8], start: Timestamp, end: Timestamp) -> crate
 				let mut origin = None;
 				while !body.is_empty() {
 					let atom = Any::decode_maybe(&mut body)
-						.map_err(Error::from)?
+						.map_err(Error::mp4)?
 						.ok_or(Error::InvalidSubtitle("truncated WebVTT cue box"))?;
 					let Any::Unknown(kind, value) = atom else {
 						return Err(Error::InvalidSubtitle("unsupported WebVTT cue box").into());

@@ -17,11 +17,13 @@
 //! The cuvid parser is driven synchronously: callbacks (sequence / decode /
 //! display) fire inside `cuvidParseVideoData` on the calling thread. Each access
 //! unit uses `CUVID_PKT_ENDOFPICTURE`, and an explicit end-of-stream packet drains
-//! any pictures the display queue still holds. Timestamps are threaded through
+//! any pictures the display queue still holds. A parser decodes nothing after
+//! end-of-stream, so each drain replaces it. Timestamps are threaded through
 //! the parser (`ulClockRate` is set to microseconds), so output frames keep
 //! correct presentation times even across reordering.
 
 use core::ffi::{c_int, c_uint, c_ulong, c_ulonglong, c_void};
+use std::collections::VecDeque;
 use std::ptr;
 use std::sync::Arc;
 
@@ -37,23 +39,25 @@ use moq_nvenc::sys::nvcuvid::{
 	CUVIDEOFORMAT, CUVIDPARSERDISPINFO, CUVIDPARSERPARAMS, CUVIDSOURCEDATAPACKET, CUvideopacketflags, CUvideoparser,
 };
 
-use super::{Backend, Codec};
+use super::{Backend, Codec, Stream};
 use crate::frame::{Surface, cuda};
 use crate::{Error, Frame};
 
 pub(crate) const NAME: &str = "nvdec";
 
 fn codec_err(msg: String) -> Error {
-	Error::Codec(anyhow::anyhow!(msg))
+	Error::codec(anyhow::anyhow!(msg))
 }
 
 pub(crate) struct Nvdec {
-	parser: CUvideoparser,
+	/// `None` once a drain could not replace it: the decoder has failed for good.
+	parser: Option<CUvideoparser>,
+	codec: cudaVideoCodec,
 	/// Boxed so its address is stable: the parser holds a raw pointer to it for
 	/// the lifetime of the parser (callbacks dereference it during parse).
 	state: Box<State>,
-	/// Mark the first access unit after a drain as a new parser epoch.
-	discontinuity: bool,
+	/// Pictures mapped and copied out, waiting for `receive`.
+	ready: VecDeque<Frame>,
 }
 
 /// State shared with the parser's C callbacks via the user-data pointer.
@@ -68,7 +72,7 @@ struct State {
 	ready: Vec<CUVIDPARSERDISPINFO>,
 	/// First error hit inside a callback; callbacks can only return an int, so
 	/// the error is surfaced by `decode` after the parse call.
-	error: Option<String>,
+	error: Option<Error>,
 }
 
 /// An open cuvid decoder plus the output geometry it was created for.
@@ -86,6 +90,9 @@ struct Decoder {
 	/// Output size: cuvid scales to this while writing the output surface.
 	width: u32,
 	height: u32,
+	/// Decode surfaces it was created with; the parser may index any of the
+	/// count it reports, so a larger requirement needs a new decoder.
+	surfaces: c_int,
 }
 
 impl Drop for Decoder {
@@ -101,7 +108,8 @@ impl Drop for Decoder {
 }
 
 impl Nvdec {
-	pub(crate) fn open(codec: Codec, config: &super::Config) -> Result<Box<dyn Backend>, Error> {
+	pub(crate) fn open(stream: &Stream, config: &super::Config) -> Result<Box<dyn Backend>, Error> {
+		let codec = stream.codec;
 		// cudarc panics when libcuda is missing, so probe it and turn a missing
 		// driver into a recoverable error; the cuvid table already loads fallibly.
 		if !driver_libs_present() {
@@ -121,6 +129,16 @@ impl Nvdec {
 		// `CudaContext::new` retains the device's primary context, the same one
 		// the NVENC backend uses, so frames pass between them without a copy.
 		let ctx = CudaContext::new(0).map_err(|e| codec_err(format!("CUDA init: {e:?}")))?;
+		ctx.bind_to_thread()
+			.map_err(|e| codec_err(format!("CUDA bind: {e:?}")))?;
+		// The decoder itself waits for the first sequence header, so ask now
+		// whether the GPU decodes the codec at all, at the one format this backend
+		// outputs and the size the description's SPS pins.
+		let coded = match stream.size {
+			Some(size) => Coded::AtLeast(size.width, size.height),
+			None => Coded::Unknown,
+		};
+		check_caps(api, cuda_codec, coded)?;
 
 		let mut state = Box::new(State {
 			api,
@@ -131,41 +149,19 @@ impl Nvdec {
 			error: None,
 		});
 
-		let mut params = CUVIDPARSERPARAMS {
-			CodecType: cuda_codec,
-			// Placeholder until the sequence callback reports the real minimum.
-			ulMaxNumDecodeSurfaces: 1,
-			// Packet timestamps are in microseconds (default is a 10 MHz clock).
-			ulClockRate: 1_000_000,
-			// Emit each picture as soon as it decodes (live path, no lookahead).
-			ulMaxDisplayDelay: 0,
-			pUserData: &mut *state as *mut State as *mut c_void,
-			pfnSequenceCallback: Some(sequence_callback),
-			pfnDecodePicture: Some(decode_callback),
-			pfnDisplayPicture: Some(display_callback),
-			..Default::default()
-		};
-
-		let mut parser: CUvideoparser = ptr::null_mut();
-		// SAFETY: params points at a fully-initialized struct and outlives the
-		// call; the user-data pointer stays valid because `state` is boxed and
-		// owned by the returned backend alongside the parser.
-		let result = unsafe { (api.create_video_parser)(&mut parser, &mut params) };
-		if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-			return Err(codec_err(format!("cuvidCreateVideoParser: {result:?}")));
-		}
-
+		let parser = create_parser(cuda_codec, &mut state)?;
 		tracing::info!(decoder = NAME, codec = ?codec, resize = ?config.scale_hint, "opened video decoder");
 		Ok(Box::new(Self {
-			parser,
+			parser: Some(parser),
+			codec: cuda_codec,
 			state,
-			discontinuity: false,
+			ready: VecDeque::new(),
 		}))
 	}
 
-	/// Submit one parser packet and copy every picture its display callback made
-	/// ready before returning.
-	fn parse(&mut self, packet: &mut CUVIDSOURCEDATAPACKET) -> Result<Vec<Frame>, Error> {
+	/// Submit one parser packet and queue a copy of every picture its display
+	/// callback made ready before returning.
+	fn parse(&mut self, packet: &mut CUVIDSOURCEDATAPACKET) -> Result<(), Error> {
 		// Parser callbacks and the map/copy below all need the CUDA context current
 		// on this thread.
 		self.state
@@ -173,46 +169,63 @@ impl Nvdec {
 			.bind_to_thread()
 			.map_err(|e| codec_err(format!("CUDA bind: {e:?}")))?;
 
+		let parser = self
+			.parser
+			.ok_or_else(|| Error::CodecGone("NVDEC parser replacement failed after a drain".into()))?;
 		// SAFETY: parser and packet are valid. A non-null payload is owned by the
 		// caller for the duration of this synchronous call.
-		let result = unsafe { (self.state.api.parse_video_data)(self.parser, packet) };
+		let result = unsafe { (self.state.api.parse_video_data)(parser, packet) };
 		if let Some(error) = self.state.error.take() {
 			self.state.ready.clear();
-			return Err(codec_err(error));
+			return Err(error);
 		}
 		if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
 			self.state.ready.clear();
 			return Err(codec_err(format!("cuvidParseVideoData: {result:?}")));
 		}
 
-		let ready = std::mem::take(&mut self.state.ready);
-		ready.iter().map(|disp| self.state.map_frame(disp)).collect()
+		// Taken out and put back so the callback's buffer keeps its capacity.
+		let mut displayed = std::mem::take(&mut self.state.ready);
+		// A failed map discards this parse's pictures so an error never precedes them.
+		let queued = self.ready.len();
+		let mapped = displayed.iter().try_for_each(|disp| {
+			self.ready.push_back(self.state.map_frame(disp)?);
+			Ok(())
+		});
+		displayed.clear();
+		self.state.ready = displayed;
+		if mapped.is_err() {
+			self.ready.truncate(queued);
+		}
+		mapped
 	}
 }
 
 impl Backend for Nvdec {
-	fn decode(&mut self, access_unit: Bytes, timestamp: Timestamp, _keyframe: bool) -> Result<Vec<Frame>, Error> {
-		let mut flags = (CUvideopacketflags::CUVID_PKT_TIMESTAMP as c_ulong)
-			| (CUvideopacketflags::CUVID_PKT_ENDOFPICTURE as c_ulong);
-		if self.discontinuity {
-			flags |= CUvideopacketflags::CUVID_PKT_DISCONTINUITY as c_ulong;
-		}
+	fn decode(&mut self, access_unit: Bytes, timestamp: Timestamp, _keyframe: bool) -> Result<(), Error> {
 		let mut packet = CUVIDSOURCEDATAPACKET {
 			// ENDOFPICTURE: each payload is one complete access unit, so the
 			// parser sees the picture boundary without waiting for the next AU.
-			flags,
+			flags: (CUvideopacketflags::CUVID_PKT_TIMESTAMP as c_ulong)
+				| (CUvideopacketflags::CUVID_PKT_ENDOFPICTURE as c_ulong),
 			payload_size: access_unit.len() as c_ulong,
 			payload: access_unit.as_ptr(),
 			// cuvid's clock rate is microseconds (set at parser creation).
 			timestamp: timestamp.as_micros() as i64,
 		};
 
-		let frames = self.parse(&mut packet)?;
-		self.discontinuity = false;
-		Ok(frames)
+		self.parse(&mut packet)
 	}
 
-	fn flush(&mut self) -> Result<Vec<Frame>, Error> {
+	fn receive(&mut self) -> Result<Option<Frame>, Error> {
+		Ok(self.ready.pop_front())
+	}
+
+	fn flush(&mut self) -> Result<(), Error> {
+		if self.parser.is_none() {
+			// A failed replacement ended the session; never install another parser.
+			return Err(Error::CodecGone("NVDEC parser replacement failed after a drain".into()));
+		}
 		let mut packet = CUVIDSOURCEDATAPACKET {
 			// NVIDIA requires an explicit EOS packet to release every picture still
 			// waiting in display order, even with zero display delay.
@@ -221,9 +234,16 @@ impl Backend for Nvdec {
 			payload: ptr::null(),
 			timestamp: 0,
 		};
-		let frames = self.parse(&mut packet)?;
-		self.discontinuity = true;
-		Ok(frames)
+		let parsed = self.parse(&mut packet);
+		// Past end-of-stream the parser accepts data but never decodes it again
+		// (CUVID_PKT_DISCONTINUITY does not reopen it), so whatever the drain did,
+		// the next access unit goes to a new parser. The cuvid decoder is kept: the
+		// new parser's sequence callback reuses it while the format holds.
+		self.destroy_parser();
+		let parser = create_parser(self.codec, &mut self.state)
+			.map_err(|err| Error::CodecGone(format!("NVDEC parser replacement: {err}")))?;
+		self.parser = Some(parser);
+		parsed
 	}
 
 	fn name(&self) -> &str {
@@ -231,54 +251,73 @@ impl Backend for Nvdec {
 	}
 }
 
-impl Drop for Nvdec {
-	fn drop(&mut self) {
+impl Nvdec {
+	fn destroy_parser(&mut self) {
+		let Some(parser) = self.parser.take() else { return };
 		// Drop may run on a different thread than decode; destroying the parser
 		// needs the context current (the decoder binds its own).
 		let _ = self.state.ctx.bind_to_thread();
 		// SAFETY: the parser is valid and no parse call is in flight (&mut self).
-		unsafe { (self.state.api.destroy_video_parser)(self.parser) };
+		unsafe { (self.state.api.destroy_video_parser)(parser) };
 	}
+}
+
+impl Drop for Nvdec {
+	fn drop(&mut self) {
+		self.destroy_parser();
+	}
+}
+
+/// A parser for `codec` whose callbacks feed `state`.
+fn create_parser(codec: cudaVideoCodec, state: &mut State) -> Result<CUvideoparser, Error> {
+	let api = state.api;
+	let mut params = CUVIDPARSERPARAMS {
+		CodecType: codec,
+		// Placeholder until the sequence callback reports the real minimum.
+		ulMaxNumDecodeSurfaces: 1,
+		// Packet timestamps are in microseconds (default is a 10 MHz clock).
+		ulClockRate: 1_000_000,
+		// Emit each picture as soon as it decodes (live path, no lookahead).
+		ulMaxDisplayDelay: 0,
+		pUserData: ptr::from_mut(state).cast(),
+		pfnSequenceCallback: Some(sequence_callback),
+		pfnDecodePicture: Some(decode_callback),
+		pfnDisplayPicture: Some(display_callback),
+		..Default::default()
+	};
+
+	let mut parser: CUvideoparser = ptr::null_mut();
+	// SAFETY: params points at a fully-initialized struct and outlives the call;
+	// the user-data pointer stays valid because `state` is boxed and owned by the
+	// backend alongside the parser.
+	let result = unsafe { (api.create_video_parser)(&mut parser, &mut params) };
+	if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+		return Err(codec_err(format!("cuvidCreateVideoParser: {result:?}")));
+	}
+	Ok(parser)
 }
 
 impl State {
 	/// Sequence callback body: (re)create the decoder for the reported format.
 	/// Returns the decode-surface count the parser should allocate for.
-	fn on_sequence(&mut self, format: &CUVIDEOFORMAT) -> Result<c_int, String> {
+	fn on_sequence(&mut self, format: &CUVIDEOFORMAT) -> Result<c_int, Error> {
 		if format.chroma_format != cudaVideoChromaFormat::cudaVideoChromaFormat_420 {
-			return Err(format!("unsupported chroma format {:?}", format.chroma_format));
+			return Err(Error::UnsupportedCodec(format!(
+				"{NAME} decodes 4:2:0 only, not {:?}",
+				format.chroma_format
+			)));
 		}
 		if format.bit_depth_luma_minus8 != 0 || format.bit_depth_chroma_minus8 != 0 {
-			return Err(format!(
-				"unsupported bit depth {} (only 8-bit is supported)",
+			return Err(Error::UnsupportedCodec(format!(
+				"{NAME} decodes 8-bit only, not {}-bit",
 				format.bit_depth_luma_minus8 + 8
-			));
+			)));
 		}
-
-		let mut caps = CUVIDDECODECAPS {
-			eCodecType: format.codec,
-			eChromaFormat: format.chroma_format,
-			nBitDepthMinus8: 0,
-			..Default::default()
-		};
-		// SAFETY: caps is fully initialized and the CUDA context is current (the
-		// callback runs inside `decode`, which binds it).
-		let result = unsafe { (self.api.get_decoder_caps)(&mut caps) };
-		if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-			return Err(format!("cuvidGetDecoderCaps: {result:?}"));
-		}
-		if caps.bIsSupported == 0 {
-			return Err(format!("this GPU cannot decode {:?}", format.codec));
-		}
-		if caps.nOutputFormatMask & (1 << cudaVideoSurfaceFormat::cudaVideoSurfaceFormat_NV12 as u16) == 0 {
-			return Err("this GPU cannot output NV12".into());
-		}
-		if format.coded_width > caps.nMaxWidth || format.coded_height > caps.nMaxHeight {
-			return Err(format!(
-				"{}x{} exceeds this GPU's {}x{} decode limit",
-				format.coded_width, format.coded_height, caps.nMaxWidth, caps.nMaxHeight
-			));
-		}
+		check_caps(
+			self.api,
+			format.codec,
+			Coded::Exact(format.coded_width, format.coded_height),
+		)?;
 
 		// Output size: the requested resize, or the display area (the coded size
 		// minus cropping). Rounded down to even for NV12.
@@ -305,8 +344,10 @@ impl State {
 			&& decoder.coded == coded
 			&& decoder.display_area == display_area
 			&& (decoder.width, decoder.height) == (width, height)
+			&& decoder.surfaces >= surfaces
 		{
-			return Ok(surfaces);
+			// The parser indexes up to this count, so report what was allocated.
+			return Ok(decoder.surfaces);
 		}
 		self.decoder = None;
 
@@ -343,7 +384,7 @@ impl State {
 		// SAFETY: info is fully initialized and the CUDA context is current.
 		let result = unsafe { (self.api.create_decoder)(&mut handle, &mut info) };
 		if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-			return Err(format!("cuvidCreateDecoder: {result:?}"));
+			return Err(codec_err(format!("cuvidCreateDecoder: {result:?}")));
 		}
 
 		tracing::debug!(
@@ -362,6 +403,7 @@ impl State {
 			display_area,
 			width,
 			height,
+			surfaces,
 		});
 		Ok(surfaces)
 	}
@@ -420,6 +462,63 @@ impl State {
 	}
 }
 
+/// What [`check_caps`] knows of the coded size.
+enum Coded {
+	/// Nothing yet: no size pinned before the first sequence header.
+	Unknown,
+	/// At least this size: the catalog's, which may be cropped below the
+	/// macroblock-aligned coded size, so only a maximum it exceeds is certain.
+	AtLeast(u32, u32),
+	/// A sequence header's macroblock-aligned coded size.
+	Exact(u32, u32),
+}
+
+/// Ask the GPU whether it decodes `codec` as 8-bit 4:2:0 into NV12, the one
+/// format this backend handles, at the `coded` size as far as it is known.
+///
+/// A no is [`Error::UnsupportedCodec`]: the device answered, and no retry here
+/// changes its answer. The CUDA context must be current.
+fn check_caps(api: &cuvid::Api, codec: cudaVideoCodec, coded: Coded) -> Result<(), Error> {
+	let mut caps = CUVIDDECODECAPS {
+		eCodecType: codec,
+		eChromaFormat: cudaVideoChromaFormat::cudaVideoChromaFormat_420,
+		nBitDepthMinus8: 0,
+		..Default::default()
+	};
+	// SAFETY: caps is fully initialized and the caller made the context current.
+	let result = unsafe { (api.get_decoder_caps)(&mut caps) };
+	if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+		return Err(codec_err(format!("cuvidGetDecoderCaps: {result:?}")));
+	}
+	if caps.bIsSupported == 0 {
+		return Err(Error::UnsupportedCodec(format!("this GPU cannot decode {codec:?}")));
+	}
+	if caps.nOutputFormatMask & (1 << cudaVideoSurfaceFormat::cudaVideoSurfaceFormat_NV12 as u16) == 0 {
+		return Err(Error::UnsupportedCodec(format!(
+			"this GPU cannot output {codec:?} as NV12"
+		)));
+	}
+	let (width, height, exact) = match coded {
+		Coded::Unknown => return Ok(()),
+		Coded::AtLeast(width, height) => (width, height, false),
+		Coded::Exact(width, height) => (width, height, true),
+	};
+	// cuviddec.h's limit: CodedWidth*CodedHeight/256 <= nMaxMBCount. A cropped
+	// size only undercounts, so a refusal on it still holds.
+	let macroblocks = u64::from(width) * u64::from(height) / 256;
+	let too_large = width > caps.nMaxWidth || height > caps.nMaxHeight || macroblocks > u64::from(caps.nMaxMBCount);
+	// The coded size can exceed a cropped one, so only an exact size is
+	// certainly below the minimum.
+	let too_small = exact && (width < u32::from(caps.nMinWidth) || height < u32::from(caps.nMinHeight));
+	if too_large || too_small {
+		return Err(Error::UnsupportedCodec(format!(
+			"{width}x{height} is outside this GPU's {codec:?} decode range ({}x{} to {}x{}, {} macroblocks)",
+			caps.nMinWidth, caps.nMinHeight, caps.nMaxWidth, caps.nMaxHeight, caps.nMaxMBCount
+		)));
+	}
+	Ok(())
+}
+
 /// Sequence callback: a new (or repeated) sequence header. Returns the number of
 /// decode surfaces the parser should assume, or 0 on failure.
 unsafe extern "C" fn sequence_callback(user: *mut c_void, format: *mut CUVIDEOFORMAT) -> c_int {
@@ -444,13 +543,15 @@ unsafe extern "C" fn decode_callback(user: *mut c_void, pic: *mut CUVIDPICPARAMS
 	let Some(decoder) = &state.decoder else {
 		state
 			.error
-			.get_or_insert("decode callback fired before a decoder exists".into());
+			.get_or_insert_with(|| codec_err("decode callback fired before a decoder exists".into()));
 		return 0;
 	};
 	// SAFETY: the decoder handle is valid and `pic` comes straight from cuvid.
 	let result = unsafe { (state.api.decode_picture)(decoder.handle, pic) };
 	if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-		state.error.get_or_insert(format!("cuvidDecodePicture: {result:?}"));
+		state
+			.error
+			.get_or_insert_with(|| codec_err(format!("cuvidDecodePicture: {result:?}")));
 		return 0;
 	}
 	1
@@ -502,7 +603,35 @@ mod tests {
 		if hw_available() {
 			return;
 		}
-		assert!(Nvdec::open(Codec::H264, &decode_config(None)).is_err());
+		assert!(Nvdec::open(&Codec::H264.into(), &decode_config(None)).is_err());
+	}
+
+	/// A GPU that can't decode a stream says so, which is the stream's refusal
+	/// rather than a fault: a size past every NVDEC's range, and each codec this
+	/// backend takes either opening or being refused (AV1 before Ampere).
+	#[test]
+	fn the_gpu_refuses_what_it_cannot_decode() {
+		if !hw_available() {
+			return;
+		}
+
+		let oversized = Stream {
+			size: Some(crate::Size::new(16384, 16384)),
+			..Codec::H264.into()
+		};
+		match Nvdec::open(&oversized, &decode_config(None)) {
+			Err(Error::UnsupportedCodec(reason)) => assert!(reason.contains("decode range"), "{reason}"),
+			Err(other) => panic!("expected a refusal, got {other:?}"),
+			Ok(_) => panic!("opened a 16384x16384 H.264 decoder"),
+		}
+
+		for codec in [Codec::H264, Codec::H265, Codec::Av1] {
+			match Nvdec::open(&codec.into(), &decode_config(None)) {
+				Ok(_) => {}
+				Err(Error::UnsupportedCodec(reason)) => assert!(reason.contains("cannot decode"), "{reason}"),
+				Err(other) => panic!("{codec:?} faulted on a working driver: {other:?}"),
+			}
+		}
 	}
 
 	fn decode_config(scale_hint: Option<crate::Size>) -> DecodeConfig {
@@ -551,19 +680,64 @@ mod tests {
 			if i == 0 {
 				encoder.cut().unwrap();
 			}
-			for encoded in encoder.encode(&gradient_frame(&rgba, w, h, i)).unwrap() {
-				for decoded in decoder.decode(encoded.payload, encoded.timestamp, i == 0).unwrap() {
+			for encoded in encoder.encode_all(&gradient_frame(&rgba, w, h, i)).unwrap() {
+				for decoded in decoder.decode_all(encoded.payload, encoded.timestamp, i == 0).unwrap() {
 					let i420 = decoded.surface.to_i420().unwrap().into_owned();
 					out.push((decoded.timestamp.as_micros() as u64, i420));
 				}
 			}
 		}
-		for decoded in decoder.flush().unwrap() {
+		for decoded in decoder.flush_all().unwrap() {
 			let i420 = decoded.surface.to_i420().unwrap().into_owned();
 			out.push((decoded.timestamp.as_micros() as u64, i420));
 		}
 		assert!(!out.is_empty(), "NVDEC produced no frames");
 		out
+	}
+
+	/// The transcode feed drains at every group end, so a drain must leave the
+	/// decoder decoding the next keyframe and everything behind it.
+	#[test]
+	fn nvdec_decodes_after_a_flush() {
+		if !hw_available() {
+			return;
+		}
+		let (w, h) = (320u32, 240u32);
+		let mut encoder = Encoder::new(&EncodeConfig {
+			kind: EncodeKind::Software,
+			..EncodeConfig::new(w, h, crate::FrameRate::new(30, 1).unwrap())
+		})
+		.unwrap();
+		let mut decoder = Nvdec::open(&Codec::H264.into(), &decode_config(None)).expect("NVDEC H.264 decoder");
+		let rgba = gradient_rgba(w, h);
+
+		let mut decoded = Vec::new();
+		for group in 0..3u64 {
+			let mut timestamps = Vec::new();
+			encoder.cut().unwrap();
+			for i in 0..10u64 {
+				for encoded in encoder
+					.encode_all(&gradient_frame(&rgba, w, h, group * 10 + i))
+					.unwrap()
+				{
+					let frames = decoder.decode_all(encoded.payload, encoded.timestamp, i == 0).unwrap();
+					timestamps.extend(frames.iter().map(|frame| frame.timestamp.as_micros() as u64));
+				}
+			}
+			let frames = decoder.flush_all().unwrap();
+			timestamps.extend(frames.iter().map(|frame| frame.timestamp.as_micros() as u64));
+			// A second flush lands on a parser that has seen no packet yet.
+			assert!(
+				decoder.flush_all().unwrap().is_empty(),
+				"a repeated flush hands back nothing"
+			);
+			decoded.push(timestamps);
+		}
+
+		for (group, timestamps) in decoded.iter().enumerate() {
+			let expected: Vec<u64> = (0..10).map(|i| (group as u64 * 10 + i) * 33_333).collect();
+			assert_eq!(timestamps, &expected, "group {group} after {group} flushes");
+		}
 	}
 
 	/// H.264 through the real hardware: openh264 encodes a gradient (Annex-B,
@@ -578,10 +752,10 @@ mod tests {
 		let (w, h) = (320u32, 240u32);
 		let encoder = Encoder::new(&EncodeConfig {
 			kind: EncodeKind::Software,
-			..EncodeConfig::new(w, h, crate::Rate::new(30, 1).unwrap())
+			..EncodeConfig::new(w, h, crate::FrameRate::new(30, 1).unwrap())
 		})
 		.unwrap();
-		let decoder = Nvdec::open(Codec::H264, &decode_config(None)).expect("NVDEC H.264 decoder");
+		let decoder = Nvdec::open(&Codec::H264.into(), &decode_config(None)).expect("NVDEC H.264 decoder");
 
 		let expected = I420::from_rgba(&gradient_rgba(w, h), w * 4, crate::Size::new(w, h)).unwrap();
 		let decoded = round_trip(encoder, decoder, w, h);
@@ -607,11 +781,11 @@ mod tests {
 		let (w, h) = (320u32, 240u32);
 		let encoder = Encoder::new(&EncodeConfig {
 			kind: EncodeKind::Software,
-			..EncodeConfig::new(w, h, crate::Rate::new(30, 1).unwrap())
+			..EncodeConfig::new(w, h, crate::FrameRate::new(30, 1).unwrap())
 		})
 		.unwrap();
-		let decoder =
-			Nvdec::open(Codec::H264, &decode_config(Some(crate::Size::new(160, 120)))).expect("NVDEC H.264 decoder");
+		let decoder = Nvdec::open(&Codec::H264.into(), &decode_config(Some(crate::Size::new(160, 120))))
+			.expect("NVDEC H.264 decoder");
 
 		// Nearest-neighbor reference downscale of the expected picture.
 		let full = I420::from_rgba(&gradient_rgba(w, h), w * 4, crate::Size::new(w, h)).unwrap();
@@ -641,12 +815,12 @@ mod tests {
 		let Ok(encoder) = Encoder::new(&EncodeConfig {
 			codec: EncodeCodec::H265,
 			kind: EncodeKind::Named("nvenc".into()),
-			..EncodeConfig::new(w, h, crate::Rate::new(30, 1).unwrap())
+			..EncodeConfig::new(w, h, crate::FrameRate::new(30, 1).unwrap())
 		}) else {
 			// Driver present but NVENC unusable (e.g. GPU busy); don't fail.
 			return;
 		};
-		let decoder = Nvdec::open(Codec::H265, &decode_config(None)).expect("NVDEC H.265 decoder");
+		let decoder = Nvdec::open(&Codec::H265.into(), &decode_config(None)).expect("NVDEC H.265 decoder");
 
 		let expected = I420::from_rgba(&gradient_rgba(w, h), w * 4, crate::Size::new(w, h)).unwrap();
 		let decoded = round_trip(encoder, decoder, w, h);
@@ -671,16 +845,16 @@ mod tests {
 		// Source stream: software-encoded gradient.
 		let source = Encoder::new(&EncodeConfig {
 			kind: EncodeKind::Software,
-			..EncodeConfig::new(w, h, crate::Rate::new(30, 1).unwrap())
+			..EncodeConfig::new(w, h, crate::FrameRate::new(30, 1).unwrap())
 		})
 		.unwrap();
 		// Decode at half size so the hardware scaler is in the loop too.
 		let decoder =
-			Nvdec::open(Codec::H264, &decode_config(Some(crate::Size::new(160, 120)))).expect("NVDEC decoder");
+			Nvdec::open(&Codec::H264.into(), &decode_config(Some(crate::Size::new(160, 120)))).expect("NVDEC decoder");
 
 		let mut nvenc = Encoder::new(&EncodeConfig {
 			kind: EncodeKind::Named("nvenc".into()),
-			..EncodeConfig::new(160, 120, crate::Rate::new(30, 1).unwrap())
+			..EncodeConfig::new(160, 120, crate::FrameRate::new(30, 1).unwrap())
 		})
 		.expect("NVENC encoder");
 
@@ -694,8 +868,8 @@ mod tests {
 				if i == 0 {
 					source.cut().unwrap();
 				}
-				for encoded in source.encode(&gradient_frame(&rgba, w, h, i)).unwrap() {
-					frames.extend(decoder.decode(encoded.payload, encoded.timestamp, i == 0).unwrap());
+				for encoded in source.encode_all(&gradient_frame(&rgba, w, h, i)).unwrap() {
+					frames.extend(decoder.decode_all(encoded.payload, encoded.timestamp, i == 0).unwrap());
 				}
 			}
 			frames
@@ -711,9 +885,9 @@ mod tests {
 			if i == 0 {
 				nvenc.cut().unwrap();
 			}
-			packets.extend(nvenc.encode(&out).unwrap());
+			packets.extend(nvenc.encode_all(&out).unwrap());
 		}
-		packets.extend(nvenc.finish().unwrap());
+		packets.extend(nvenc.flush_all().unwrap());
 		assert!(!packets.is_empty(), "NVENC produced no packets from CUDA frames");
 
 		// Decode the re-encoded stream in software and compare to the source.
@@ -728,7 +902,7 @@ mod tests {
 			y
 		};
 		let mut check = crate::decode::backend::open(
-			crate::decode::backend::Codec::H264,
+			&crate::decode::backend::Codec::H264.into(),
 			&DecodeConfig {
 				kind: DecodeKind::Software,
 				..DecodeConfig::new()
@@ -737,7 +911,7 @@ mod tests {
 		.unwrap();
 		let mut last = None;
 		for (i, encoded) in packets.into_iter().enumerate() {
-			for out in check.decode(encoded.payload, encoded.timestamp, i == 0).unwrap() {
+			for out in check.decode_all(encoded.payload, encoded.timestamp, i == 0).unwrap() {
 				last = Some(out.surface.to_i420().unwrap().into_owned());
 			}
 		}

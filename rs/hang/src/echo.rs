@@ -61,10 +61,6 @@ pub struct Rendition {
 	/// The newest media timestamp received and its arrival wall time.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub arrival: Option<Arrival>,
-	/// Latest playout latency.
-	#[serde_as(as = "Option<Millis>")]
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub latency: Option<Duration>,
 }
 
 /// The newest received media timestamp paired with its arrival wall time.
@@ -77,12 +73,12 @@ pub struct Arrival {
 	pub timestamp: moq_net::Timestamp,
 	/// The arrival wall time, encoded in milliseconds since the MoQ epoch.
 	#[serde_as(as = "crate::snapshot::Wall")]
-	pub wall: std::time::SystemTime,
+	pub wall: kio::clock::Wall,
 }
 
 impl Arrival {
 	/// Pair a received media timestamp with the wall time it arrived.
-	pub fn new(timestamp: moq_net::Timestamp, wall: std::time::SystemTime) -> Self {
+	pub fn new(timestamp: moq_net::Timestamp, wall: kio::clock::Wall) -> Self {
 		Self { timestamp, wall }
 	}
 }

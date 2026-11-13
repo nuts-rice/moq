@@ -4,10 +4,10 @@
 //! capture is intentionally forbidden there. An X11 session does expose stable
 //! monitor and window ids, so this backend enumerates them with RandR and pulls
 //! pixels through MIT-SHM, falling back to `GetImage` without local shared
-//! memory. It is also the fallback when the `pipewire` feature is disabled
-//! on an X11 desktop.
+//! memory. It is the only Linux backend for `Source::Display`, so a display
+//! that X11 cannot reach is refused rather than handed to the portal.
 
-use moq_clock::Instant;
+use kio::clock::Instant;
 use std::os::fd::AsRawFd;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -34,8 +34,8 @@ use crate::frame::{I420, Surface};
 const DEFAULT_FRAMERATE: u32 = 30;
 
 /// Whether a display selector belongs to X11. A desktop without Wayland also
-/// selects X11 by default, making it the no-portal fallback.
-pub(super) fn selected(selector: Option<&str>) -> bool {
+/// selects X11 by default.
+fn selected(selector: Option<&str>) -> bool {
 	selects_x11(selector, std::env::var_os("WAYLAND_DISPLAY").is_some())
 }
 
@@ -118,9 +118,12 @@ pub(super) fn windows() -> Result<Vec<Window>, Error> {
 
 pub(super) async fn open_display(config: &Config, selector: Option<&str>) -> Result<Stream, Error> {
 	if !selected(selector) {
-		return Err(Error::Unsupported(
-			"screen capture on Wayland without the `pipewire` feature".to_string(),
-		));
+		let display = selector.map_or("the main display".to_string(), |selector| {
+			format!("display {selector:?}")
+		});
+		return Err(Error::Unsupported(format!(
+			"{display} on Wayland; only XWayland `x11:` displays are capturable by id, and the system portal picker chooses Wayland screens"
+		)));
 	}
 	let selector = selector.map(|selector| parse_selector(selector, "x11:")).transpose()?;
 	open(config, Target::Display(selector)).await
@@ -181,7 +184,7 @@ struct Capture {
 	shm: Option<SharedMemory>,
 	rgb: Vec<u8>,
 	observed: Observed,
-	framerate: crate::Rate,
+	framerate: crate::FrameRate,
 	interval: Duration,
 	next: Instant,
 	name: String,
@@ -288,7 +291,7 @@ impl Capture {
 		let format = PixelFormat::new(connection.setup(), depth, visual)?;
 		let shm = SharedMemory::open(connection.clone(), format.required_len(width, height)?)?;
 		tracing::debug!(source = %name, shared_memory = shm.is_some(), "X11 capture opened");
-		let framerate = config.framerate.unwrap_or(crate::Rate::integer(DEFAULT_FRAMERATE));
+		let framerate = config.framerate.unwrap_or(crate::FrameRate::integer(DEFAULT_FRAMERATE));
 		let interval = Duration::from_secs_f64(1.0 / framerate.as_f64());
 		let cursor = config.cursor
 			&& connection
@@ -327,11 +330,13 @@ impl Capture {
 	fn read(&mut self) -> Result<pump::Read, Error> {
 		let now = Instant::now();
 		if self.next > now {
-			// The capture thread runs outside any runtime, so it blocks on the host clock.
-			#[allow(clippy::disallowed_methods)]
+			#[expect(
+				clippy::disallowed_methods,
+				reason = "the capture thread runs outside any runtime, so it blocks on the host clock"
+			)]
 			std::thread::sleep(self.next - now);
 		}
-		self.next = Instant::now() + self.interval;
+		self.next = Instant::now().saturating_add(self.interval);
 		// The encoder's geometry is fixed at open, so a settled change ends the
 		// stream and the caller reopens against the new size.
 		match self.settled()? {
@@ -340,9 +345,9 @@ impl Capture {
 			Settled::Changed => return Ok(pump::Read::Done),
 		}
 
-		let width = u16::try_from(self.width).map_err(|_| Error::Codec(anyhow::anyhow!("X11 width is too large")))?;
+		let width = u16::try_from(self.width).map_err(|_| Error::codec(anyhow::anyhow!("X11 width is too large")))?;
 		let height =
-			u16::try_from(self.height).map_err(|_| Error::Codec(anyhow::anyhow!("X11 height is too large")))?;
+			u16::try_from(self.height).map_err(|_| Error::codec(anyhow::anyhow!("X11 height is too large")))?;
 		if let Err(error) = self.capture_image(width, height) {
 			// A resize can land after the state check but before the image request.
 			// The reply has queued the preceding events; only a confirmed source
@@ -819,9 +824,9 @@ impl PixelFormat {
 			.flat_map(|screen| &screen.allowed_depths)
 			.flat_map(|depth| &depth.visuals)
 			.find(|visual| visual.visual_id == visual_id)
-			.ok_or_else(|| Error::Codec(anyhow::anyhow!("X11 root visual is missing")))?;
+			.ok_or_else(|| Error::codec(anyhow::anyhow!("X11 root visual is missing")))?;
 		if visual.class != VisualClass::TRUE_COLOR {
-			return Err(Error::Codec(anyhow::anyhow!(
+			return Err(Error::codec(anyhow::anyhow!(
 				"unsupported X11 visual class: {:?}",
 				visual.class
 			)));
@@ -830,7 +835,7 @@ impl PixelFormat {
 			.pixmap_formats
 			.iter()
 			.find(|format| format.depth == depth)
-			.ok_or_else(|| Error::Codec(anyhow::anyhow!("X11 pixel format for depth {depth} is missing")))?;
+			.ok_or_else(|| Error::codec(anyhow::anyhow!("X11 pixel format for depth {depth} is missing")))?;
 		Ok(Self {
 			byte_order: setup.image_byte_order,
 			bits_per_pixel: format.bits_per_pixel,
@@ -867,7 +872,7 @@ impl PixelFormat {
 		let stride = self.stride(width)?;
 		let required = self.required_len(width, height)?;
 		if data.len() < required {
-			return Err(Error::Codec(anyhow::anyhow!(
+			return Err(Error::codec(anyhow::anyhow!(
 				"short X11 frame: got {} bytes, need {required}",
 				data.len()
 			)));
@@ -952,7 +957,7 @@ fn wm_class(value: &str) -> String {
 }
 
 fn codec(error: impl std::fmt::Display) -> Error {
-	Error::Codec(anyhow::anyhow!("X11: {error}"))
+	Error::codec(anyhow::anyhow!("X11: {error}"))
 }
 
 fn source(error: impl std::fmt::Display) -> Error {
@@ -1026,6 +1031,8 @@ mod tests {
 		assert!(is_available(true, true));
 		assert!(!selects_x11(None, true));
 		assert!(selects_x11(Some("x11:0"), true));
+		// A non-X11 id under Wayland is refused, never handed to the portal picker.
+		assert!(!selects_x11(Some("0"), true));
 	}
 
 	#[test]
@@ -1104,7 +1111,7 @@ mod tests {
 		observed.event(&configure(7, 800, 600), 7);
 		assert_eq!(settle.observe(&observed, now), Settled::Waiting);
 		assert_eq!(
-			settle.observe(&observed, now + super::super::settle::HOLD),
+			settle.observe(&observed, now.saturating_add(super::super::settle::HOLD)),
 			Settled::Changed
 		);
 		observed.event(&configure(7, 640, 480), 7);

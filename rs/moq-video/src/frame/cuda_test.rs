@@ -92,10 +92,10 @@ fn nal_types(annexb: &[u8]) -> Vec<u8> {
 }
 
 fn nvenc(size: Size, color: Color) -> crate::encode::Encoder {
-	let mut config = crate::encode::Config::new(size.width, size.height, crate::Rate::new(30, 1).unwrap());
+	let mut config = crate::encode::Config::new(size.width, size.height, crate::FrameRate::new(30, 1).unwrap());
 	config.kind = crate::encode::Kind::Named("nvenc".into());
 	config.color = Some(color);
-	config.gop = crate::encode::Gop::Keyframe { interval: 30 };
+	config.join = std::time::Duration::from_secs(1);
 	crate::encode::Encoder::new(&config).expect("open NVENC")
 }
 
@@ -211,7 +211,7 @@ async fn vulkan_cuda_convert_resize_encode() {
 		kind: crate::decode::Kind::Software,
 		..crate::decode::Config::new()
 	};
-	let mut decoder = crate::decode::backend::open(crate::decode::backend::Codec::H264, &decode).unwrap();
+	let mut decoder = crate::decode::backend::open(&crate::decode::backend::Codec::H264.into(), &decode).unwrap();
 	let mut decoded = None;
 	let mut sd_packets = 0;
 	let mut expected = None;
@@ -248,7 +248,7 @@ async fn vulkan_cuda_convert_resize_encode() {
 			sd_encoder.cut().expect("NVENC cuts on request");
 		}
 		let packets = hd
-			.encode(&VideoFrame::new(Surface::Cuda(converted), timestamp))
+			.encode_all(&VideoFrame::new(Surface::Cuda(converted), timestamp))
 			.unwrap();
 		assert_eq!(packets.len(), 1, "one access unit per frame at {i}");
 		assert_eq!(packets[0].timestamp, timestamp, "timestamp preserved at {i}");
@@ -258,13 +258,16 @@ async fn vulkan_cuda_convert_resize_encode() {
 		if idr {
 			assert!(types.contains(&7) && types.contains(&8), "IDR at {i} lacks SPS/PPS");
 		}
-		for out in decoder.decode(packets[0].payload.clone(), timestamp, i == 0).unwrap() {
+		for out in decoder
+			.decode_all(packets[0].payload.clone(), timestamp, i == 0)
+			.unwrap()
+		{
 			decoded = Some(out.surface.to_i420().unwrap().into_owned());
 			expected = Some(reference(&gradient(size, Format::Rgba8, i as usize * 4), size, color));
 		}
 
 		let packets = sd_encoder
-			.encode(&VideoFrame::new(Surface::Cuda(scaled), timestamp))
+			.encode_all(&VideoFrame::new(Surface::Cuda(scaled), timestamp))
 			.unwrap();
 		assert_eq!(packets.len(), 1);
 		assert_eq!(packets[0].timestamp, timestamp);
@@ -314,7 +317,7 @@ struct Stage {
 
 impl Stage {
 	fn measure<T>(&mut self, f: impl FnOnce() -> T) -> T {
-		let (wall, cpu) = (std::time::Instant::now(), cpu_now());
+		let (wall, cpu) = (kio::clock::now(), cpu_now());
 		let out = f();
 		self.wall.push(wall.elapsed());
 		self.cpu.push(cpu_now() - cpu);
@@ -384,7 +387,7 @@ async fn vulkan_cuda_three_view_workload() {
 	let (mut encode_hd, mut encode_sd, mut complete) = (Stage::default(), Stage::default(), Stage::default());
 	let mut bytes = (0usize, 0usize);
 	let mut late = 0u64;
-	let mut started = std::time::Instant::now();
+	let mut started = kio::clock::now();
 
 	for tick_index in 0..WARMUP + TICKS {
 		// Discard the warmup: the first ticks pay for PTX JIT, NVENC's lazy
@@ -399,9 +402,9 @@ async fn vulkan_cuda_three_view_workload() {
 			complete = Stage::default();
 			bytes = (0, 0);
 			late = 0;
-			started = std::time::Instant::now();
+			started = kio::clock::now();
 		}
-		let deadline = std::time::Instant::now() + tick;
+		let deadline = kio::clock::now().saturating_add(tick);
 		let timestamp = moq_net::Timestamp::from_micros(tick_index * 33_333).unwrap();
 
 		for (producer, slot, hd, small, signal) in &mut views {
@@ -422,15 +425,15 @@ async fn vulkan_cuda_three_view_workload() {
 				.expect("resize");
 
 			let packets = encode_hd
-				.measure(|| hd.encode(&VideoFrame::new(Surface::Cuda(converted), timestamp)))
+				.measure(|| hd.encode_all(&VideoFrame::new(Surface::Cuda(converted), timestamp)))
 				.expect("encode HD");
 			bytes.0 += packets.iter().map(|p| p.payload.len()).sum::<usize>();
 			let packets = encode_sd
-				.measure(|| small.encode(&VideoFrame::new(Surface::Cuda(scaled), timestamp)))
+				.measure(|| small.encode_all(&VideoFrame::new(Surface::Cuda(scaled), timestamp)))
 				.expect("encode SD");
 			bytes.1 += packets.iter().map(|p| p.payload.len()).sum::<usize>();
 
-			let (wall, cpu) = (std::time::Instant::now(), cpu_now());
+			let (wall, cpu) = (kio::clock::now(), cpu_now());
 			let returned = completion.wait().await.expect("completion worker stopped");
 			complete.wall.push(wall.elapsed());
 			complete.cpu.push(cpu_now() - cpu);
@@ -443,8 +446,8 @@ async fn vulkan_cuda_three_view_workload() {
 			*slot = Some(returned);
 		}
 
-		match deadline.checked_duration_since(std::time::Instant::now()) {
-			Some(idle) => tokio::time::sleep(idle).await,
+		match deadline.checked_duration_since(kio::clock::now()) {
+			Some(idle) => kio::clock::sleep(idle).await,
 			None => late += 1,
 		}
 	}
@@ -541,7 +544,7 @@ async fn vulkan_cuda_auto_external_encode() {
 	};
 	let mut renditions = Vec::new();
 	for output in [size, Size::new(160, 96)] {
-		let mut config = crate::encode::Config::new(output.width, output.height, crate::Rate::new(30, 1).unwrap());
+		let mut config = crate::encode::Config::new(output.width, output.height, crate::FrameRate::new(30, 1).unwrap());
 		config.input = Some(device);
 		config.color = Some(color);
 		config
@@ -550,7 +553,7 @@ async fn vulkan_cuda_auto_external_encode() {
 			.expect("probe the declared input device before capture");
 		let encoder = crate::encode::Encoder::new(&config).expect("automatic external-image selection");
 		assert_eq!(encoder.name(), "nvenc");
-		let decoder = crate::decode::backend::open(crate::decode::backend::Codec::H264, &decode).unwrap();
+		let decoder = crate::decode::backend::open(&crate::decode::backend::Codec::H264.into(), &decode).unwrap();
 		renditions.push((encoder, decoder));
 	}
 
@@ -572,14 +575,14 @@ async fn vulkan_cuda_auto_external_encode() {
 				let output = encoder.size();
 				encoder.cut().unwrap();
 				let encoded = encoder
-					.encode(&frame)
+					.encode_all(&frame)
 					.expect("external image encoded entirely on the GPU");
 				assert_eq!(encoded.len(), 1, "one access unit for {output} capture {capture}");
 				let mut decoded = Vec::new();
 				for packet in encoded {
 					decoded.extend(
 						decoder
-							.decode(packet.payload, packet.timestamp, packet.keyframe)
+							.decode_all(packet.payload, packet.timestamp, packet.keyframe)
 							.unwrap(),
 					);
 				}

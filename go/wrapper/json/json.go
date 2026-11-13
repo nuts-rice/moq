@@ -1,10 +1,15 @@
 // Package json publishes and consumes JSON tracks, mirroring the moq-json crate.
 //
 // Each type wraps a track from package moq: a producer takes over a
-// [moq.TrackProducer] and advertises it in its broadcast's catalog, and a
-// consumer takes over a [moq.TrackConsumer] that has not read a group yet. The
-// track can come from a request as well as by name. Import it under an alias
-// next to encoding/json:
+// [moq.TrackProducer] (the snapshot and stream producers also advertise it in
+// their broadcast's catalog, which has no window mode), and a consumer takes
+// over a [moq.TrackConsumer] that has not read a group yet. The track can come
+// from a request as well as by name. Compression is the track's: publish JSON
+// with [moq.TrackInfo] Compression set, and a consumer reads it with no option of
+// its own. Every write (a snapshot update, a stream append, a window push or
+// pop) takes a timestamp on the broadcast clock, the epoch every track in the
+// broadcast shares (read it with media.CatalogProducer.Now), so the track needs
+// a [moq.TrackInfo] Timescale; one without is refused. Import it under an alias next to encoding/json:
 //
 //	import moqjson "moq.dev/moq/json"
 package json
@@ -12,49 +17,37 @@ package json
 import (
 	"context"
 	stdjson "encoding/json"
+	"fmt"
 	"iter"
-	"time"
 
 	"moq.dev/moq"
 	ffi "moq.dev/moq-ffi/moq"
 	"moq.dev/moq/internal/bridge"
 )
 
-// DefaultDeltaRatio is used when [SnapshotOptions.DeltaRatio] is nil. Go has no field
-// defaults, so unlike the other bindings this restates the `#[uniffi(default = 8)]` on
-// moq-ffi's MoqJsonSnapshotConfig (itself pinned to moq-json's default by a Rust test).
-const DefaultDeltaRatio uint32 = 8
-
 // SnapshotOptions configures a lossy latest-value JSON producer.
 type SnapshotOptions struct {
-	// DeltaRatio controls how aggressively deltas replace full snapshots. Nil uses
-	// [DefaultDeltaRatio]; a pointer to zero disables deltas entirely.
-	DeltaRatio *uint32
-	// Compression enables group-scoped DEFLATE and must match on the consumer.
-	Compression bool
+	// Deltas encodes updates as merge-patch deltas against the group's snapshot. Nil
+	// enables them, matching the other bindings; a pointer to false publishes every
+	// update as a full snapshot in its own group. With deltas on, give the track a
+	// refresh ratio so a joiner past it gets the value restated in a fresh group.
+	Deltas *bool
 }
 
-// deltaRatio resolves the configured ratio, falling back to the shared default.
-func (o SnapshotOptions) deltaRatio() uint32 {
-	if o.DeltaRatio == nil {
-		return DefaultDeltaRatio
-	}
-	return *o.DeltaRatio
+// deltas resolves the configured switch. Go has no field defaults, so this restates the
+// `#[uniffi(default = true)]` on moq-ffi's MoqJsonSnapshotConfig (itself pinned to
+// moq-json's default by a Rust test).
+func (o SnapshotOptions) deltas() bool {
+	return o.Deltas == nil || *o.Deltas
 }
 
-// StreamOptions configures a lossless append-log JSON producer.
-type StreamOptions struct {
-	// Compression enables group-scoped DEFLATE and must match on the consumer.
-	Compression bool
-}
-
-// ConsumerOptions configures reading either kind of JSON track.
-//
-// Delta encoding is a producer-side choice the consumer reconstructs automatically,
-// so only the compression setting has to match.
-type ConsumerOptions struct {
-	// Compression enables group-scoped DEFLATE and must match the producer.
-	Compression bool
+// WindowOptions configures a sliding-window JSON producer.
+type WindowOptions struct {
+	// CheckpointRecords bounds the records retained and restated when a group rolls,
+	// for a window that is never popped: a reader that keeps up still sees every
+	// record, while a later joiner gets a WindowEventSkip for the older ones. Nil restates
+	// the whole window; zero is refused.
+	CheckpointRecords *uint64
 }
 
 // SnapshotProducer publishes a JSON value as lossy latest state.
@@ -64,12 +57,13 @@ type SnapshotProducer struct {
 
 // NewSnapshotProducer publishes track as a lossy latest-value JSON track, advertised in
 // broadcast's catalog until it finishes. It takes over track, whose handle is closed
-// afterward, and fails if the catalog already carries the track's name.
+// afterward, and fails if the catalog already carries the track's name or track has no
+// timescale.
 func NewSnapshotProducer(broadcast *moq.BroadcastProducer, track *moq.TrackProducer, options SnapshotOptions) (*SnapshotProducer, error) {
 	inner, err := ffi.NewMoqJsonSnapshotProducer(
 		bridge.BroadcastProducer(broadcast),
 		bridge.TrackProducer(track),
-		ffi.MoqJsonSnapshotConfig{DeltaRatio: options.deltaRatio(), Compression: options.Compression},
+		ffi.MoqJsonSnapshotConfig{Deltas: options.deltas()},
 	)
 	if err != nil {
 		return nil, err
@@ -77,18 +71,14 @@ func NewSnapshotProducer(broadcast *moq.BroadcastProducer, track *moq.TrackProdu
 	return &SnapshotProducer{inner: inner}, nil
 }
 
-// Update publishes value at timestamp on the broadcast clock; nil is untimed.
+// Update publishes value at timestamp on the broadcast clock.
 // It is a no-op when unchanged.
-func (p *SnapshotProducer) Update(value any, timestamp *time.Duration) error {
+func (p *SnapshotProducer) Update(value any, timestamp moq.Timestamp) error {
 	encoded, err := stdjson.Marshal(value)
 	if err != nil {
 		return err
 	}
-	at, err := bridge.OptionalDuration(timestamp, "timestamp")
-	if err != nil {
-		return err
-	}
-	return p.inner.Update(string(encoded), at)
+	return p.inner.Update(string(encoded), timestamp)
 }
 
 // Demand returns a watch-only handle to whether the track has subscribers.
@@ -112,30 +102,23 @@ type StreamProducer struct {
 
 // NewStreamProducer publishes track as a lossless append-log JSON track, advertised in
 // broadcast's catalog until it finishes. It takes over track, whose handle is closed
-// afterward, and fails if the catalog already carries the track's name.
-func NewStreamProducer(broadcast *moq.BroadcastProducer, track *moq.TrackProducer, options StreamOptions) (*StreamProducer, error) {
-	inner, err := ffi.NewMoqJsonStreamProducer(
-		bridge.BroadcastProducer(broadcast),
-		bridge.TrackProducer(track),
-		ffi.MoqJsonStreamConfig{Compression: options.Compression},
-	)
+// afterward, and fails if the catalog already carries the track's name or track has no
+// timescale.
+func NewStreamProducer(broadcast *moq.BroadcastProducer, track *moq.TrackProducer) (*StreamProducer, error) {
+	inner, err := ffi.NewMoqJsonStreamProducer(bridge.BroadcastProducer(broadcast), bridge.TrackProducer(track))
 	if err != nil {
 		return nil, err
 	}
 	return &StreamProducer{inner: inner}, nil
 }
 
-// Append adds one JSON record at timestamp on the broadcast clock; nil is untimed.
-func (p *StreamProducer) Append(value any, timestamp *time.Duration) error {
+// Append adds one JSON record at timestamp on the broadcast clock.
+func (p *StreamProducer) Append(value any, timestamp moq.Timestamp) error {
 	encoded, err := stdjson.Marshal(value)
 	if err != nil {
 		return err
 	}
-	at, err := bridge.OptionalDuration(timestamp, "timestamp")
-	if err != nil {
-		return err
-	}
-	return p.inner.Append(string(encoded), at)
+	return p.inner.Append(string(encoded), timestamp)
 }
 
 // Demand returns a watch-only handle to whether the track has subscribers.
@@ -156,22 +139,15 @@ func (p *StreamProducer) Finish() error {
 type Timed struct {
 	// Value is the JSON document.
 	Value stdjson.RawMessage
-	// Timestamp is on the broadcast clock, or nil on an untimed track. It is rounded down
-	// to a whole microsecond, so a tick on a track like 90 kHz may not survive a read and
-	// republish exactly.
-	Timestamp *time.Duration
+	// Timestamp is on the broadcast clock, or nil on an untimed track.
+	Timestamp *moq.Timestamp
 }
 
 func timed(value *ffi.MoqJsonValue) *Timed {
 	if value == nil {
 		return nil
 	}
-	out := &Timed{Value: stdjson.RawMessage(value.Value)}
-	if value.TimestampUs != nil {
-		at := time.Duration(*value.TimestampUs) * time.Microsecond
-		out.Timestamp = &at
-	}
-	return out
+	return &Timed{Value: stdjson.RawMessage(value.Value), Timestamp: value.Timestamp}
 }
 
 // SnapshotConsumer receives each reconstructed JSON state.
@@ -179,38 +155,41 @@ type SnapshotConsumer struct {
 	inner *ffi.MoqJsonSnapshotConsumer
 }
 
-// NewSnapshotConsumer reads track as a lossy latest-value JSON track. It takes over
-// track, whose handle is closed afterward, and fails if track has already read a group.
-func NewSnapshotConsumer(track *moq.TrackConsumer, options ConsumerOptions) (*SnapshotConsumer, error) {
-	// DeltaRatio is producer-only; the consumer ignores it.
-	inner, err := ffi.NewMoqJsonSnapshotConsumer(
-		bridge.TrackConsumer(track),
-		ffi.MoqJsonSnapshotConfig{Compression: options.Compression},
-	)
+// SnapshotConsumerOptions configures a snapshot consumer's subscription.
+type SnapshotConsumerOptions struct {
+	// Priority is the subscription's delivery priority, higher first, as
+	// moq.Subscription.Priority.
+	Priority int8
+}
+
+// NewSnapshotConsumer subscribes to the track named name on broadcast and reads it as a
+// lossy latest-value JSON track. The consumer owns its subscription, at a zero Delay.Max
+// and the options' priority; a read waits for it to resolve and fails if it cannot.
+func NewSnapshotConsumer(broadcast *moq.BroadcastConsumer, name string, options SnapshotConsumerOptions) (*SnapshotConsumer, error) {
+	inner, err := ffi.NewMoqJsonSnapshotConsumer(bridge.BroadcastConsumer(broadcast), name, options.Priority)
 	if err != nil {
 		return nil, err
 	}
 	return &SnapshotConsumer{inner: inner}, nil
 }
 
-// Next returns the next state in order, or nil when the track ends. Groups older
-// than the subscription's MaxDelay are skipped, so a playhead reader sets that
-// budget to its distance behind live.
+// Next returns the next state in order, or nil when the track ends. It skips
+// every group a newer one supersedes.
 func (c *SnapshotConsumer) Next(ctx context.Context) (*Timed, error) {
-	value, err := bridge.Call(ctx, c.inner.Cancel, c.inner.Next)
+	value, err := bridge.Call(ctx, nil, c.inner.Next)
 	return timed(value), err
 }
 
 // Latest skips to the newest state, or waits for one; nil when the track ends.
 // Skipped states are gone, and Next continues after this one.
 func (c *SnapshotConsumer) Latest(ctx context.Context) (*Timed, error) {
-	value, err := bridge.Call(ctx, c.inner.Cancel, c.inner.Latest)
+	value, err := bridge.Call(ctx, nil, c.inner.Latest)
 	return timed(value), err
 }
 
 // All ranges over each JSON state until the track ends.
 func (c *SnapshotConsumer) All(ctx context.Context) iter.Seq2[*Timed, error] {
-	return bridge.Seq(ctx, c.Next)
+	return bridge.Seq(ctx, c.inner.Cancel, c.Next)
 }
 
 // Cancel stops current and future reads.
@@ -225,11 +204,8 @@ type StreamConsumer struct {
 
 // NewStreamConsumer reads track as a lossless append-log JSON track. It takes over
 // track, whose handle is closed afterward, and fails if track has already read a group.
-func NewStreamConsumer(track *moq.TrackConsumer, options ConsumerOptions) (*StreamConsumer, error) {
-	inner, err := ffi.NewMoqJsonStreamConsumer(
-		bridge.TrackConsumer(track),
-		ffi.MoqJsonStreamConfig{Compression: options.Compression},
-	)
+func NewStreamConsumer(track *moq.TrackConsumer) (*StreamConsumer, error) {
+	inner, err := ffi.NewMoqJsonStreamConsumer(bridge.TrackConsumer(track))
 	if err != nil {
 		return nil, err
 	}
@@ -238,16 +214,172 @@ func NewStreamConsumer(track *moq.TrackConsumer, options ConsumerOptions) (*Stre
 
 // Next returns the next JSON record, or nil when the track ends.
 func (c *StreamConsumer) Next(ctx context.Context) (*Timed, error) {
-	value, err := bridge.Call(ctx, c.inner.Cancel, c.inner.Next)
+	value, err := bridge.Call(ctx, nil, c.inner.Next)
 	return timed(value), err
 }
 
 // All ranges over every JSON record until the track ends.
 func (c *StreamConsumer) All(ctx context.Context) iter.Seq2[*Timed, error] {
-	return bridge.Seq(ctx, c.Next)
+	return bridge.Seq(ctx, c.inner.Cancel, c.Next)
 }
 
 // Cancel stops current and future reads.
 func (c *StreamConsumer) Cancel() {
+	c.inner.Cancel()
+}
+
+// WindowProducer publishes a sliding window of JSON records, pushed at the back
+// and popped from the front.
+type WindowProducer struct {
+	inner *ffi.MoqJsonWindowProducer
+}
+
+// NewWindowProducer publishes track as a JSON window track. The window rolls to
+// new groups that restate the records it retains, so a reader can join at any
+// point; give the track a refresh ratio so a joiner past it gets a fresh group.
+// It takes over track, whose handle is closed afterward, and fails if track has
+// no timescale. It is not advertised in the catalog, which has no window mode.
+func NewWindowProducer(track *moq.TrackProducer, options WindowOptions) (*WindowProducer, error) {
+	inner, err := ffi.NewMoqJsonWindowProducer(
+		bridge.TrackProducer(track),
+		ffi.MoqJsonWindowConfig{CheckpointRecords: options.CheckpointRecords},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &WindowProducer{inner: inner}, nil
+}
+
+// Push appends one JSON record at timestamp on the broadcast clock.
+func (p *WindowProducer) Push(value any, timestamp moq.Timestamp) error {
+	encoded, err := stdjson.Marshal(value)
+	if err != nil {
+		return err
+	}
+	return p.inner.Push(string(encoded), timestamp)
+}
+
+// Pop drops count records from the front of the window, clamped to what it holds,
+// at timestamp on the broadcast clock.
+func (p *WindowProducer) Pop(count uint64, timestamp moq.Timestamp) error {
+	return p.inner.Pop(count, timestamp)
+}
+
+// Cut closes the open group, so the next edit opens one restating the retained
+// window. It is a no-op when no group is open. Cut at a natural boundary, such as
+// the end of an utterance.
+func (p *WindowProducer) Cut() error {
+	return p.inner.Cut()
+}
+
+// Demand returns a watch-only handle to whether the track has subscribers.
+func (p *WindowProducer) Demand() (*moq.TrackDemand, error) {
+	inner, err := p.inner.Demand()
+	if err != nil {
+		return nil, err
+	}
+	return bridge.TrackDemand(inner).(*moq.TrackDemand), nil
+}
+
+// Finish closes the window track.
+func (p *WindowProducer) Finish() error {
+	return p.inner.Finish()
+}
+
+// WindowEvent is one change to a window: a WindowEventPush, WindowEventPop, or WindowEventSkip.
+type WindowEvent interface {
+	windowEvent()
+}
+
+// WindowEventPush is a record joining the window at its absolute index.
+type WindowEventPush struct {
+	// Index is the record's absolute index.
+	Index uint64
+	// Value is the JSON document.
+	Value stdjson.RawMessage
+}
+
+// WindowEventPop is the records in [Start, End) leaving the window.
+type WindowEventPop struct {
+	// Start is the first index popped.
+	Start uint64
+	// End is one past the last index popped.
+	End uint64
+}
+
+// WindowEventSkip is the records in [Start, End) that will never be delivered: they
+// were pushed and dropped while this reader was behind, or fell outside the
+// producer's checkpoint when it joined.
+type WindowEventSkip struct {
+	// Start is the first index skipped.
+	Start uint64
+	// End is one past the last index skipped.
+	End uint64
+}
+
+func (WindowEventPush) windowEvent() {}
+func (WindowEventPop) windowEvent()  {}
+func (WindowEventSkip) windowEvent() {}
+
+// WindowTimed is a window change and the timestamp of the frame that carried it.
+type WindowTimed struct {
+	// Event is the change to the window.
+	Event WindowEvent
+	// Timestamp is on the broadcast clock, or nil on an untimed track. A record
+	// first learned of from a group's restatement carries that frame's time, not
+	// its original push time.
+	Timestamp *moq.Timestamp
+}
+
+func windowTimed(value *ffi.MoqJsonWindowTimed) (*WindowTimed, error) {
+	if value == nil {
+		return nil, nil
+	}
+	out := &WindowTimed{Timestamp: value.Timestamp}
+	switch event := value.Event.(type) {
+	case ffi.MoqJsonWindowEventPush:
+		out.Event = WindowEventPush{Index: event.Index, Value: stdjson.RawMessage(event.Value)}
+	case ffi.MoqJsonWindowEventPop:
+		out.Event = WindowEventPop{Start: event.Start, End: event.End}
+	case ffi.MoqJsonWindowEventSkip:
+		out.Event = WindowEventSkip{Start: event.Start, End: event.End}
+	default:
+		return nil, fmt.Errorf("unknown window event: %T", event)
+	}
+	return out, nil
+}
+
+// WindowConsumer receives each change to a JSON window in order.
+type WindowConsumer struct {
+	inner *ffi.MoqJsonWindowConsumer
+}
+
+// NewWindowConsumer reads track as a JSON window track. It takes over track,
+// whose handle is closed afterward, and fails if track has already read a group.
+func NewWindowConsumer(track *moq.TrackConsumer) (*WindowConsumer, error) {
+	inner, err := ffi.NewMoqJsonWindowConsumer(bridge.TrackConsumer(track))
+	if err != nil {
+		return nil, err
+	}
+	return &WindowConsumer{inner: inner}, nil
+}
+
+// Next returns the next change to the window, or nil when the track ends. Group
+// rolls never surface.
+func (c *WindowConsumer) Next(ctx context.Context) (*WindowTimed, error) {
+	value, err := bridge.Call(ctx, nil, c.inner.Next)
+	if err != nil {
+		return nil, err
+	}
+	return windowTimed(value)
+}
+
+// All ranges over every change to the window until the track ends.
+func (c *WindowConsumer) All(ctx context.Context) iter.Seq2[*WindowTimed, error] {
+	return bridge.Seq(ctx, c.inner.Cancel, c.Next)
+}
+
+// Cancel stops current and future reads.
+func (c *WindowConsumer) Cancel() {
 	c.inner.Cancel()
 }

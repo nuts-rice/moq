@@ -17,7 +17,7 @@ async fn ts_surround_opus_decodes() {
 	let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default()).unwrap();
 	let mut import = moq_mux::container::ts::Import::new(broadcast, catalog.reserve());
 	import.decode(&data[..]).unwrap();
-	import.finish().unwrap();
+	let _finished = import.finish().unwrap();
 
 	let snapshot = catalog.snapshot();
 	let (name, config) = snapshot.audio.renditions.iter().next().expect("an Opus track");
@@ -25,7 +25,7 @@ async fn ts_surround_opus_decodes() {
 	let mut options = decode::Options::default();
 	options.output.format = Format::F32;
 	// The whole file is imported before anything decodes it.
-	options.max_delay = Duration::from_secs(30);
+	options.delay.max = Some(Duration::from_secs(30));
 	let mut consumer = decode::Consumer::new(&broadcast_consumer, config, name, options)
 		.await
 		.unwrap();
@@ -34,7 +34,7 @@ async fn ts_surround_opus_decodes() {
 	// Canonical 5.1 order: FL, FR, FC, LFE, SL, SR.
 	let mut energy = [0.0f64; 6];
 	let mut frames = 0;
-	while let Some(frame) = tokio::time::timeout(Duration::from_secs(5), next_frame(&mut consumer))
+	while let Some(frame) = kio::clock::timeout(Duration::from_secs(5), next_frame(&mut consumer))
 		.await
 		.expect("decoded frame timed out")
 		.unwrap()
@@ -66,8 +66,8 @@ async fn ts_surround_opus_decodes() {
 async fn next_frame(consumer: &mut decode::Consumer) -> Result<Option<moq_audio::Frame>, moq_audio::Error> {
 	loop {
 		match consumer.read().await? {
-			Some(decode::Read::Frame { frame, .. }) => return Ok(Some(frame)),
-			Some(decode::Read::End { .. }) => {}
+			Some(decode::Read::Frame(frame)) => return Ok(Some(frame)),
+			Some(decode::Read::Gap { .. } | decode::Read::End { .. }) => {}
 			None => return Ok(None),
 		}
 	}

@@ -1,15 +1,16 @@
-import type * as Epoch from "../epoch.ts";
 import { ProtocolViolation } from "../error.ts";
+import type * as Instance from "../instance.ts";
 import * as Path from "../path.ts";
 import type { Reader, Writer } from "../stream.ts";
 import { decodeError } from "../util/decode_error.ts";
-import { decodeEpoch, encodeEpoch } from "./epoch.ts";
+import { decodeNode, decodePin, encodeNode, encodePin } from "./instance.ts";
 import * as Message from "./message.ts";
 import { TrackInfo } from "./track.ts";
 import { hasTracks, type Version } from "./version.ts";
 
 const TRACKS_ADD = 0x0;
 const TRACKS_REMOVE = 0x1;
+const TRACKS_FINISH = 0x2;
 // The same event the announce stream marks its initial set with.
 const SYNCED = 0x4;
 
@@ -24,18 +25,22 @@ function guardTracks(version: Version) {
 export class Tracks {
 	broadcast: Path.Valid;
 	/** The publisher instance the subscriber expects. */
-	epoch?: Epoch.Valid;
+	instance?: Instance.Valid;
+	/** The origin node that serves the request, 0 for whichever the publisher selects. Lite-07+. */
+	node: bigint;
 
-	constructor(broadcast: Path.Valid, epoch?: Epoch.Valid) {
+	constructor(broadcast: Path.Valid, instance?: Instance.Valid, node = 0n) {
 		this.broadcast = broadcast;
-		this.epoch = epoch;
+		this.instance = instance;
+		this.node = node;
 	}
 
 	async encode(w: Writer, version: Version): Promise<void> {
 		guardTracks(version);
 		return Message.encode(w, async (w) => {
 			await w.string(Path.encode(this.broadcast));
-			await encodeEpoch(w, version, this.epoch);
+			await encodePin(w, version, this.instance);
+			await encodeNode(w, version, this.node);
 		});
 	}
 
@@ -43,19 +48,21 @@ export class Tracks {
 		guardTracks(version);
 		return Message.decode(r, async (r) => {
 			const broadcast = Path.decode(await r.string());
-			const epoch = await decodeEpoch(r, version);
-			return new Tracks(broadcast, epoch);
+			const instance = await decodePin(r, version);
+			return new Tracks(broadcast, instance, await decodeNode(r, version));
 		});
 	}
 }
 
 /**
  * One event the publisher sends on a Tracks Stream: TRACKS_ADD with the TRACK_INFO a Track
- * Stream would answer, TRACKS_REMOVE, or SYNCED once the listing's initial set was sent.
+ * Stream would answer, TRACKS_REMOVE for a track that left unfinished, TRACKS_FINISH for one that
+ * finished, or SYNCED once the listing's initial set was sent.
  */
 export type TracksEvent =
 	| { kind: "added"; name: string; info: TrackInfo }
 	| { kind: "removed"; name: string }
+	| { kind: "finished"; name: string }
 	| { kind: "synced" };
 
 /** Write one {@link TracksEvent}: its type, then its size-prefixed body. */
@@ -73,6 +80,8 @@ export async function encodeTracksEvent(w: Writer, event: TracksEvent, version: 
 			);
 		case "removed":
 			return Message.encode(w, (w) => w.string(event.name), { id: TRACKS_REMOVE });
+		case "finished":
+			return Message.encode(w, (w) => w.string(event.name), { id: TRACKS_FINISH });
 		case "synced":
 			return Message.encode(w, async () => {}, { id: SYNCED });
 	}
@@ -91,6 +100,8 @@ export async function decodeTracksEventMaybe(r: Reader, version: Version): Promi
 			});
 		case TRACKS_REMOVE:
 			return Message.decode(r, async (r) => ({ kind: "removed", name: await r.string() }));
+		case TRACKS_FINISH:
+			return Message.decode(r, async (r) => ({ kind: "finished", name: await r.string() }));
 		case SYNCED:
 			return Message.decode(r, async () => ({ kind: "synced" }));
 		default:

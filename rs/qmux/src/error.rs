@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use moq_net::transport::CloseKind;
-use moq_quic::{ConnectionError, TransportErrorCode};
+use moq_quic::{LimitsError, TransportErrorCode, connection::Error as ConnectionError};
 
 /// Errors that can occur during QMux session and stream operations.
 #[derive(Debug, thiserror::Error, Clone)]
@@ -54,6 +54,10 @@ pub enum Error {
 	#[error("invalid config: {0}")]
 	InvalidConfig(&'static str),
 
+	/// The flow-control limits are ones a peer would refuse.
+	#[error("invalid limits: {0}")]
+	Limits(#[from] LimitsError),
+
 	/// The peer opened more streams than it was allowed.
 	#[error("stream limit exceeded")]
 	StreamLimitExceeded,
@@ -94,10 +98,14 @@ pub enum Error {
 	#[error(transparent)]
 	Io(Arc<std::io::Error>),
 
+	/// This CPU lacks a feature that rind, MoQ's cryptography, requires.
+	#[error(transparent)]
+	UnsupportedCpu(#[from] moq_crypto::cpu::UnsupportedCpu),
+
 	/// The WebSocket failed.
 	#[cfg(feature = "ws")]
 	#[error(transparent)]
-	WebSocket(Arc<tokio_tungstenite::tungstenite::Error>),
+	WebSocket(WebSocketError),
 
 	/// Datagrams are disabled on this session, or the peer does not accept them.
 	#[error("datagrams not supported")]
@@ -106,19 +114,37 @@ pub enum Error {
 	/// The datagram exceeds [`max_datagram_size`](moq_net::transport::poll::Session::max_datagram_size).
 	#[error("datagram too large")]
 	DatagramTooLarge,
+
+	/// Incomplete messages filled the receive window and this stream ranked lowest, so its
+	/// buffered bytes were discarded to free it.
+	#[error("evicted")]
+	Evicted,
+
+	/// The receive window is below the given floor, moq-net's
+	/// [`MIN_RECEIVE_WINDOW`](moq_net::transport::MIN_RECEIVE_WINDOW).
+	#[error("receive_window must be at least {0} bytes to fit the largest message")]
+	ReceiveWindowTooSmall(u64),
+
+	/// A lease wanted more than the receive window can ever hold.
+	#[error("lease exceeds the receive window")]
+	LeaseTooLarge,
 }
 
 impl Error {
-	/// The terminal error for a connection that ended for `reason`, `established` or not
-	pub(crate) fn lost(reason: ConnectionError, established: bool) -> Self {
+	/// The terminal error for a connection that ended for `reason`
+	pub(crate) fn lost(reason: ConnectionError) -> Self {
 		match reason {
 			ConnectionError::ApplicationClosed(close) => Self::ConnectionClosed {
 				code: close.error_code.into_inner(),
-				reason: String::from_utf8_lossy(&close.reason).into_owned(),
+				reason: close.reason,
+			},
+			ConnectionError::LocallyClosed { code, reason } => Self::ConnectionClosed {
+				code: code.into_inner(),
+				reason,
 			},
 			ConnectionError::ConnectionClosed(close) => Self::ConnectionReset {
 				code: close.error_code.into(),
-				reason: String::from_utf8_lossy(&close.reason).into_owned(),
+				reason: close.reason,
 			},
 			ConnectionError::TransportError(err) => match err.code {
 				TransportErrorCode::FLOW_CONTROL_ERROR | TransportErrorCode::FINAL_SIZE_ERROR => Self::FlowControlError,
@@ -127,9 +153,8 @@ impl Error {
 				TransportErrorCode::STREAM_LIMIT_ERROR => Self::StreamLimitExceeded,
 				_ => Self::ProtocolViolation,
 			},
-			ConnectionError::TimedOut if established => Self::IdleTimeout,
-			ConnectionError::TimedOut => Self::HandshakeTimeout,
-			// A local close publishes its own code, so this is a close without one.
+			ConnectionError::TimedOut => Self::IdleTimeout,
+			ConnectionError::HandshakeTimeout => Self::HandshakeTimeout,
 			_ => Self::Closed,
 		}
 	}
@@ -143,16 +168,36 @@ impl From<std::io::Error> for Error {
 	}
 }
 
+/// A WebSocket failure, opaque so the WebSocket implementation is not part of this API.
 #[cfg(feature = "ws")]
-impl From<tokio_tungstenite::tungstenite::Error> for Error {
-	fn from(err: tokio_tungstenite::tungstenite::Error) -> Self {
+#[derive(Clone, Debug)]
+pub struct WebSocketError(Arc<tokio_tungstenite::tungstenite::Error>);
+
+#[cfg(feature = "ws")]
+impl std::fmt::Display for WebSocketError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		self.0.fmt(f)
+	}
+}
+
+#[cfg(feature = "ws")]
+impl std::error::Error for WebSocketError {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		self.0.source()
+	}
+}
+
+#[cfg(feature = "ws")]
+impl Error {
+	/// Classify a WebSocket failure.
+	pub(crate) fn websocket(err: tokio_tungstenite::tungstenite::Error) -> Self {
 		// A non-101 upgrade response carries the HTTP status; surface it as a
 		// distinct, transport-agnostic variant so callers can act on terminal
 		// rejections (e.g. auth) without downcasting tungstenite.
 		if let tokio_tungstenite::tungstenite::Error::Http(response) = &err {
 			return Self::Http(response.status().as_u16());
 		}
-		Self::WebSocket(Arc::new(err))
+		Self::WebSocket(WebSocketError(Arc::new(err)))
 	}
 }
 
@@ -161,6 +206,7 @@ impl moq_net::transport::Error for Error {
 		match self {
 			Self::IdleTimeout => CloseKind::IdleTimeout,
 			Self::Closed => CloseKind::Closed,
+			Self::Evicted => CloseKind::Evicted,
 			_ => CloseKind::Transport,
 		}
 	}
@@ -191,13 +237,13 @@ mod tests {
 			.status(http::StatusCode::UNAUTHORIZED)
 			.body(None::<Vec<u8>>)
 			.unwrap();
-		let err: Error = tungstenite::Error::Http(Box::new(response)).into();
+		let err = Error::websocket(tungstenite::Error::Http(Box::new(response)));
 		assert!(matches!(err, Error::Http(401)));
 	}
 
 	#[test]
 	fn non_http_preserves_source() {
-		let err: Error = tungstenite::Error::ConnectionClosed.into();
+		let err = Error::websocket(tungstenite::Error::ConnectionClosed);
 		assert!(matches!(err, Error::WebSocket(_)));
 	}
 }

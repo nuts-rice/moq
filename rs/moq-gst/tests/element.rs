@@ -37,10 +37,12 @@ fn track_error_of(sink: &gst::Element, pad: &str) -> Option<String> {
 
 /// A publisher pointed at a relay that cannot answer. Connect runs in the background, so the element
 /// still reaches PAUSED and creates its producers, which is all these tests need.
+/// A sink that closes its broadcast at the end of stream, for tests not about the linger.
 fn publisher() -> gst::Element {
 	gst::ElementFactory::make("moqsink")
 		.property("url", "https://127.0.0.1:1")
 		.property("broadcast", "test")
+		.property("linger", 0u64)
 		.build()
 		.expect("create moqsink")
 }
@@ -226,13 +228,12 @@ fn play_one_frame(sink: &gst::Element) -> gst::Pad {
 	pad
 }
 
-// Lingering is opt-in: by default the end of stream closes the broadcast and posts EOS at once, even
-// with media a late subscriber could still have drained.
+// With no linger, the end of stream closes the broadcast and posts EOS at once, even with media a
+// late subscriber could still have drained.
 #[test]
-fn published_media_posts_the_eos_at_once_by_default() {
+fn published_media_posts_the_eos_at_once_without_a_linger() {
 	init();
 	let sink = publisher();
-	assert!(!sink.property::<bool>("linger"));
 	let seen = recording_bus(&sink);
 	let pad = play_one_frame(&sink);
 
@@ -241,14 +242,14 @@ fn published_media_posts_the_eos_at_once_by_default() {
 	let _ = sink.set_state(gst::State::Null);
 }
 
-// With `linger`, published media is served until it is stale, so the EOS that ends `gst-launch` waits
-// for it. Stopping the pipeline is the interrupt: it closes the broadcast at once, and the run it ended
+// By default, published media is served for the linger, so the EOS that ends `gst-launch` waits for
+// it. Stopping the pipeline is the interrupt: it closes the broadcast at once, and the run it ended
 // owes no EOS.
 #[test]
 fn a_lingering_sink_holds_the_eos_until_the_pipeline_stops() {
 	init();
 	let sink = publisher();
-	sink.set_property("linger", true);
+	sink.set_property("linger", 30_000u64);
 	let seen = recording_bus(&sink);
 	let pad = play_one_frame(&sink);
 
@@ -588,13 +589,21 @@ fn sink_pads_are_named_through_child_proxy() {
 #[test]
 fn a_pipeline_description_names_the_track() {
 	init();
-	let sink = gst::parse::launch("moqsink name=publisher url=https://127.0.0.1:1 broadcast=test sink_0::track=camera")
-		.expect("parse the description");
+	let sink = gst::parse::launch(
+		"moqsink name=publisher url=https://127.0.0.1:1 broadcast=test \
+		 sink_0::track=camera sink_0::bandwidth-ceiling=4000000",
+	)
+	.expect("parse the description");
 	let _pad = sink.request_pad_simple("sink_0").expect("request sink_0");
 	assert_eq!(
 		child_of(&sink, "sink_0").property::<String>("track"),
 		"camera",
 		"sink_0::track reached the pad"
+	);
+	assert_eq!(
+		child_of(&sink, "sink_0").property::<u64>("bandwidth-ceiling"),
+		4_000_000,
+		"sink_0::bandwidth-ceiling reached the pad"
 	);
 }
 
@@ -619,20 +628,6 @@ fn a_pipeline_description_selects_loc() {
 	assert_eq!(
 		child_of(&sink, "sink_0").property::<gstmoq::MediaContainer>("container"),
 		gstmoq::MediaContainer::Loc
-	);
-}
-
-#[test]
-fn a_pipeline_description_marks_an_encoder_pad() {
-	init();
-	let sink = gst::parse::launch("moqsink name=publisher url=https://127.0.0.1:1 broadcast=test sink_0::encoder=true")
-		.expect("parse the description");
-	let _pad = sink.request_pad_simple("sink_0").expect("request sink_0");
-	assert!(child_of(&sink, "sink_0").property::<bool>("encoder"));
-	let _other = sink.request_pad_simple("sink_1").expect("request sink_1");
-	assert!(
-		!child_of(&sink, "sink_1").property::<bool>("encoder"),
-		"a pad is an import unless it says otherwise"
 	);
 }
 
@@ -1098,7 +1093,7 @@ fn a_pad_requested_from_the_eos_notify_is_refused() {
 }
 
 // A write that the producer rejects is the failure the property exists for. A frame past
-// MAX_CACHE_BYTES is the deterministic way to cause one: moq-net refuses it before reserving a group.
+// moq-net's 32 MiB frame bound is the deterministic way to cause one: moq-net refuses it before reserving a group.
 #[test]
 fn a_rejected_write_moves_the_pad_to_error() {
 	init();
@@ -1507,14 +1502,12 @@ fn missing_url_fails_state_change() {
 	let _ = sink.set_state(gst::State::Null);
 }
 
-// A connect that cannot succeed does NOT post a fatal ERROR: the sink reconnects with backoff
-// (issue #2212), so an unattended publisher survives a relay that is unreachable at startup or
-// during an outage instead of tearing down the pipeline. It keeps retrying and stays disconnected.
-// (A non-retryable failure, e.g. auth rejection, is still terminal; that path needs a live relay
-// and is covered separately.) The "relay" accepts each dial and hangs up at once, so the test
-// counts the retries rather than waiting out a window.
+// A first connect that reaches no session posts a fatal ERROR instead of retrying, so a
+// misconfigured relay URL, certificate, or version surfaces at once; a supervisor restarts the
+// pipeline once the relay is reachable. Reconnecting with backoff is only for a session that
+// once worked. The "relay" accepts each dial and hangs up at once.
 #[test]
-fn connect_failure_retries_without_erroring() {
+fn a_failed_first_connect_errors_without_retrying() {
 	init();
 	let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
 	let addr = listener.local_addr().expect("local address");
@@ -1540,31 +1533,33 @@ fn connect_failure_retries_without_erroring() {
 		pipeline.set_state(gst::State::Playing).is_ok(),
 		"a valid url + broadcast must let the Ready->Playing change start (connect runs in the background)"
 	);
-	// The first dial and a retry after it failed.
-	for _ in 0..2 {
-		dials
-			.recv_timeout(std::time::Duration::from_secs(30))
-			.expect("the sink stopped dialing");
-	}
 	let bus = pipeline.bus().expect("pipeline bus");
-	let msg = bus.pop_filtered(&[gst::MessageType::Error]);
+	let msg = bus.timed_pop_filtered(gst::ClockTime::from_seconds(30), &[gst::MessageType::Error]);
 	let connected = sink.property::<bool>("connected");
 	let status = sink.property::<gstmoq::ConnectionStatus>("status");
-	let send_bitrate = sink.property::<u64>("estimated-send-rate");
-	let recv_bitrate = sink.property::<u64>("estimated-recv-rate");
 	let _ = pipeline.set_state(gst::State::Null);
 
+	assert!(msg.is_some(), "a failed first connect must post an ERROR");
+	assert!(!connected);
+	assert_eq!(status, gstmoq::ConnectionStatus::Failed);
+	dials.recv().expect("the sink dialed");
 	assert!(
-		msg.is_none(),
-		"a failed connect must NOT post an ERROR: the sink retries (issue #2212)"
+		dials.try_recv().is_err(),
+		"the sink redialed after its first connect failed"
 	);
-	assert!(
-		!connected,
-		"a failed connect must leave connected = false while retrying"
-	);
-	// While retrying, status stays Disconnected (a transient retry, not the terminal Failed) and the
-	// bitrate estimates read 0.
-	assert_eq!(status, gstmoq::ConnectionStatus::Disconnected);
-	assert_eq!(send_bitrate, 0);
-	assert_eq!(recv_bitrate, 0);
+}
+
+// Both element factories expose the same connection syntax, and refuse unknown versions
+// before opening a transport rather than silently offering the defaults.
+#[test]
+fn parsed_connection_properties_are_shared_and_validated() {
+	init();
+	for factory in ["moqsink", "moqsrc"] {
+		let element = gst::parse::launch(&format!("{factory} url=https://127.0.0.1:1 broadcast=test connect-version=moq-lite-99 quic-idle-timeout=15000 quic-keep-alive=0"))
+			.expect("parse the shared property syntax");
+		assert_eq!(element.property::<u64>("quic-idle-timeout"), 15_000);
+		assert_eq!(element.property::<u64>("quic-keep-alive"), 0);
+		assert_eq!(element.set_state(gst::State::Paused), Err(gst::StateChangeError));
+		element.set_state(gst::State::Null).unwrap();
+	}
 }

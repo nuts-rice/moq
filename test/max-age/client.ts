@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { Milli } from "@moq/clock";
-import Session from "@moq/qmux";
+import { Duration } from "@moq/clock";
+import { Session } from "@moq/qmux";
 import { connect } from "../../js/net/src/connection/connect.ts";
 import { Producer } from "../../js/net/src/origin.ts";
 import * as Path from "../../js/net/src/path.ts";
@@ -12,11 +12,13 @@ const [address, protocol, mode] = process.argv.slice(2);
 if (!address || !protocol || !["publish", "subscribe"].includes(mode))
 	throw new Error("expected URL ALPN publish|subscribe");
 const origin = new Producer();
-const ages = [undefined, Milli(0), Milli(30_000)];
+// `null` is an explicit unlimited: an omitted max age is the zero authored default.
+const ages = [null, Duration.millis(0), Duration.millis(30_000)];
 if (mode === "publish") {
-	const broadcast = origin.createBroadcast(Path.from("age"));
+	const broadcastRoute = origin.route(Path.from("age"), { hidden: true });
+	const broadcast = broadcastRoute.broadcast;
 	for (const [i, maxAge] of ages.entries()) broadcast.createTrack(String(i), { maxAge });
-	broadcast.announce();
+	broadcastRoute.announce();
 }
 const url = new URL(address);
 const transport = new Session(url, {
@@ -38,7 +40,7 @@ try {
 		for (;;) {
 			const event = await announcements.next();
 			assert(event, "announcements closed");
-			if (event.kind === "start" && event.prefix === "age") break;
+			if (event.kind === "present" && event.prefix === "age") break;
 		}
 		const request = origin.consume().request(Path.from("age"));
 		let broadcast = request.active.peek();
@@ -46,7 +48,10 @@ try {
 		assert(broadcast);
 		for (const [i, age] of ages.entries()) {
 			const track = broadcast.track(String(i)).subscribe();
-			assert.equal((await track.info()).maxAge, age, `${protocol} track ${i}`);
+			// moq-transport never sends MAX_CACHE_DURATION (it would expire the newest group too),
+			// so only lite carries the publisher's limit.
+			const want = protocol.startsWith("moq-lite-") ? age?.asMillis() : undefined;
+			assert.equal((await track.info()).maxAge?.asMillis(), want, `${protocol} track ${i}`);
 			track.close();
 		}
 		request.close();

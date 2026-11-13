@@ -2,18 +2,18 @@
 
 //! A relay's front for a path ends once unread, end to end over real sessions.
 //!
-//! Two workers each claim the `pool` prefix with `origin::Producer::dynamic` and
+//! Two workers each claim the `pool` prefix with `origin::Producer::requests` and
 //! announce it to relay `R` on their own sessions, the way a transcode pool does. A
-//! viewer on `R` reads `pool/p` from worker `A`, which then closes that output and
-//! drains its claim. Nothing tells `R` the output closed, so only the front ending
-//! once unread lets the next viewer reach worker `B`, which wins the path now, rather
-//! than the drained worker.
+//! viewer on `R` reads `pool/p` from worker `A`, over the cheaper link, which then
+//! closes that output and drains its session. Nothing tells `R` the output closed, so
+//! only the front ending once unread lets the next viewer reach worker `B`, which wins
+//! the path now, rather than the drained worker.
 
 use crate::support;
 
 use std::{cell::RefCell, rc::Rc, time::Duration};
 
-use moq_net::{Hop, Timestamp, Version, broadcast, origin, track};
+use moq_net::{Timestamp, Version, goaway::Goaway, origin, track};
 use support::harness::{MockConnectOptions, MockPair, connect_mock};
 
 /// A millisecond track: the frames written here carry timestamps.
@@ -24,55 +24,56 @@ fn timed() -> moq_net::track::Info {
 const TEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 fn produce_origin(hop: u64) -> origin::Producer {
-	let (producer, driver) = origin::Producer::new(origin::Config::new(Hop::new(hop).unwrap()));
+	let (producer, driver) = origin::Producer::new(origin::Config::new(std::num::NonZeroU64::new(hop).unwrap()));
 	support::harness::spawn(driver);
-	producer
+	producer.with_proxy(true)
 }
 
-/// Have `to` pull everything `from` publishes.
-async fn link(version: Version, from: &origin::Producer, to: &origin::Producer) -> MockPair {
+/// Have `to` pull everything `from` publishes, over a link priced at `cost`.
+async fn link(version: Version, from: &origin::Producer, to: &origin::Producer, cost: u64) -> MockPair {
 	let mut options = MockConnectOptions::new(version);
 	options.server_publish = Some(from.consume());
 	options.client_subscribe = Some(to.clone());
+	options.cost = Some(cost);
 	connect_mock(options).await
 }
 
 /// Let every task settle. Time is paused, so this returns once the runtime is idle.
 async fn settle() {
-	moq_clock::sleep(Duration::from_millis(500)).await;
+	kio::clock::sleep(Duration::from_millis(500)).await;
 }
 
 /// A worker claiming `pool`, answering each request with an output whose `video`
 /// track carries the worker's name.
 struct Worker {
-	claim: Rc<origin::Dynamic>,
-	/// Each output with its track, which would end once its producer drops.
-	outputs: Rc<RefCell<Vec<(broadcast::Producer, track::Producer)>>>,
+	_claim: Rc<origin::Claim>,
+	/// Each output with its track, which would end once its route drops.
+	outputs: Rc<RefCell<Vec<(origin::Route, track::Producer)>>>,
 	origin: origin::Producer,
 }
 
 impl Worker {
-	fn new(hop: u64, name: &'static str, cost: u64) -> Self {
+	fn new(hop: u64, name: &'static str) -> Self {
 		let origin = produce_origin(hop);
-		let claim = Rc::new(
-			origin
-				.dynamic_route("pool", origin::Route::default().with_cost(cost))
-				.unwrap(),
-		);
+		let claim = Rc::new(origin.claim("pool", moq_net::origin::RouteOptions::default()).unwrap());
 		let outputs = Rc::new(RefCell::new(Vec::new()));
 		let (handler, served) = (claim.clone(), outputs.clone());
-		drop(moq_clock::sim::spawn(async move {
-			while let Ok(request) = handler.requested_broadcast().await {
-				let output = broadcast::Info::new().produce();
-				let track = output.create_track("video", timed()).unwrap();
+		drop(kio::clock::sim::spawn(async move {
+			while let Some(request) = handler.requested().await {
+				let prepared = request.route(moq_net::origin::RouteOptions::hidden()).unwrap();
+				let track = prepared.broadcast().create_track("video", timed()).unwrap();
 				let mut group = track.append_group().unwrap();
 				group.write_frame(Timestamp::ZERO, name.as_bytes().to_vec()).unwrap();
 				group.finish().unwrap();
-				request.accept(&output);
-				served.borrow_mut().push((output, track));
+				prepared.announce().unwrap();
+				served.borrow_mut().push((prepared, track));
 			}
 		}));
-		Self { claim, outputs, origin }
+		Self {
+			_claim: claim,
+			outputs,
+			origin,
+		}
 	}
 
 	/// How many outputs the worker was asked for.
@@ -81,9 +82,17 @@ impl Worker {
 	}
 }
 
-/// Read the first frame of `video` at `pool/p` through `relay`.
-async fn watch(relay: &origin::Producer) -> String {
-	let broadcast = relay.consume().request_broadcast("pool/p", None).await.unwrap();
+/// Read the first frame of `video` at `pool/p` through `relay`. On moq-lite-07 the answer's
+/// exact route carries the claim's instance, so the first subscription reads. Older wires
+/// mint an instance per announcement, so the answer resets the first subscription through
+/// the claim: they wake the worker first.
+async fn watch(version: Version, relay: &origin::Producer) -> String {
+	if version != "moq-lite-07-wip".parse().unwrap() {
+		let cold = relay.consume().request("pool/p", None).await.unwrap();
+		drop(cold.track("video").unwrap().subscribe(None).await);
+		settle().await;
+	}
+	let broadcast = relay.consume().request("pool/p", None).await.unwrap();
 	let mut subscription = broadcast.track("video").unwrap().subscribe(None).await.unwrap();
 	let mut group = subscription.recv_group().await.unwrap().expect("a group");
 	let frame = group.read_frame().await.unwrap().expect("a frame");
@@ -93,25 +102,26 @@ async fn watch(relay: &origin::Producer) -> String {
 async fn drained_claim(version: &str) {
 	let version: Version = version.parse().unwrap();
 	let relay = produce_origin(3);
-	let a = Worker::new(1, "a", 0);
-	let b = Worker::new(2, "b", 10);
-	let _a = link(version, &a.origin, &relay).await;
-	let _b = link(version, &b.origin, &relay).await;
+	let a = Worker::new(1, "a");
+	let b = Worker::new(2, "b");
+	let a_link = link(version, &a.origin, &relay, 1).await;
+	let _b = link(version, &b.origin, &relay, 10).await;
 	settle().await;
 
-	assert_eq!(watch(&relay).await, "a", "{version}");
+	assert_eq!(watch(version, &relay).await, "a", "{version}");
 
-	// A closes its output and drains its claim, so B wins the path from here on.
-	a.outputs.borrow().iter().for_each(|(output, _)| output.close());
-	a.claim
-		.update_route(a.claim.route().with_cost(origin::Cost::DRAIN))
-		.unwrap();
+	// A closes its output and drains its session, so B wins the path from here on.
+	a.outputs
+		.borrow()
+		.iter()
+		.for_each(|(output, _)| output.broadcast().close());
+	a_link.server.drain().send(Goaway::new()).unwrap();
 	// Past the linger, which is as long as the cache window, nothing reads the relay's
 	// front for the path.
-	moq_clock::sleep(moq_net::cache::DEFAULT_EXPIRY * 2).await;
+	kio::clock::sleep(moq_net::cache::DEFAULT_EXPIRY * 2).await;
 
 	assert_eq!(
-		watch(&relay).await,
+		watch(version, &relay).await,
 		"b",
 		"{version}: the relay kept the drained worker's front"
 	);
@@ -119,16 +129,16 @@ async fn drained_claim(version: &str) {
 	assert_eq!(b.served(), 1, "{version}");
 }
 
-#[moq_clock::test]
+#[kio::test]
 async fn a_drained_claims_front_ends_once_unread_lite06() {
-	moq_clock::timeout(TEST_TIMEOUT, drained_claim("moq-lite-06"))
+	kio::clock::timeout(TEST_TIMEOUT, drained_claim("moq-lite-06"))
 		.await
 		.expect("timed out");
 }
 
-#[moq_clock::test]
+#[kio::test]
 async fn a_drained_claims_front_ends_once_unread_lite07() {
-	moq_clock::timeout(TEST_TIMEOUT, drained_claim("moq-lite-07-wip"))
+	kio::clock::timeout(TEST_TIMEOUT, drained_claim("moq-lite-07-wip"))
 		.await
 		.expect("timed out");
 }

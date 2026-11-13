@@ -7,12 +7,16 @@
 //!
 //! The media tasks need the decoders, so they stay behind `play`, but they
 //! reach the devices only through `output`: tests drive them against a
-//! recorder (`fake`), and `just rs play` runs those on every PR that reaches
-//! this crate.
+//! recorder (`fake`), and the merge gate's test build turns `play` on for every
+//! PR that reaches this crate.
 
-// With `play` off the event loop is gone and nothing calls the modules below.
-// They are still compiled and tested, which is the point.
-#![cfg_attr(not(feature = "play"), allow(dead_code))]
+#![cfg_attr(
+	not(feature = "play"),
+	allow(
+		dead_code,
+		reason = "with `play` off the event loop is gone and nothing calls the modules below. They are still compiled and tested, which is the point"
+	)
+)]
 
 mod args;
 mod buffer;
@@ -40,12 +44,12 @@ pub use args::Args;
 /// Play a broadcast through a window or an audio-only speaker.
 #[cfg(feature = "play")]
 pub async fn run(
-	origin: hang::moq_net::origin::Consumer,
+	origin: moq_net::origin::Consumer,
 	broadcast: String,
 	args: Args,
 	network: tokio::task::JoinSet<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
-	if args.select.no_video {
+	if args.select.video == Some(crate::subscribe::Mode::Off) {
 		headless::run(origin, broadcast, args, network).await
 	} else {
 		window::run(origin, broadcast, args, network)

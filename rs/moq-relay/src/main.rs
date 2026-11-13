@@ -2,11 +2,11 @@ use moq_relay::{Config, Relay};
 
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
-static ALLOC: moq_tokio::jemalloc::tikv_jemallocator::Jemalloc = moq_tokio::jemalloc::tikv_jemallocator::Jemalloc;
+static ALLOC: moq_tokio::jemalloc::Allocator = moq_tokio::jemalloc::Allocator;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-	moq_tokio::crypto::install_default().expect("failed to install default crypto provider");
+	moq_tokio::crypto::install_default()?;
 
 	// The whole startup sequence lives in `Relay::load` rather than here, so an
 	// embedder gets it by calling one function instead of copying this file.

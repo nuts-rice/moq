@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
-use hang::moq_net::origin;
+use moq_net::origin;
 use tokio::sync::{Notify, mpsc};
 
 use moq_audio::playback::Observer;
@@ -13,8 +13,9 @@ use super::args::Args;
 use super::media::Media;
 use super::metrics::Metrics;
 use super::output::Output;
-use super::timeline::Presentation;
+use super::timeline::Playhead;
 use super::window::Event;
+use moq_mux::sync::Producer as Presentation;
 
 /// The speaker and the run loop's events, plus `--metrics`' observer feed.
 #[derive(Clone)]
@@ -37,6 +38,11 @@ impl Output for Headless {
 	fn send(&self, event: Event) {
 		let _ = self.events.send(event);
 	}
+
+	/// Never asked: headless playback decodes no video.
+	async fn render(&self) -> moq_video::Output {
+		moq_video::Output::Cpu
+	}
 }
 
 pub(crate) async fn run(
@@ -46,10 +52,11 @@ pub(crate) async fn run(
 	mut network: tokio::task::JoinSet<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
 	let (events, mut received) = mpsc::unbounded_channel();
-	let presentation = Arc::new(Mutex::new(Presentation::new(args.video_delay())));
+	let presentation = Presentation::new(args.video_delay());
+	let playhead = Playhead::default();
 	let (mut metrics, observe) = match &args.metrics {
 		Some(path) => {
-			let (metrics, observe) = Metrics::create(path, presentation.clone())?;
+			let (metrics, observe) = Metrics::create(path, presentation.consume(), playhead.clone())?;
 			(Some(metrics), Some(observe))
 		}
 		None => (None, None),
@@ -60,6 +67,7 @@ pub(crate) async fn run(
 			origin,
 			broadcast,
 			presentation,
+			playhead,
 			args,
 			video: Arc::new(Mutex::new(VecDeque::new())),
 			drained: Arc::new(Notify::new()),
@@ -78,6 +86,16 @@ pub(crate) async fn run(
 				Some(Event::Wake) => {}
 				Some(Event::Ended | Event::Finished) => break Ok(()),
 				Some(Event::Failed(error)) => break Err(anyhow::anyhow!(error)),
+				Some(Event::Utterance(timestamp)) => {
+					if let Some(metrics) = &mut metrics {
+						metrics.utterance(timestamp);
+					}
+				}
+				Some(Event::Trimmed { audio, skip }) => {
+					if let Some(metrics) = &mut metrics {
+						metrics.trimmed(audio, skip);
+					}
+				}
 				None => break Err(anyhow::anyhow!("audio playback event channel closed")),
 			},
 			result = &mut media, if !completed => {
@@ -126,9 +144,14 @@ mod tests {
 		let args = Args {
 			catalog_format: None,
 			metrics: None,
+			#[cfg(all(target_os = "linux", feature = "vaapi"))]
+			vaapi_device: None,
+			#[cfg(all(target_os = "linux", feature = "v4l2"))]
+			v4l2_decoder: None,
 			delay: super::super::args::Delay::Auto,
+			stretch: std::time::Duration::from_secs(2).into(),
 			select: crate::subscribe::SelectArgs {
-				no_video: true,
+				video: Some(crate::subscribe::Mode::Off),
 				..Default::default()
 			},
 		};
@@ -141,7 +164,7 @@ mod tests {
 
 	/// A run that ends still writes its final sample, with nothing it could not
 	/// measure filled in.
-	#[tokio::test]
+	#[tokio::test(start_paused = true)]
 	async fn metrics_write_a_final_sample() {
 		let dir = tempfile::tempdir().unwrap();
 		let path = dir.path().join("play.ndjson");
@@ -149,9 +172,14 @@ mod tests {
 		let args = Args {
 			catalog_format: None,
 			metrics: Some(path.clone()),
+			#[cfg(all(target_os = "linux", feature = "vaapi"))]
+			vaapi_device: None,
+			#[cfg(all(target_os = "linux", feature = "v4l2"))]
+			v4l2_decoder: None,
 			delay: super::super::args::Delay::Auto,
+			stretch: std::time::Duration::from_secs(2).into(),
 			select: crate::subscribe::SelectArgs {
-				no_video: true,
+				video: Some(crate::subscribe::Mode::Off),
 				..Default::default()
 			},
 		};
@@ -175,9 +203,14 @@ mod tests {
 		let args = Args {
 			catalog_format: None,
 			metrics: None,
+			#[cfg(all(target_os = "linux", feature = "vaapi"))]
+			vaapi_device: None,
+			#[cfg(all(target_os = "linux", feature = "v4l2"))]
+			v4l2_decoder: None,
 			delay: super::super::args::Delay::Auto,
+			stretch: std::time::Duration::from_secs(2).into(),
 			select: crate::subscribe::SelectArgs {
-				no_video: true,
+				video: Some(crate::subscribe::Mode::Off),
 				..Default::default()
 			},
 		};

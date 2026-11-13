@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::error::MoqError;
-use crate::ffi::Task;
+use crate::ffi::{OneShot, Task};
 use crate::origin::MoqOriginProducer;
 use crate::session::{MoqQuicConfig, MoqSession};
 
@@ -28,6 +28,10 @@ pub struct MoqServerConfig {
 	/// QUIC transport tuning.
 	#[uniffi(default)]
 	pub quic: MoqQuicConfig,
+	/// Your own `name/version` product tokens, space-separated, advertised in SETUP ahead of
+	/// moq-ffi's, as [`MoqClientConfig::implementation`](crate::session::MoqClientConfig::implementation) does.
+	#[uniffi(default = None)]
+	pub implementation: Option<String>,
 	/// The origin whose broadcasts are served to incoming sessions.
 	///
 	/// With neither `publish` nor `consume` set, each session's two sides share one fresh
@@ -55,39 +59,53 @@ pub struct MoqServerTls {
 	pub generate: Vec<String>,
 }
 
-struct ServerState {
+/// What a server's configuration resolves to, fixed at construction.
+struct Settings {
 	config: moq_tokio::listen::Config,
 	quic: moq_tokio::quic::Config,
+}
+
+/// The origins served to incoming sessions, held until the server is cancelled.
+#[derive(Clone)]
+struct Origins {
 	publish: Option<Arc<MoqOriginProducer>>,
 	consume: Option<Arc<MoqOriginProducer>>,
-	/// Set by `listen`, to the requests the accept loop has taken from the listener.
-	requests: Option<Requests>,
 }
 
-struct Requests {
-	driver: crate::ffi::Background,
-	queue: tokio::sync::mpsc::Receiver<moq_tokio::server::Request>,
-	certificates: moq_tokio::tls::Certificates,
+/// Where a server is in its lifecycle.
+enum Phase {
+	/// Nothing bound yet, or the last bind failed.
+	Idle(Origins),
+	/// `listen` started the accept loop.
+	Listening(Listening),
+	/// Terminal. Keeps the loop's completion, so a later call still reports its panic.
+	Cancelled(crate::ffi::Background),
 }
 
-/// Stops a listening server's accept loop without the state lock, which a parked
-/// `accept` holds until the host frees it.
+/// A running accept loop, which `cancel` stops without waiting for a parked `accept`.
 struct Listening {
+	driver: crate::ffi::Background,
 	/// Dropped to stop the loop.
 	stop: tokio::sync::oneshot::Sender<()>,
 	/// Disconnects once the loop has closed the listener.
 	closed: std::sync::mpsc::Receiver<()>,
+	/// The requests the loop accepted, read by one `accept` at a time.
+	queue: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<moq_tokio::server::Request>>>,
+	certificates: moq_tokio::tls::Certificates,
+	origins: Origins,
 }
 
 impl Listening {
-	/// Stop the accept loop and block until the listener's sockets are released.
+	/// Stop the accept loop and block until the listener's sockets are released, returning
+	/// the loop's completion.
 	///
 	/// Waits on a std channel so it works from inside another runtime, but must not run on
 	/// an FFI runtime worker, which the accept loop may need.
-	fn close(self) {
+	fn close(self) -> crate::ffi::Background {
 		drop(self.stop);
 		// Disconnects when the loop finishes, or when the runtime is gone and dropped it.
 		let _ = self.closed.recv();
+		self.driver
 	}
 }
 
@@ -143,8 +161,11 @@ async fn serve(
 			request = listener.accept() => request,
 		};
 		match request {
-			Some(request) => slot.send(request),
-			None => break,
+			Ok(request) => slot.send(request),
+			Err(err) => {
+				tracing::error!(%err, "server stopped accepting");
+				break;
+			}
 		}
 	}
 	// `Listener::close` releases the sockets before it returns; a drop only schedules that.
@@ -152,9 +173,10 @@ async fn serve(
 	drop(closed);
 }
 
-impl ServerState {
-	fn new(config: MoqServerConfig) -> Result<Self, MoqError> {
+impl Settings {
+	fn new(config: MoqServerConfig) -> Result<(Self, Origins), MoqError> {
 		let mut listen = moq_tokio::listen::Config::default();
+		listen.implementation = Some(crate::session::implementation(config.implementation.as_deref())?);
 		if let Some(bind) = config.bind {
 			let parsed = bind.parse().map_err(|_| MoqError::Config {
 				reason: format!("invalid bind address: {bind}"),
@@ -172,90 +194,83 @@ impl ServerState {
 			reason: err.to_string(),
 		})?;
 
-		Ok(Self {
-			config: listen,
-			quic,
+		let origins = Origins {
 			publish: config.publish,
 			consume: config.consume,
-			requests: None,
-		})
-	}
-
-	/// Bind, and start the accept loop that `listening` stops.
-	async fn listen(&mut self, owner: &MoqServer) -> Result<String, MoqError> {
-		if self.requests.is_some() {
-			return Err(MoqError::Bind {
-				reason: "already listening".into(),
-			});
-		}
-		let (bound, addr) = tokio::sync::oneshot::channel();
-		let (queue, requests) = tokio::sync::mpsc::channel(1);
-		let (certificates, driver) = {
-			// `cancel` flags the task before it takes `listening`, so checking the flag under
-			// that lock means either `cancel` finds the loop or this finds the cancel. `init`
-			// binds the QUIC socket, so it goes after the check and straight to the loop.
-			let mut slot = owner.listening.lock().unwrap();
-			if owner.task.is_cancelled() {
-				return Err(MoqError::Cancelled);
-			}
-			let server = self
-				.config
-				.clone()
-				.init(self.quic.clone())
-				.map_err(|err| MoqError::Bind {
-					reason: format!("{err}"),
-				})?;
-			let certificates = server.certificates();
-			let (stop, stopped) = tokio::sync::oneshot::channel();
-			let (closed, wait) = std::sync::mpsc::channel();
-			let driver = crate::ffi::spawn(serve(server, bound, queue, stopped, closed));
-			*owner.driver.lock().unwrap() = driver.clone();
-			*slot = Some(Listening { stop, closed: wait });
-			(certificates, driver)
 		};
-
-		// Dropped only when the runtime is gone.
-		let addr = match addr.await {
-			Ok(addr) => addr?,
-			Err(_) => {
-				driver.finished().await?;
-				return Err(MoqError::Cancelled);
-			}
-		};
-		self.requests = Some(Requests {
-			driver,
-			queue: requests,
-			certificates,
-		});
-		Ok(addr)
+		Ok((Self { config: listen, quic }, origins))
 	}
+}
 
-	async fn accept(&mut self) -> Result<Option<Arc<MoqRequest>>, MoqError> {
-		let requests = self.requests.as_mut().ok_or_else(|| MoqError::Bind {
-			reason: "not listening; call listen() first".into(),
-		})?;
-		match requests.queue.recv().await {
-			Some(request) => Ok(Some(MoqRequest::new(
-				request,
-				self.publish.clone(),
-				self.consume.clone(),
-			)?)),
-			None => {
-				requests.driver.finished().await?;
-				Ok(None)
-			}
-		}
+/// A terminal call's answer: the accept loop's panic, or `Cancelled`.
+async fn cancelled<T>(driver: crate::ffi::Background) -> Result<T, MoqError> {
+	driver.finished().await?;
+	Err(MoqError::Cancelled)
+}
+
+fn not_listening() -> MoqError {
+	MoqError::Bind {
+		reason: "not listening; call listen() first".into(),
 	}
 }
 
 /// A MoQ server that accepts incoming QUIC/WebTransport sessions.
 #[derive(uniffi::Object)]
 pub struct MoqServer {
-	task: Task<ServerState>,
-	/// Outside cancellable state so a terminal call can still report the listener's panic.
-	driver: std::sync::Mutex<crate::ffi::Background>,
-	/// Outside `task`, so `cancel` closes the listener without waiting for a parked `accept`.
-	listening: std::sync::Mutex<Option<Listening>>,
+	settings: Settings,
+	/// Never held across an await, so `cancel` closes the listener while an `accept` is parked.
+	phase: std::sync::Mutex<Phase>,
+}
+
+impl MoqServer {
+	/// Bind, and start the accept loop, moving `phase` from `Idle` to `Listening`.
+	///
+	/// `init` binds the QUIC socket, so it runs under the lock that `cancel` takes to close it.
+	fn start(
+		&self,
+		phase: &mut Phase,
+		origins: Origins,
+	) -> Result<
+		(
+			tokio::sync::oneshot::Receiver<Result<String, MoqError>>,
+			crate::ffi::Background,
+		),
+		MoqError,
+	> {
+		let _guard = crate::ffi::enter();
+		let server = self
+			.settings
+			.config
+			.clone()
+			.init(self.settings.quic.clone())
+			.map_err(|err| MoqError::Bind {
+				reason: format!("{err}"),
+			})?;
+		let certificates = server.certificates();
+		let (bound, addr) = tokio::sync::oneshot::channel();
+		let (queue, requests) = tokio::sync::mpsc::channel(1);
+		let (stop, stopped) = tokio::sync::oneshot::channel();
+		let (closed, wait) = std::sync::mpsc::channel();
+		let driver = crate::ffi::spawn(serve(server, bound, queue, stopped, closed));
+		*phase = Phase::Listening(Listening {
+			driver: driver.clone(),
+			stop,
+			closed: wait,
+			queue: Arc::new(tokio::sync::Mutex::new(requests)),
+			certificates,
+			origins,
+		});
+		Ok((addr, driver))
+	}
+
+	/// Whether an `accept` is waiting on the queue.
+	#[cfg(test)]
+	pub(crate) fn accepting(&self) -> bool {
+		match &*self.phase.lock().unwrap() {
+			Phase::Listening(listening) => listening.queue.try_lock().is_err(),
+			Phase::Idle(_) | Phase::Cancelled(_) => false,
+		}
+	}
 }
 
 #[uniffi::export]
@@ -266,20 +281,55 @@ impl MoqServer {
 	#[uniffi::constructor]
 	pub fn new(config: MoqServerConfig) -> Result<Arc<Self>, MoqError> {
 		let _guard = crate::ffi::runtime().enter();
+		let (settings, origins) = Settings::new(config)?;
 		Ok(Arc::new(Self {
-			task: Task::new(ServerState::new(config)?),
-			driver: Default::default(),
-			listening: Default::default(),
+			settings,
+			phase: std::sync::Mutex::new(Phase::Idle(origins)),
 		}))
 	}
 
 	/// Bind the listening socket. Returns the bound local address as a string,
 	/// which is useful when binding to an ephemeral port (`:0`).
 	pub async fn listen(&self) -> Result<String, MoqError> {
-		let result = self.task.run(|mut state| async move { state.listen(self).await }).await;
-		let driver = self.driver.lock().unwrap().clone();
-		if self.task.is_cancelled() {
-			driver.finished().await?;
+		let started = {
+			let mut phase = self.phase.lock().unwrap();
+			match &*phase {
+				Phase::Idle(origins) => {
+					let origins = origins.clone();
+					Ok(self.start(&mut phase, origins)?)
+				}
+				Phase::Listening(_) => {
+					return Err(MoqError::Bind {
+						reason: "already listening".into(),
+					});
+				}
+				Phase::Cancelled(driver) => Err(driver.clone()),
+			}
+		};
+		let (addr, driver) = match started {
+			Ok(started) => started,
+			Err(driver) => return cancelled(driver).await,
+		};
+
+		let result = crate::ffi::run(async {
+			// Dropped only when the runtime is gone.
+			addr.await.map_err(|_| MoqError::Cancelled)?
+		})
+		.await;
+		let after = {
+			let mut phase = self.phase.lock().unwrap();
+			match &*phase {
+				Phase::Cancelled(driver) => Some(driver.clone()),
+				// Only this call leaves `Idle`, so the loop that failed to bind is the one listening.
+				Phase::Listening(listening) if result.is_err() => {
+					*phase = Phase::Idle(listening.origins.clone());
+					None
+				}
+				Phase::Idle(_) | Phase::Listening(_) => None,
+			}
+		};
+		if let Some(driver) = after {
+			return cancelled(driver).await;
 		}
 		driver.check()?;
 		result
@@ -290,28 +340,65 @@ impl MoqServer {
 	/// `listen()` must be called first. Dropping the returned future aborts this
 	/// call alone and leaves the server listening.
 	pub async fn accept(&self) -> Result<Option<Arc<MoqRequest>>, MoqError> {
-		let driver = self.driver.lock().unwrap().clone();
-		let result = driver
-			.watch(self.task.run(|mut state| async move { state.accept().await }))
+		let listening = match &*self.phase.lock().unwrap() {
+			Phase::Idle(_) => return Err(not_listening()),
+			Phase::Listening(listening) => Ok((listening.driver.clone(), listening.queue.clone())),
+			Phase::Cancelled(driver) => Err(driver.clone()),
+		};
+		let (driver, queue) = match listening {
+			Ok(listening) => listening,
+			Err(driver) => return cancelled(driver).await,
+		};
+		// A cancel closes the loop, which ends the queue and wakes this.
+		let ended = driver.clone();
+		let request = driver
+			.watch(crate::ffi::run(async move {
+				let mut queue = tokio::select! {
+					// A request buffered before the loop ended still goes to whoever takes the queue.
+					biased;
+					queue = queue.lock() => queue,
+					// Another accept holds the queue, and a foreign-cancelled one keeps it until freed.
+					result = ended.finished() => return result.map(|()| None),
+				};
+				Ok::<_, MoqError>(queue.recv().await)
+			}))
 			.await;
-		if self.task.is_cancelled() {
-			driver.finished().await?;
+		// Read after the wait, so a parked accept holds no origin past a cancel.
+		let origins = match &*self.phase.lock().unwrap() {
+			Phase::Cancelled(driver) => Err(driver.clone()),
+			Phase::Idle(origins) => Ok(origins.clone()),
+			Phase::Listening(listening) => Ok(listening.origins.clone()),
+		};
+		let origins = match origins {
+			Ok(origins) => origins,
+			Err(driver) => return cancelled(driver).await,
+		};
+		match request? {
+			Some(request) => Ok(Some(MoqRequest::new(request, origins.publish, origins.consume)?)),
+			None => {
+				driver.finished().await?;
+				Ok(None)
+			}
 		}
-		result
 	}
 
 	/// SHA-256 fingerprints of the configured TLS certificates, hex-encoded.
 	///
 	/// Useful for pinning a generated self-signed certificate in a browser via
 	/// WebTransport's `serverCertificateHashes`. Returns an error if called
-	/// before `listen()`, and [`MoqError::Busy`] while `listen()` or `accept()` is in flight.
+	/// before `listen()`.
 	pub fn cert_fingerprints(&self) -> Result<Vec<String>, MoqError> {
-		self.driver.lock().unwrap().check()?;
-		let state = self.task.configure()?;
-		let requests = state.requests.as_ref().ok_or_else(|| MoqError::Bind {
-			reason: "not listening; call listen() first".into(),
-		})?;
-		Ok(requests.certificates.fingerprints())
+		match &*self.phase.lock().unwrap() {
+			Phase::Idle(_) => Err(not_listening()),
+			Phase::Listening(listening) => {
+				listening.driver.check()?;
+				Ok(listening.certificates.fingerprints())
+			}
+			Phase::Cancelled(driver) => {
+				driver.check()?;
+				Err(MoqError::Cancelled)
+			}
+		}
 	}
 
 	/// Cancel any in-flight `listen()` or `accept()` call.
@@ -320,17 +407,19 @@ impl MoqServer {
 	/// not when the handle is, so the address can be bound again immediately.
 	/// `cert_fingerprints()` returns `Cancelled` afterwards.
 	pub fn cancel(&self) {
-		self.task.cancel();
 		// Closed under the lock, so a concurrent `cancel` returns only once the socket is released.
-		let mut listening = self.listening.lock().unwrap();
-		if let Some(listening) = listening.take() {
-			listening.close();
-		}
+		let mut phase = self.phase.lock().unwrap();
+		let driver = match std::mem::replace(&mut *phase, Phase::Cancelled(Default::default())) {
+			Phase::Idle(_) => Default::default(),
+			Phase::Listening(listening) => listening.close(),
+			Phase::Cancelled(driver) => driver,
+		};
+		*phase = Phase::Cancelled(driver);
 	}
 }
 
 struct RequestState {
-	request: Option<moq_tokio::server::Request>,
+	request: OneShot<moq_tokio::server::Request>,
 	publish: Option<Arc<MoqOriginProducer>>,
 	consume: Option<Arc<MoqOriginProducer>>,
 }
@@ -340,8 +429,6 @@ struct RequestState {
 pub enum MoqTransport {
 	/// Raw QUIC, negotiating a MoQ ALPN directly.
 	Quic,
-	/// An Iroh QUIC connection.
-	Iroh,
 	/// A WebSocket connection using qmux framing.
 	WebSocket,
 	/// A plaintext TCP connection using qmux framing.
@@ -358,7 +445,6 @@ impl TryFrom<moq_tokio::Transport> for MoqTransport {
 	fn try_from(value: moq_tokio::Transport) -> Result<Self, Self::Error> {
 		Ok(match value {
 			moq_tokio::Transport::Quic => Self::Quic,
-			moq_tokio::Transport::Iroh => Self::Iroh,
 			moq_tokio::Transport::WebSocket => Self::WebSocket,
 			moq_tokio::Transport::Tcp => Self::Tcp,
 			moq_tokio::Transport::Unix => Self::Unix,
@@ -376,7 +462,6 @@ mod transport_tests {
 	#[test]
 	fn converts_supported_transports() {
 		assert_eq!(MoqTransport::try_from(Transport::Quic).unwrap(), MoqTransport::Quic);
-		assert_eq!(MoqTransport::try_from(Transport::Iroh).unwrap(), MoqTransport::Iroh);
 		assert_eq!(
 			MoqTransport::try_from(Transport::WebSocket).unwrap(),
 			MoqTransport::WebSocket
@@ -393,8 +478,8 @@ mod transport_tests {
 /// An incoming MoQ session that can be accepted or rejected.
 ///
 /// Origin arguments are captured when [`accept`](Self::accept) starts. A second
-/// response fails with [`MoqError::AlreadyResponded`], and calls after
-/// [`cancel`](Self::cancel) fail with [`MoqError::Cancelled`].
+/// response fails with [`MoqError::AlreadyResponded`], or with the first one's error if it
+/// failed, and calls after [`cancel`](Self::cancel) fail with [`MoqError::Cancelled`].
 #[derive(uniffi::Object)]
 pub struct MoqRequest {
 	task: Task<RequestState>,
@@ -402,6 +487,7 @@ pub struct MoqRequest {
 	url: Option<String>,
 	path: String,
 	query: Option<String>,
+	peer_implementation: Option<String>,
 }
 
 impl MoqRequest {
@@ -414,9 +500,10 @@ impl MoqRequest {
 		let url = request.url().map(|u| u.to_string());
 		let path = request.path().to_string();
 		let query = request.query().map(str::to_string);
+		let peer_implementation = request.peer_implementation().map(str::to_string);
 		Ok(Arc::new(Self {
 			task: Task::new(RequestState {
-				request: Some(request),
+				request: OneShot::new(request),
 				publish,
 				consume,
 			}),
@@ -424,6 +511,7 @@ impl MoqRequest {
 			url,
 			path,
 			query,
+			peer_implementation,
 		}))
 	}
 }
@@ -466,6 +554,14 @@ impl MoqRequest {
 		self.query.clone()
 	}
 
+	/// The implementation the client advertised in its SETUP, such as
+	/// `moq-py/0.6.0 moq-ffi/0.4.12 moq-net-rs/0.3.10`, or null when it advertised none.
+	///
+	/// Peer-controlled: use it for logs and rollout counts, never to authorize.
+	pub fn peer_implementation(&self) -> Option<String> {
+		self.peer_implementation.clone()
+	}
+
 	/// The network transport carrying this session.
 	pub fn transport(&self) -> MoqTransport {
 		self.transport
@@ -475,31 +571,36 @@ impl MoqRequest {
 	///
 	/// A null origin inherits the server's configured origin; a supplied origin replaces it.
 	/// Pass a fresh origin for isolation, or the same fresh origin on both sides to share it.
-	/// Returns `AlreadyResponded` after a response and `Cancelled` after cancellation.
+	/// Returns `AlreadyResponded` after a response, the response's error if it failed, and
+	/// `Cancelled` after cancellation.
 	#[uniffi::method(default(publish = None, consume = None))]
 	pub async fn accept(
 		&self,
 		publish: Option<Arc<MoqOriginProducer>>,
 		consume: Option<Arc<MoqOriginProducer>>,
 	) -> Result<Arc<MoqSession>, MoqError> {
+		// Foreign runtime threads can have a 512 KiB stack. Keep the transport
+		// handshake out of the nested Task::run futures polled on that stack.
 		self.task
-			.run(move |mut state| async move {
-				let request = state.request.take().ok_or(MoqError::AlreadyResponded)?;
-				// Materialize both origin sides so the session can publish/subscribe and the
-				// FFI can hand back a publisher/consumer.
-				let (publish, subscribe) = crate::origin::resolve_pair(
-					publish.as_ref().or(state.publish.as_ref()),
-					consume.as_ref().or(state.consume.as_ref()),
-				);
-				let (session, driver) = request
-					.with_publisher(&publish.inner)
-					.with_subscriber(subscribe.inner.clone())
-					.ok()
-					.await
-					.map_err(|err| MoqError::Connect {
-						reason: format!("{err}"),
-					})?;
-				Ok(Arc::new(MoqSession::accepted(session, publish, subscribe, driver)))
+			.run(move |state| {
+				Box::pin(async move {
+					let (request, answering) = state.request.take()?;
+					// Materialize both origin sides so the session can publish/subscribe and the
+					// FFI can hand back a publisher/consumer.
+					let (publish, subscribe) = crate::origin::resolve_pair(
+						publish.as_ref().or(state.publish.as_ref()),
+						consume.as_ref().or(state.consume.as_ref()),
+					);
+					let session = request
+						.with_publisher(&publish.inner)
+						.with_subscriber(subscribe.inner.clone())
+						.ok()
+						.await
+						.map_err(|err| MoqError::Connect {
+							reason: format!("{err}"),
+						});
+					answering.settle(session.map(|session| Arc::new(MoqSession::accepted(session, publish, subscribe))))
+				})
 			})
 			.await
 	}
@@ -509,20 +610,19 @@ impl MoqRequest {
 	/// Codes 401 and 403 map to the protocol's unauthorized error; every other
 	/// code is sent as an application error.
 	///
-	/// Returns `AlreadyResponded` if `accept()` or `reject()` has already been called.
+	/// Returns `AlreadyResponded` if `accept()` or `reject()` has already been called, or that
+	/// call's error if it failed.
 	pub async fn reject(&self, code: u16) -> Result<(), MoqError> {
 		self.task
-			.run(move |mut state| async move {
-				let request = state.request.take().ok_or(MoqError::AlreadyResponded)?;
+			.run(move |state| async move {
+				let (request, answering) = state.request.take()?;
 				let reject = match code {
-					401 => moq_tokio::server::Reject::Unauthorized,
-					403 => moq_tokio::server::Reject::Forbidden,
-					code => moq_tokio::server::Reject::App(code),
+					401 | 403 => moq_net::SessionError::Unauthorized,
+					code => moq_net::SessionError::App(code),
 				};
-				request.reject(reject).await.map_err(|err| MoqError::Reject {
+				answering.settle(request.reject(reject).await.map_err(|err| MoqError::Reject {
 					reason: format!("{err}"),
-				})?;
-				Ok(())
+				}))
 			})
 			.await
 	}
@@ -533,5 +633,63 @@ impl MoqRequest {
 	/// rejects the session.
 	pub fn cancel(&self) {
 		self.task.cancel();
+	}
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+	use super::*;
+
+	/// A server can complete a real handshake on an Apple-sized foreign thread.
+	#[test]
+	fn accept_on_a_foreign_thread() {
+		std::thread::Builder::new()
+			.name("foreign-session".into())
+			.stack_size(512 * 1024)
+			.spawn(|| {
+				let server = MoqServer::new(MoqServerConfig {
+					bind: Some("127.0.0.1:0".into()),
+					versions: vec!["moq-lite-07-wip".into()],
+					tls: MoqServerTls {
+						generate: vec!["localhost".into()],
+						..Default::default()
+					},
+					..Default::default()
+				})
+				.unwrap();
+				let addr = pollster::block_on(server.listen()).unwrap();
+				let client = crate::session::MoqClient::new(crate::session::MoqClientConfig {
+					bind: Some("127.0.0.1:0".into()),
+					versions: vec!["moq-lite-07-wip".into()],
+					tls: crate::session::MoqClientTls {
+						insecure: true,
+						..Default::default()
+					},
+					..Default::default()
+				})
+				.unwrap();
+				let connect =
+					crate::ffi::runtime().spawn(async move { client.connect(format!("https://{addr}")).await });
+				let request = pollster::block_on(server.accept()).unwrap().unwrap();
+				let peer = pollster::block_on(request.accept(None, None)).unwrap();
+				let session = pollster::block_on(connect).unwrap().unwrap();
+				let everything = crate::auth::MoqGrant {
+					publish: vec!["**".into()],
+					subscribe: vec!["**".into()],
+					expires: None,
+				};
+				for grants in [peer.grants(), session.grants()] {
+					let mut grant = grants.grant();
+					while grant.as_ref() != Some(&everything) {
+						grant = pollster::block_on(grants.changed()).unwrap();
+					}
+				}
+				peer.cancel(0);
+				session.cancel(0);
+				server.cancel();
+			})
+			.unwrap()
+			.join()
+			.unwrap();
 	}
 }

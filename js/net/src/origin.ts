@@ -10,59 +10,43 @@
  *
  * @module
  */
-import { Derived, type Dispose, type GetPromise, type Getter, getter, Once, race, Signal } from "@moq/signals";
+import { Derived, type Dispose, type GetPromise, type Getter, Once, race, Signal } from "@moq/signals";
+import type * as Announce from "./announce.ts";
 import * as announce from "./announced.ts";
+import type { Credential } from "./auth.ts";
 import * as broadcast from "./broadcast.ts";
-import type * as Epoch from "./epoch.ts";
 import { StreamCode, StreamError } from "./error.ts";
-import { Route, routesEqual } from "./hop.ts";
+import { type Cost, routesEqual, WireRoute } from "./hop.ts";
+import * as Instance from "./instance.ts";
 import {
-	compareEpochs,
 	compareRouteCandidates,
 	compareRoutes,
 	coveringPrefixes,
+	Epochs,
+	firstEligible,
 	hiddenBelow,
 	hooks,
+	routeHops,
 	scopeCaptures,
 	scopeHead,
 	scopeOverlaps,
-	spreadHash,
+	superseded,
 } from "./internal.ts";
 import * as Path from "./path.ts";
 import { Front } from "./resume.ts";
+import { Own } from "./route.ts";
+import { closeUnwanted } from "./util/announce.ts";
 import {
 	type Advertised,
 	type Advertisements,
-	type Instance,
 	type InterestListener,
 	registerWire,
+	type Served,
 	sameInstance,
 	wireOf,
 } from "./wire.ts";
 
-export type { Cost, Hop, Route } from "./hop.ts";
-export { isAnonymous } from "./hop.ts";
-
-/**
- * How much an endpoint prefers a link over its others; higher wins. A positive value promotes a
- * link and a negative one demotes it. See {@link Producer.withPreference}.
- */
-export type Preference = number & { readonly _brand: "preference" };
-
-/** Constructors for {@link Preference}. */
-export const Preference = Object.assign(
-	/** Rank a link, throwing a `RangeError` outside -128..=127. */
-	(value: number): Preference => {
-		if (!Number.isInteger(value) || value < -128 || value > 127) {
-			throw new RangeError(`preference must be an integer in -128..=127: ${value}`);
-		}
-		return value as Preference;
-	},
-	{
-		/** The neutral 0 every link starts at, and what a broadcast published locally ranks. */
-		default: 0 as Preference,
-	},
-);
+export type { Cost, RouteInfo } from "./hop.ts";
 
 /** The rooted permissions shared by a handle and every route it inserts. */
 class Scope {
@@ -134,14 +118,23 @@ class Scope {
 		return out;
 	}
 
+	/** Whether this scope allows everything beneath the root-relative `prefix`. */
+	covers(prefix: Path.Valid): boolean {
+		if (!this.allowed) return true;
+		// A peer's prefix may fit the wire alone and overflow once joined: nothing allowed lies there.
+		const path = Path.join(this.root, prefix);
+		return !Path.check(path) && this.allowed.contains(Path.Pattern.subtree(path));
+	}
+
 	/** Whether this scope allows anything beneath the absolute `prefix`. */
 	overlaps(prefix: Path.Valid): boolean {
 		return this.allowed?.overlaps(Path.Pattern.subtree(prefix)) ?? true;
 	}
 
 	/** The exact paths within this scope, relative to its root. */
-	projectPaths<T>(values: ReadonlyMap<Path.Valid, T> | undefined): ReadonlyMap<Path.Valid, T> | undefined {
-		if (!values || this === Scope.all) return values;
+	projectPaths<T>(values: ReadonlyMap<Path.Valid, T>): ReadonlyMap<Path.Valid, T> {
+		if (this === Scope.all) return values;
+
 		const out = new Map<Path.Valid, T>();
 		for (const [path, value] of values) {
 			if (!this.matches(path)) continue;
@@ -176,7 +169,8 @@ class Scope {
 			}
 			// Hold the empty path's place in the order until every covering prefix is known.
 			if (covering.length === 0) out.set(Path.empty(), []);
-			covering.push([path, visible]);
+			// Each keeps its own prefix, so supersession never compares across the merged prefixes.
+			covering.push([path, visible.map((value) => ({ ...value, prefix: path }))]);
 		}
 		if (covering.length > 0) {
 			covering.sort(([a], [b]) => b.length - a.length);
@@ -242,7 +236,6 @@ class CoveringRoot {
 	}
 }
 
-// pending: /quest/m1/public-model/answer.md
 /**
  * One requested path: the notify node for everything watching it.
  *
@@ -253,7 +246,7 @@ class CoveringRoot {
  * every open request on every unrelated change.
  *
  * `answer` is one session's: when that session dies the request it resolved ends, since the
- * next session is another publisher instance unless an epoch says otherwise. A slot still
+ * next session is another publisher instance unless an instance says otherwise. A slot still
  * waiting is answered by the next session.
  *
  * `handles` holds the `closed` of each open {@link Requesting} on the path.
@@ -261,27 +254,31 @@ class CoveringRoot {
  * A refusal is terminal, even while another source still serves: the slot ends, every handle
  * closes with the handler's error, and the slot leaves the table, so the next request asks
  * afresh. A refusal never falls through to a broader prefix or another advertiser.
- *
- * @internal
  */
-export interface RequestSlot {
-	/** Open handles that always take a blind answer. */
+interface RequestSlot {
+	/** Open plain handles that can use a peer without discovery. */
 	blind: number;
-	/** Open announcement-gated handles, which take a blind answer only while discovery is incomplete. */
-	announced: number;
 	answer?: broadcast.Consumer;
 	readonly handles: Set<Once<Error | null>>;
+	/** Pending plain handles, each ending itself once synced discovery leaves it no route. */
+	readonly absent: Set<() => void>;
 	readonly route: Signal<Resolution | undefined>;
 	/** The front a detached slot took from the table, closed with its last handle. */
 	retired?: broadcast.Consumer;
-	/** The route a detached slot asked to take over under the same epoch, until it answers. */
+	/** The route a detached slot asked to take over under the same instance, until it answers. */
 	failover?: RouteEntry;
+	/**
+	 * The instance a pinned slot resolves through its own routes, as Rust's lookup does, while
+	 * another instance wins the path. Such a slot is detached from the start: never in the
+	 * table's `requests`, it is shared only by requests pinned to the same instance.
+	 */
+	readonly pin?: Instance.Valid;
 }
 
-/** One path resolution and the epoch of the route that can currently serve it. */
+/** One path resolution and the instance of the route that can currently serve it. */
 interface Resolution {
 	readonly front?: broadcast.Consumer;
-	readonly epoch?: Epoch.Valid;
+	readonly instance?: Instance.Valid;
 	/** The local broadcast or route entry's identity the front came from, when it did. */
 	readonly source?: object;
 }
@@ -293,73 +290,65 @@ interface Resolution {
  * The preferred entry per prefix is the one requests resolve through. An originated
  * entry is forwarded by sessions; a received one is not, so a shared origin
  * cannot echo a peer's announcements back to it.
- *
- * @internal
  */
-export interface RouteEntry {
+interface RouteEntry {
 	readonly identity: object;
 	readonly scope: Scope;
 	/** The paths the entry may serve beneath its prefix, when its producer is scoped. */
 	readonly claim?: Path.Patterns;
-	readonly route: Signal<Route>;
-	/** The rank of the link the entry arrived on; see {@link Producer.withPreference}. */
-	readonly preference: Preference;
+	readonly route: Signal<WireRoute>;
 	readonly originated: boolean;
 	readonly server?: ServeState;
+	/**
+	 * Set as a received route leaves because its session lost it, rather than its announcer
+	 * ending it: readers then see it go offline, not end.
+	 */
+	lost: boolean;
 }
 
 /** One advertisement at a prefix. `exact` marks an announced local broadcast, which is only its own path. */
 interface Candidate extends Advertised {
 	readonly exact: boolean;
-	readonly preference: Preference;
+	/** Whether the route left because its session lost it; see {@link RouteEntry.lost}. */
+	readonly lost?: () => boolean;
 }
 
 /**
- * Orders advertisements at `prefix`: the better route, then a local broadcast on a tie, then
- * fewer hops, then the lower {@link spreadHash} of the prefix, matching `route_order` in rs/moq-net.
+ * Orders advertisements at a prefix: the better route, then a local broadcast on a tie, then
+ * fewer hops. A remaining tie is left to the table's newest-first order; see
+ * {@link compareRouteCandidates}.
  */
-function compareCandidates(prefix: Path.Valid, a: Candidate, b: Candidate): number {
-	const order =
-		compareLinks(a.route, b.route, a.preference, b.preference) ||
-		compareRoutes(a.route, b.route) ||
-		Number(b.exact) - Number(a.exact) ||
-		a.route.hops.length - b.route.hops.length;
-	if (order !== 0) return order;
-	const ha = spreadHash(prefix, a.route.hops);
-	const hb = spreadHash(prefix, b.route.hops);
-	return ha < hb ? -1 : ha > hb ? 1 : 0;
+function compareCandidates(a: Candidate, b: Candidate): number {
+	return (
+		compareRoutes(a.route, b.route) || Number(b.exact) - Number(a.exact) || routeHops(a.route) - routeHops(b.route)
+	);
 }
 
 /**
- * Orders routes from different links: the newer epoch, since an older one is a publisher that
- * was replaced, then the higher link {@link Preference}, so metrics from different operators are
- * never compared. Zero on a tie, leaving the rest to {@link compareRoutes}.
- */
-function compareLinks(a: Route, b: Route, aPreference: Preference, bPreference: Preference): number {
-	return compareEpochs(a, b) || bPreference - aPreference;
-}
-
-/**
- * The preferred of `entries` (newest first) for resolving `path`, not skipped: the best route,
- * then fewest hops, then the lowest {@link spreadHash}, then newest. `path` is the requested
- * path for a request, or the prefix itself for an advertisement.
+ * The preferred of `entries` (newest first, at `prefix`) for resolving `path`, not skipped
+ * nor superseded: see {@link compareRouteCandidates}, then newest.
  */
 function preferredEntry(
 	path: Path.Valid,
+	prefix: Path.Valid,
 	entries: readonly RouteEntry[],
 	skip?: (entry: RouteEntry) => boolean,
+	others: readonly WireRoute[] = [],
 ): RouteEntry | undefined {
+	const eligible = entries.filter((entry) => !skip?.(entry));
+	// `others` compete at the prefix too, such as a broadcast announced here at the path.
+	const epochs = new Epochs([...eligible.map((entry) => entry.route.peek()), ...others]);
 	let best: RouteEntry | undefined;
-	for (const entry of entries) {
-		if (skip?.(entry)) continue;
+	for (const entry of eligible) {
+		// Only the highest epoch of an instance is eligible, however cheap an older one is.
+		if (epochs.supersedes(entry.route.peek())) continue;
 		if (!best) {
 			best = entry;
 			continue;
 		}
 		const a = entry.route.peek();
 		const b = best.route.peek();
-		const order = compareLinks(a, b, entry.preference, best.preference) || compareRouteCandidates(path, a, b);
-		if (order < 0) best = entry;
+		if (compareRouteCandidates(path, prefix, a, b) < 0) best = entry;
 	}
 	return best;
 }
@@ -369,22 +358,28 @@ function received(entry: RouteEntry): boolean {
 	return !entry.originated;
 }
 
+/** What a peer cannot be served through: a received route, or one of another instance than it pinned. */
+function unservable(instance: Instance.Valid | undefined): (entry: RouteEntry) => boolean {
+	if (instance === undefined) return received;
+	return (entry) => received(entry) || entry.route.peek().instance !== instance;
+}
+
 function unroutable(): StreamError {
 	return new StreamError(StreamCode.Unroutable, { message: "unroutable" });
 }
 
-/** A served route from {@link Producer.dynamic}: the queue a handler drains. */
+// A selected handler refused these requests; a coalesced route gap can have the same error.
+const refusedRequests = new WeakSet<GetPromise<Error | null>>();
+
+/** A claim's queue of requests, from {@link Producer.claim}: what a handler drains. */
 class ServeState {
 	readonly root: Path.Valid;
 	/** The prefix the route claims; every served path is at or beneath it. */
 	readonly prefix: Path.Valid;
-	/** False when a session announced the route: it may serve that session's broadcast. */
-	readonly originated: boolean;
 
-	constructor(root: Path.Valid, prefix: Path.Valid, originated: boolean) {
+	constructor(root: Path.Valid, prefix: Path.Valid) {
 		this.root = root;
 		this.prefix = prefix;
-		this.originated = originated;
 	}
 
 	queue = new Signal(new Set<Request>());
@@ -399,6 +394,8 @@ class ServeState {
 	settled = new Signal(0);
 	/** Counts {@link reset}s, so a waiter can tell its request was released rather than answered. */
 	resets = 0;
+	/** Set on a claim serving an instance it minted, which it hands to its jobs' exact routes. */
+	handoff?: Handoff;
 	onChange: (path: Path.Valid) => void = () => {};
 	onReject: (path: Path.Valid, err: Error) => void = () => {};
 
@@ -499,8 +496,23 @@ class ServeState {
 	}
 }
 
+/**
+ * What a claim that minted its instance shares with its jobs. A job naming no instance
+ * continues the claim's, so a reader resolved through the claim continues on the job's exact
+ * route; once that job stops being advertised the claim moves to a fresh instance, so the next
+ * job for the path is a new stream and nothing answers the ended one's instance again.
+ */
+interface Handoff {
+	/** The instance and epoch the claim serves now, which a job binds when it first announces or reads its instance. */
+	current(): { instance: Instance.Valid; epoch: bigint };
+	/** A job serving `instance` stopped being advertised; the claim moves on if it still serves it. */
+	advance(instance: Instance.Valid): void;
+}
+
 interface Presented extends Advertised {
 	readonly captures: Path.Pattern[] | undefined;
+	/** See {@link Candidate.lost}. */
+	readonly lost?: () => boolean;
 }
 
 /** A table mutation invalidates the shared route snapshot before its async notification. */
@@ -513,11 +525,33 @@ class VersionedSignal<T> extends Signal<T> {
 	}
 }
 
+// Navigation belongs to relative references, resolved before publication.
+function publishPath(path: Path.Valid): void {
+	if (Path.parts(path).some((segment) => segment === "." || segment === "..")) {
+		throw new Error("broadcast path contains a navigation segment");
+	}
+}
+
+// A broadcast created through the origin: its producer, the handle the origin routes, and
+// how its route stops being advertised.
+interface Created {
+	producer: broadcast.Producer;
+	front: broadcast.Consumer;
+	retract: () => void;
+}
+
+// End a created broadcast the origin no longer routes. Consumer handles never end a produced
+// broadcast, so the origin closes its producer; tracks already subscribed keep serving.
+function retire({ producer, front }: Created): void {
+	front.close();
+	producer.close();
+}
+
 /** Reactive backing state shared by origin producers and consumers. */
 class OriginState {
 	// Both tables decouple the application producing into the origin from the
-	// connections serving or feeding it. Undefined once the origin closes, so late
-	// writes fail loudly.
+	// connections serving or feeding it. Emptied once the origin closes, after which
+	// `closed` refuses late writes.
 	//
 	// Created is what this endpoint publishes, keyed by exact path, announced or not.
 	// Local is the announced subset, with its route in advertisedLocal: a broadcast
@@ -526,10 +560,10 @@ class OriginState {
 	// newest first. Local and routes stay separate so a session can never announce a
 	// received entry back to a peer, which is what makes an origin shared by both
 	// directions echo-free.
-	created: Map<Path.Valid, broadcast.Consumer> | undefined = new Map();
-	local = new VersionedSignal<Map<Path.Valid, broadcast.Consumer> | undefined>(new Map());
-	advertisedLocal = new VersionedSignal<Map<Path.Valid, Route> | undefined>(new Map());
-	routes = new VersionedSignal<Map<Path.Valid, RouteEntry[]> | undefined>(new Map());
+	created = new Map<Path.Valid, Created>();
+	local = new VersionedSignal(new Map<Path.Valid, broadcast.Consumer>());
+	advertisedLocal = new VersionedSignal(new Map<Path.Valid, WireRoute>());
+	routes = new VersionedSignal(new Map<Path.Valid, RouteEntry[]>());
 
 	#snapshotVersion = "";
 	#snapshot: ReadonlyMap<Path.Valid, readonly Candidate[]> = new Map();
@@ -546,12 +580,13 @@ class OriginState {
 
 	/**
 	 * Every advertisement per prefix, most preferred first, without the `skip`ped entries.
-	 * Readers select after filtering by their scope, so a cheaper route they cannot see
-	 * never hides one they can.
+	 * Readers select after filtering by their scope, then drop what a higher epoch of the
+	 * same instance supersedes (see {@link firstEligible}), so a route they cannot see never
+	 * hides one they can.
 	 */
 	candidates(skip?: (entry: RouteEntry) => boolean): Map<Path.Valid, Candidate[]> {
 		const out = new Map<Path.Valid, Candidate[]>();
-		for (const [path, entries] of this.routes.peek() ?? []) {
+		for (const [path, entries] of this.routes.peek()) {
 			const list: Candidate[] = [];
 			for (const entry of entries) {
 				if (skip?.(entry)) continue;
@@ -560,26 +595,25 @@ class OriginState {
 					route: entry.route.peek(),
 					claim: entry.claim,
 					exact: false,
-					preference: entry.preference,
+					lost: () => entry.lost,
 				});
 			}
 			if (list.length > 0) out.set(path, list);
 		}
 		const advertised = this.advertisedLocal.peek();
-		for (const [path, front] of this.local.peek() ?? []) {
+		for (const [path, front] of this.local.peek()) {
 			const local = {
 				identity: front,
-				route: advertised?.get(path) ?? Route.default,
+				route: advertised.get(path) ?? WireRoute.default,
 				exact: true,
-				preference: Preference.default,
 			};
 			const list = out.get(path);
 			if (list) list.push(local);
 			else out.set(path, [local]);
 		}
-		for (const [prefix, list] of out) {
+		for (const list of out.values()) {
 			// Stable, so equal routes keep the table's newest-first order.
-			if (list.length > 1) list.sort((a, b) => compareCandidates(prefix, a, b));
+			if (list.length > 1) list.sort(compareCandidates);
 		}
 		return out;
 	}
@@ -587,24 +621,32 @@ class OriginState {
 	// Originated advertisements sessions should forward: exact-path announces plus
 	// originated dynamics. Identity is the local front or the route entry, so a
 	// republish diffs as retract-then-announce and a re-price as another active.
+	// Undefined once the origin closes, which ends the sessions publishing it.
 	originated = new Signal<Advertisements | undefined>(new Map());
+
+	// The lite-07 route identity every session originates these advertisements under.
+	own = new Own(() => this.originated.peek());
+
+	// Every open prefix route's server, advertised or not, so the origin's close ends each
+	// handler loop even for a route that is hidden or withdrawn.
+	servers = new Set<ServeState>();
 
 	// Broadcasts materialized from a served route, keyed by exact path. Shared by every
 	// request for the path so repeats reuse one accept; dropped (and closed) when the
 	// providing route goes away or the last request releases it.
 	materialized = new Map<
 		Path.Valid,
-		{ entry: RouteEntry; front: broadcast.Consumer; epoch?: Epoch.Valid; source: object }
+		{ entry: RouteEntry; front: broadcast.Consumer; instance?: Instance.Valid; source: object }
 	>();
 
 	// Paths consumers asked for without waiting for an announcement; attached sessions
 	// answer them with blind subscriptions. Never announced: an answered request is assumed
 	// present, not known live, so it must not read as an availability claim.
-	requests = new Signal<Map<Path.Valid, RequestSlot> | undefined>(new Map());
+	requests = new Signal(new Map<Path.Valid, RequestSlot>());
 
-	// Path-local wakeups for announced requests, which survive the end of a resolved instance.
-	// A counter rather than the instance: the instance is a plain object, so two epochless
-	// routes with identical metadata compare equal, and a coalesced write could hide a takeover
+	// Path-local wakeups for followers, which survive the end of a resolved instance.
+	// A counter rather than the instance: the instance is a plain object, so two routes with
+	// identical metadata compare equal, and a coalesced write could hide a takeover
 	// or the origin closing. Watchers read the table and `closed` themselves when woken.
 	watchers = new Map<Path.Valid, { users: number; version: Signal<number> }>();
 
@@ -614,8 +656,11 @@ class OriginState {
 	detached = new Map<Path.Valid, Set<RequestSlot>>();
 
 	// An in-place Restart forgets served answers for future requests, but resolved handles
-	// retain their old broadcast without participating in routing or same-epoch failover.
+	// retain their old broadcast without participating in routing or same-instance failover.
 	retained = new WeakSet<RequestSlot>();
+
+	// The sessions withholding hidden broadcasts from their peer; see `hooks.withholdHidden`.
+	withheld = new Signal(0);
 
 	// How many sessions are attached, and how many of those support broadcast discovery.
 	// What backs the public `discovery` getter.
@@ -639,11 +684,58 @@ class OriginState {
 				if (count > 0) counts.set(prefix, count);
 				else counts.delete(prefix);
 			});
+			this.settle(prefix);
 		};
 	}
 
-	// The literal heads readers are watching, counted, as a trie: announcement streams and
-	// announced requests. Sessions ask their peer for announcements under the broadest of
+	// The prefixes whose pending plain requests may have lost their last reason to wait.
+	#unsettled = new Set<Path.Valid>();
+
+	/**
+	 * Recheck the pending plain requests under the absolute `prefix` once the current task
+	 * settles, so a session releasing its initial set and downgrading reads as one step.
+	 */
+	settle(prefix: Path.Valid): void {
+		if (this.#unsettled.size === 0) queueMicrotask(() => this.#settled());
+		this.#unsettled.add(prefix);
+	}
+
+	#settled(): void {
+		const requests = this.requests.peek();
+		const visited = new Set<WatchNode>();
+		for (const prefix of this.#unsettled) {
+			// Every request watches its own path, so the watches beneath the prefix name exactly
+			// the requests it can settle, without scanning the rest of the table.
+			let node: WatchNode | undefined = this.#watches;
+			for (const part of prefix === Path.empty() ? [] : prefix.split("/")) node = node?.children.get(part);
+			const stack = node ? [node] : [];
+			for (let next = stack.pop(); next; next = stack.pop()) {
+				if (visited.has(next)) continue;
+				visited.add(next);
+				// Children first: settling a request may prune its node.
+				stack.push(...next.children.values());
+				const slot = requests.get(next.path);
+				if (slot) for (const absent of [...slot.absent]) absent();
+				// A pinned slot waits detached.
+				for (const other of [...(this.detached.get(next.path) ?? [])]) {
+					for (const absent of [...other.absent]) absent();
+				}
+			}
+		}
+		this.#unsettled.clear();
+	}
+
+	/** Whether every attached session discovers and none owes an initial set covering `path`. */
+	synced(path: Path.Valid): boolean {
+		const { total, discovery } = this.sessions.peek();
+		if (total === 0 || discovery < total) return false;
+		const snapshots = this.snapshots.peek();
+		for (const prefix of coveringPrefixes(path)) if (snapshots.has(prefix)) return false;
+		return true;
+	}
+
+	// The literal heads readers are watching, counted, as a trie: announcement streams,
+	// requests, and followers. Sessions ask their peer for announcements under the broadest of
 	// these and nothing else, and hear each change to that covering set as it happens, so a
 	// watch coming or going touches only its prefix and the watches directly above or below.
 	#watches: WatchNode = { path: Path.empty(), children: new Map(), count: 0 };
@@ -706,12 +798,6 @@ class OriginState {
 		return () => this.#interests.delete(listener);
 	}
 
-	// How many things are prepared to answer a request: attached sessions, plus reconnecting
-	// connections that have no session right now but will. Zero means an unrouted path is
-	// unroutable rather than merely unanswered, which is the whole difference between "wait,
-	// this is coming" and "nothing here can ever serve you".
-	answerers = new Signal(0);
-
 	closed = new Once<Error | null>();
 
 	/**
@@ -723,7 +809,7 @@ class OriginState {
 	 */
 	refresh(path: Path.Valid): void {
 		this.watchers.get(path)?.version.update((n) => n + 1);
-		const slot = this.requests.peek()?.get(path);
+		const slot = this.requests.peek().get(path);
 		const detached = [...(this.detached.get(path) ?? [])];
 		if (slot) this.reroute(path, slot);
 		for (const other of detached) this.reroute(path, other);
@@ -732,14 +818,14 @@ class OriginState {
 
 	/** Release unanswered requests no wire waiter or local route still needs. */
 	forget(path: Path.Valid): void {
-		const slot = this.requests.peek()?.get(path);
+		const slot = this.requests.peek().get(path);
 		// An empty slot remains joinable until its deferred teardown removes it.
 		const best = slot ? this.bestEntry(path) : undefined;
 		const wanted = best && !this.localWins(path, best) ? best.server : undefined;
 		const failovers = this.detached.get(path);
 		let held: Set<RouteEntry> | undefined;
 		for (const prefix of coveringPrefixes(path)) {
-			for (const entry of this.routes.peek()?.get(prefix) ?? []) {
+			for (const entry of this.routes.peek().get(prefix) ?? []) {
 				const server = entry.server;
 				const pending = server?.pending.get(path);
 				if (!server || !pending || server.demanding.has(path) || server === wanted) continue;
@@ -767,17 +853,22 @@ class OriginState {
 	reroute(path: Path.Valid, slot: RequestSlot): void {
 		if (this.retained.has(slot)) return;
 		const current = slot.route.peek();
+		// A pinned slot follows its instance from the start, and a detached one once it resolved.
+		if (slot.pin !== undefined && !(current?.front && current.source)) {
+			this.follow(path, slot, slot.pin, undefined);
+			return;
+		}
 		if (current?.front && current.source) {
 			if (this.detached.get(path)?.has(slot)) {
-				this.failover(path, slot, current.source, current.epoch);
+				this.follow(path, slot, current.instance, current.source);
 				return;
 			}
-			if (!this.serves(path, current.source, current.epoch, false)) {
+			if (!this.serves(path, current.source, current.instance, false)) {
 				this.drop(path, slot, unroutable());
 				return;
 			}
 			const next = this.instance(path);
-			const held = { identity: current.source, route: { epoch: current.epoch } };
+			const held = { identity: current.source, route: { instance: current.instance } };
 			if (next && !sameInstance(held, next)) {
 				this.retire(path, slot);
 				return;
@@ -787,59 +878,94 @@ class OriginState {
 	}
 
 	/**
-	 * Keep a detached slot on its instance: on its own source while that serves, else on another
-	 * route of the same epoch, which serves the same bytes, keeping the old front until that one
-	 * answers. Without such a route the slot ends.
+	 * Keep `slot` on `instance` through its cheapest route, as Rust's lookup does whichever
+	 * instance wins `path`: a local broadcast announced under it, else its best route, each serving
+	 * the same bytes. A move to a route that has not answered yet keeps the front `source` gave
+	 * until it does. Without a route a resolved slot ends, and an unresolved one waits, its handles
+	 * ending once discovery syncs. Without an instance, nothing says another source serves the same
+	 * bytes, so the slot stays on `source` until it stops serving.
 	 */
-	failover(path: Path.Valid, slot: RequestSlot, source: object, epoch: Epoch.Valid | undefined): void {
-		if (this.serves(path, source, epoch, true)) {
-			// Its own source serves again: a takeover still pending speaks for nobody.
-			slot.failover = undefined;
-			return;
-		}
-		// A local broadcast announced under the epoch serves the same bytes with no round trip.
-		const local = this.local.peek()?.get(path);
-		if (epoch !== undefined && local && this.advertisedLocal.peek()?.get(path)?.epoch === epoch) {
-			slot.failover = undefined;
-			slot.retired?.close();
-			slot.retired = undefined;
-			slot.route.set({ front: local, epoch, source: local });
-			return;
-		}
-		const entry =
-			epoch === undefined
-				? undefined
-				: this.bestEntry(path, (candidate) => !candidate.server || candidate.route.peek().epoch !== epoch);
-		if (!entry?.server) {
+	follow(
+		path: Path.Valid,
+		slot: RequestSlot,
+		instance: Instance.Valid | undefined,
+		source: object | undefined,
+	): void {
+		if (instance === undefined) {
+			if (source && this.serves(path, source, instance, true)) return;
 			this.drop(path, slot, unroutable());
+			return;
+		}
+		const skip = (candidate: RouteEntry) => !candidate.server || candidate.route.peek().instance !== instance;
+		const entry = this.bestEntry(path, skip);
+		const local = this.local.peek().get(path);
+		if (
+			local &&
+			this.advertisedLocal.peek().get(path)?.instance === instance &&
+			this.localWins(path, entry, skip)
+		) {
+			slot.failover = undefined;
+			if (source === local) return;
+			this.retain(path, slot, undefined);
+			slot.route.set({ front: local, instance, source: local });
+			return;
+		}
+		if (!entry?.server) {
+			slot.failover = undefined;
+			if (source) this.drop(path, slot, unroutable());
+			else slot.route.set(undefined);
+			return;
+		}
+		if (entry.identity === source) {
+			// Already on the cheapest: a takeover still pending speaks for nobody.
+			slot.failover = undefined;
 			return;
 		}
 		const served = entry.server.served.get(path);
 		if (!served || served.closed.peek() !== undefined) {
+			// Held by the slot, so the pending request outlives a forget.
 			slot.failover = entry;
 			entry.server.enqueue(path);
+			if (!source) slot.route.set({ instance });
 			return;
 		}
 		slot.failover = undefined;
-		slot.retired?.close();
-		slot.retired = served;
-		slot.route.set({ front: served, epoch, source: entry.identity });
+		this.retain(path, slot, served);
+		slot.route.set({ front: served, instance, source: entry.identity });
 	}
 
 	/**
-	 * Whether the instance `source` served under `epoch` still serves `path`. Under an epoch any
-	 * route of it does, unless `exact` asks for `source` itself; without one only `source` does,
-	 * since nothing says another serves the same bytes.
+	 * Make `front` the session answer `slot` holds, closing the one it held unless the cache or
+	 * another detached slot shares it: a session serves one answer per path, so a pinned slot and
+	 * the path's own requests can take the same one.
 	 */
-	serves(path: Path.Valid, source: object, epoch: Epoch.Valid | undefined, exact: boolean): boolean {
-		const matches = (identity: object) => identity === source || (!exact && epoch !== undefined);
-		const local = this.local.peek()?.get(path);
-		const advertised = this.advertisedLocal.peek()?.get(path);
-		if (local && advertised && advertised.epoch === epoch && matches(local)) return true;
-		for (const [prefix, entries] of this.routes.peek() ?? []) {
+	retain(path: Path.Valid, slot: RequestSlot, front: broadcast.Consumer | undefined): void {
+		const previous = slot.retired;
+		slot.retired = front;
+		if (previous && previous !== front) this.closeUnheld(path, previous);
+	}
+
+	/** Close a session answer nothing at `path` holds any more: neither the cache nor a detached slot. */
+	closeUnheld(path: Path.Valid, front: broadcast.Consumer): void {
+		if (this.materialized.get(path)?.front === front) return;
+		for (const slot of this.detached.get(path) ?? []) if (slot.retired === front) return;
+		front.close();
+	}
+
+	/**
+	 * Whether the instance `source` served under `instance` still serves `path`. Under an
+	 * instance any route of it does, unless `exact` asks for `source` itself; without one only
+	 * `source` does, since nothing says another serves the same bytes.
+	 */
+	serves(path: Path.Valid, source: object, instance: Instance.Valid | undefined, exact: boolean): boolean {
+		const matches = (candidate: object) => candidate === source || (!exact && instance !== undefined);
+		const local = this.local.peek().get(path);
+		const advertised = this.advertisedLocal.peek().get(path);
+		if (local && advertised && advertised.instance === instance && matches(local)) return true;
+		for (const [prefix, entries] of this.routes.peek()) {
 			if (!Path.hasPrefix(prefix, path)) continue;
 			for (const entry of entries) {
-				if (!entry.server || !entry.scope.matches(path) || entry.route.peek().epoch !== epoch) continue;
+				if (!entry.server || !entry.scope.matches(path) || entry.route.peek().instance !== instance) continue;
 				if (matches(entry.identity)) return true;
 			}
 		}
@@ -847,11 +973,11 @@ class OriginState {
 	}
 
 	/** The publisher instance a request for `path` resolves through, when one serves it. */
-	instance(path: Path.Valid): Instance | undefined {
+	instance(path: Path.Valid): Served | undefined {
 		const entry = this.bestEntry(path);
-		const local = this.local.peek()?.get(path);
+		const local = this.local.peek().get(path);
 		if (local && this.localWins(path, entry)) {
-			return { identity: local, route: { epoch: this.advertisedLocal.peek()?.get(path)?.epoch } };
+			return { identity: local, route: { instance: this.advertisedLocal.peek().get(path)?.instance } };
 		}
 		if (!entry?.server) return undefined;
 		return { identity: entry.identity, route: entry.route.peek() };
@@ -863,7 +989,7 @@ class OriginState {
 	 */
 	retire(path: Path.Valid, slot: RequestSlot): void {
 		this.requests.mutate((map) => {
-			if (map?.get(path) === slot) map.delete(path);
+			if (map.get(path) === slot) map.delete(path);
 		});
 		let detached = this.detached.get(path);
 		if (!detached) {
@@ -878,10 +1004,10 @@ class OriginState {
 		}
 	}
 
-	/** Preserve this route's resolved answers before its server resets for another epoch. */
+	/** Preserve this route's resolved answers before its server resets for another instance. */
 	restart(entry: RouteEntry): void {
 		for (const path of entry.server?.served.keys() ?? []) {
-			const joined = this.requests.peek()?.get(path);
+			const joined = this.requests.peek().get(path);
 			const slots = [...(this.detached.get(path) ?? [])];
 			if (joined) slots.push(joined);
 			for (const slot of slots) {
@@ -903,14 +1029,9 @@ class OriginState {
 		}
 	}
 
-	/**
-	 * Whether sessions should answer `slot` with a blind subscription. An announcement-gated
-	 * handle falls back to one only while at least one attached session cannot announce, and
-	 * stays gated with no session attached.
-	 */
+	/** Whether a plain request needs the non-discovery session's blind answer. */
 	blind(slot: RequestSlot): boolean {
-		if (slot.blind > 0) return true;
-		if (slot.announced === 0) return false;
+		if (slot.blind === 0) return false;
 		const { total, discovery } = this.sessions.peek();
 		return discovery < total;
 	}
@@ -923,22 +1044,26 @@ class OriginState {
 	refuse(path: Path.Valid, entry: RouteEntry, err: Error): void {
 		// A detached slot failing over to this route ends with its answer.
 		for (const other of [...(this.detached.get(path) ?? [])]) {
-			if (other.failover === entry) this.drop(path, other, err);
+			if (other.failover === entry) {
+				for (const closed of other.handles) refusedRequests.add(closed);
+				this.drop(path, other, err);
+			}
 		}
-		const slot = this.requests.peek()?.get(path);
+		const slot = this.requests.peek().get(path);
 		if (!slot) return;
 		// Only the route the request is waiting on speaks for it; one superseded by another
 		// route or a local broadcast has a moot answer.
 		if (this.bestEntry(path) !== entry || this.localWins(path, entry)) return;
+		for (const closed of slot.handles) refusedRequests.add(closed);
 		this.drop(path, slot, err);
 	}
 
 	/** End `slot` with `err`, wherever it is held: it leaves the table and every handle closes. */
 	drop(path: Path.Valid, slot: RequestSlot, err: Error): void {
-		const joined = this.requests.peek()?.get(path) === slot;
+		const joined = this.requests.peek().get(path) === slot;
 		if (joined) {
 			this.requests.mutate((map) => {
-				map?.delete(path);
+				map.delete(path);
 			});
 		}
 		this.detach(path, slot);
@@ -957,8 +1082,7 @@ class OriginState {
 		const detached = this.detached.get(path);
 		if (!detached?.delete(slot)) return;
 		if (detached.size === 0) this.detached.delete(path);
-		slot.retired?.close();
-		slot.retired = undefined;
+		this.retain(path, slot, undefined);
 	}
 
 	/**
@@ -970,20 +1094,20 @@ class OriginState {
 	refreshPrefix(prefix: Path.Valid): void {
 		for (const [path, watch] of this.watchers) if (Path.hasPrefix(prefix, path)) watch.version.update((n) => n + 1);
 		const detached = [...this.detached].map(([path, slots]) => [path, [...slots]] as const);
-		for (const [path, slot] of [...(this.requests.peek() ?? [])]) {
+		for (const [path, slot] of [...this.requests.peek()]) {
 			if (Path.hasPrefix(prefix, path)) this.reroute(path, slot);
 		}
 		for (const [path, slots] of detached) {
 			if (!Path.hasPrefix(prefix, path)) continue;
 			for (const slot of slots) this.reroute(path, slot);
 		}
-		for (const path of this.requests.peek()?.keys() ?? []) if (Path.hasPrefix(prefix, path)) this.forget(path);
+		for (const path of this.requests.peek().keys()) if (Path.hasPrefix(prefix, path)) this.forget(path);
 		for (const [path] of detached) if (Path.hasPrefix(prefix, path)) this.forget(path);
 	}
 
 	/** Rebuild the publisher-facing originated table after an advertisement write. */
 	rebuildOriginated(): void {
-		if (!this.local.peek() && !this.advertisedLocal.peek() && !this.routes.peek()) {
+		if (this.closed.peek() !== undefined) {
 			this.originated.set(undefined);
 			return;
 		}
@@ -1000,20 +1124,22 @@ class OriginState {
 		const cached = this.materialized.get(path);
 		if (!cached) return;
 		this.materialized.delete(path);
-		cached.front.close();
+		this.closeUnheld(path, cached.front);
 	}
 
 	/** The preferred entry on the most specific route covering `path`, ignoring skipped entries, if any. */
 	bestEntry(path: Path.Valid, skip?: (entry: RouteEntry) => boolean): RouteEntry | undefined {
 		const routes = this.routes.peek();
-		if (!routes) return undefined;
+		const local = this.local.peek().has(path) ? this.advertisedLocal.peek().get(path) : undefined;
 		for (const prefix of coveringPrefixes(path)) {
 			const entries = routes.get(prefix);
 			if (!entries) continue;
 			const entry = preferredEntry(
 				path,
+				prefix,
 				entries,
 				(candidate) => !candidate.scope.matches(path) || (skip?.(candidate) ?? false),
+				prefix === path && local ? [local] : [],
 			);
 			if (entry) return entry;
 		}
@@ -1022,17 +1148,27 @@ class OriginState {
 
 	/**
 	 * Whether the announced local broadcast at `path` wins over `entry`, the best route a
-	 * session or dynamic handle announced there. They compare as any two routes do, with the
-	 * local broadcast at {@link Preference.default}: an identified route strictly cheaper
-	 * than the local one wins, and the local broadcast wins a tie. A route at a shorter prefix never competes, since the most specific
-	 * prefix wins outright. False when nothing is announced locally at `path`.
+	 * session or dynamic handle announced there. They compare as any two routes do: an
+	 * identified route strictly cheaper than the local one wins, and the local broadcast wins a
+	 * tie. A route at a shorter prefix never competes, since the most specific prefix wins
+	 * outright. A higher epoch of the local broadcast's instance at the path supersedes it, among
+	 * the routes `skip` leaves, which must be what `entry` was chosen from. False when nothing is
+	 * announced locally at `path`.
 	 */
-	localWins(path: Path.Valid, entry: RouteEntry | undefined): boolean {
-		const local = this.advertisedLocal.peek()?.get(path);
-		if (!local || !this.local.peek()?.has(path)) return false;
-		if (!entry || !this.routes.peek()?.get(path)?.includes(entry)) return true;
+	localWins(path: Path.Valid, entry: RouteEntry | undefined, skip?: (entry: RouteEntry) => boolean): boolean {
+		const local = this.advertisedLocal.peek().get(path);
+		if (!local || !this.local.peek().has(path)) return false;
+		if (!entry || !this.routes.peek().get(path)?.includes(entry)) return true;
 		const remote = entry.route.peek();
-		return (compareLinks(local, remote, Preference.default, entry.preference) || compareRoutes(local, remote)) <= 0;
+		// Within one instance only the higher epoch is eligible, however cheap the other is, so
+		// any route at the path the request could take supersedes the local broadcast, not only
+		// the best one.
+		const rivals = (this.routes.peek().get(path) ?? [])
+			.filter((candidate) => candidate.scope.matches(path) && !(skip?.(candidate) ?? false))
+			.map((candidate) => candidate.route.peek());
+		if (superseded(local, rivals)) return false;
+		if (superseded(remote, [local])) return true;
+		return compareRoutes(local, remote) <= 0;
 	}
 
 	/**
@@ -1046,11 +1182,11 @@ class OriginState {
 	 */
 	route(path: Path.Valid, slot: Pick<RequestSlot, "answer">): Resolution | undefined {
 		const entry = this.bestEntry(path);
-		const local = this.local.peek()?.get(path);
+		const local = this.local.peek().get(path);
 		if (local && this.localWins(path, entry)) {
 			// Nothing reads a remote front the local broadcast replaced, so close its session subscription.
 			this.releaseMaterialized(path);
-			return { front: local, epoch: this.advertisedLocal.peek()?.get(path)?.epoch, source: local };
+			return { front: local, instance: this.advertisedLocal.peek().get(path)?.instance, source: local };
 		}
 
 		let cached = this.materialized.get(path);
@@ -1058,8 +1194,8 @@ class OriginState {
 			this.materialized.delete(path);
 			cached = undefined;
 		}
-		const epoch = entry?.route.peek().epoch;
-		if (cached && cached.entry === entry && cached.epoch === epoch) return cached;
+		const instance = entry?.route.peek().instance;
+		if (cached && cached.entry === entry && cached.instance === instance) return cached;
 		if (!entry?.server) {
 			this.releaseMaterialized(path);
 			return slot.answer ? { front: slot.answer } : undefined;
@@ -1067,17 +1203,44 @@ class OriginState {
 
 		const served = entry.server.served.get(path);
 		if (served && served.closed.peek() === undefined) {
-			cached?.front.close();
-			const resolution = { entry, front: served, epoch, source: entry.identity };
+			const resolution = { entry, front: served, instance, source: entry.identity };
 			this.materialized.set(path, resolution);
+			if (cached && cached.front !== served) this.closeUnheld(path, cached.front);
 			return resolution;
 		}
 
 		entry.server.enqueue(path);
 		// The same instance over another route: the old front serves until the new one answers.
-		const kept = cached?.epoch === epoch ? cached : undefined;
-		return { front: kept?.front, epoch, source: kept?.source };
+		const kept = cached?.instance === instance ? cached : undefined;
+		return { front: kept?.front, instance, source: kept?.source };
 	}
+}
+
+/**
+ * The read side of an origin, borrowed: resolve broadcasts by path and watch what is
+ * available, without publishing into it or owning its lifecycle.
+ *
+ * Code that only reads an origin should accept this type. {@link Consumer} implements it
+ * and {@link Table} extends it, so `producer.consume()`, a borrowed table, and a structural
+ * equivalent all fit.
+ *
+ * @public
+ */
+export interface Reader {
+	/** Settles once the origin closes; see {@link Consumer.closed}. */
+	readonly closed: GetPromise<Error | null>;
+
+	/** Whether every attached session announces into the table; see {@link Consumer.discovery}. */
+	readonly discovery: Getter<boolean | undefined>;
+
+	/** Resolve one publisher instance at `path`; see {@link Consumer.request}. */
+	request(path: Path.Valid, options?: RequestOptions): Requesting;
+
+	/** Follow `path` across publisher instances; see {@link Consumer.follow}. */
+	follow(path: Path.Valid, options?: FollowOptions): Following;
+
+	/** The available broadcasts under `scope`, as a live stream; see {@link Consumer.announced}. */
+	announced(scope?: Path.Pattern, options?: Announce.Options): Announce.Consumer;
 }
 
 /**
@@ -1085,49 +1248,77 @@ class OriginState {
  *
  * What a shared connection lends out. {@link Producer} implements it, so code that is
  * handed an origin rather than owning one should accept this type: closing the origin
- * stays the owner's alone, and a borrower cannot express it.
+ * stays the owner's alone, and a borrower cannot express it. A borrower that only reads
+ * should accept {@link Reader} instead, so `producer.consume()` fits too.
  *
  * @public
  */
-export interface Table {
-	/** Settles once the origin closes; see {@link Producer.closed}. */
-	readonly closed: GetPromise<Error | null>;
+export interface Table extends Reader {
+	/** Create a route at exactly `path`, owning a new broadcast; see {@link Producer.route}. */
+	route(path: Path.Valid, options?: RouteOptions): Route;
 
-	/** Whether every attached session announces into the table; see {@link Consumer.discovery}. */
-	readonly discovery: Getter<boolean | undefined>;
-
-	/** Create an unannounced broadcast at `path`; see {@link Producer.createBroadcast}. */
-	createBroadcast(path: Path.Valid): broadcast.Producer;
-
-	/** Resolve `path`, optionally waiting for an announcement; see {@link Consumer.request}. */
-	request(path: Path.Valid, options?: RequestOptions): Requesting;
-
-	/** The available broadcasts under `scope`, as a live stream; see {@link Consumer.announced}. */
-	announced(scope?: Path.Pattern, options?: announce.Options): announce.Consumer;
-
-	/** Advertise a prefix and serve requests under it; see {@link Producer.dynamic}. */
-	dynamic(prefix: Path.Valid): Dynamic;
-
-	/** Insert a route with protocol metadata. @internal */
-	dynamicRoute(
-		prefix: Path.Valid,
-		route?: Route | { epoch?: Route["epoch"]; hops?: Route["hops"]; cost?: Route["cost"]; auth?: Route["auth"] },
-	): Dynamic;
-}
-
-/** Options for resolving a broadcast path. */
-export interface RequestOptions {
-	/**
-	 * Follow announced instances unless an epoch is pinned; resolve blindly when discovery is
-	 * unavailable. Watches the path, so a `consume` session asks its peer about it.
-	 */
-	announced?: boolean;
-	/** Refuse a different publisher instance, including an asynchronous answer or a retry. */
-	epoch?: Epoch.Valid;
+	/** Claim `prefix`, yielding the requests beneath it; see {@link Producer.claim}. */
+	claim(prefix: Path.Valid, options?: RouteOptions): Claim;
 }
 
 /**
- * The write side of an origin: create broadcasts by path and advertise them.
+ * How an application advertises a {@link Route} or {@link Claim}: its visibility at creation,
+ * its price, its credential, and, rarely, a stable instance.
+ *
+ * The default announces at once, at cost 0, under the session's scope, serving a fresh random
+ * instance minted when the route is created. A job's route ({@link Request.route}) instead
+ * continues its claim's instance when that one was minted; see {@link Route.instance}.
+ */
+export interface RouteOptions {
+	/**
+	 * Create the route hidden: it exists for nobody until it announces. For a
+	 * publisher that fills its catalog first, or answers a negotiation, before readers may find it.
+	 */
+	hidden?: boolean;
+	/**
+	 * What pulling content via this route costs: lower wins among routes covering the same
+	 * prefix and anonymity. A publisher prices content it already produces at zero, and content
+	 * it would have to start producing on demand higher.
+	 */
+	cost?: Cost;
+	/**
+	 * The credential the advertising request carries, from `auth.add()`. Only a session built
+	 * on the handle that issued it presents it, as the token on its moq-transport
+	 * PUBLISH_NAMESPACE; every other session advertises the route under its own scope.
+	 */
+	auth?: Credential;
+	/**
+	 * Serve this stable instance `id` at `epoch`, in place of a freshly minted one.
+	 *
+	 * Only for a publisher that continues the instance's sequence space across restarts,
+	 * announcing a higher `epoch` each time, such as a counter persisted on disk. Readers
+	 * stitch every route of one instance together, so a publisher that restarts its group
+	 * sequences under an old instance splices unrelated groups into their tracks. The highest
+	 * epoch wins over every older one of the instance, cheaper or not. Naming an instance grants
+	 * nothing: publishing still needs the path's grant.
+	 */
+	instance?: { id: Instance.Valid; epoch: bigint };
+}
+
+/** Options for resolving one publisher instance with {@link Consumer.request}. */
+export interface RequestOptions {
+	/** Refuse a different publisher instance, including an asynchronous answer or a retry. */
+	instance?: Instance.Valid;
+}
+
+/** Options for following a broadcast path with {@link Consumer.follow}. */
+export interface FollowOptions {
+	/** Follow only this publisher instance, waiting for it to return across gaps. */
+	instance?: Instance.Valid;
+}
+
+// Route constructors, assigned in the classes' static blocks so no class exposes one.
+let makeRoute: (broadcast: broadcast.Producer, control: RouteControl) => Route;
+let makeClaim: (control: RouteControl, requested: () => AsyncIterableIterator<Request>) => Claim;
+let exactRoute: (producer: Producer, path: Path.Valid, options: RouteOptions, request: Request) => Route;
+
+/**
+ * The write side of an origin: route broadcasts into it by path and advertise them.
  *
  * Independent of any connection. A connection given this origin (via its `publish` option)
  * announces and serves the table's originated advertisements for as long as the session
@@ -1135,35 +1326,58 @@ export interface RequestOptions {
  * the origin down. A reconnecting session re-announces the table on each attach, so
  * advertisements made while offline surface on the next connection.
  *
- * Create, attach {@link dynamic} for tracks served on demand, populate, then
- * {@link broadcast.Producer.announce}: an exact-path subscribe before the tracks exist is
- * refused, and nobody can see or reach a broadcast until it announces.
+ * Create a {@link route} at a path and fill its broadcast; create it hidden and
+ * {@link Route.announce} it once its first tracks exist, since nobody can see or reach a hidden
+ * route. To publish broadcasts on demand instead, {@link claim} a prefix and answer the
+ * requests beneath it.
  *
  * @public
  */
 export class Producer implements Table {
 	#state = new OriginState();
 	#scope = Scope.all;
-	#preference = Preference.default;
-	#requests?: Getter<ReadonlyMap<Path.Valid, RequestSlot> | undefined>;
+	#requests?: Getter<ReadonlyMap<Path.Valid, RequestSlot>>;
+
+	// Set on a derived handle, which borrows the origin: what it registered, so its close
+	// releases only that. The owner has none, since its close ends the whole origin.
+	#borrowed?: { releases: Set<Dispose>; closed: boolean };
 
 	// The reader backing the passthroughs, so holding a Producer never requires the
 	// consume().x() stutter for everyday reads. One instance, so `discovery` keeps its
 	// identity across reads.
 	#reader = makeConsumer(this.#state, this.#scope);
 
+	static {
+		hooks.hiddenWithheld = (origin) => origin.#state.withheld;
+		exactRoute = (producer, path, options, request) => producer.#exact(path, options, request);
+	}
+
 	constructor() {
 		const thisProducer = this;
 		registerWire(this, {
 			receive: (prefix, route) => this.#receive(prefix, route),
-			interests: (listener) =>
-				this.#state.interests((absolute, wanted) => {
-					for (const prefix of this.#scope.interests(absolute)) listener(prefix, wanted);
-				}),
+			interests: (listener) => {
+				if (this.#borrowed?.closed) return () => {};
+				// What the listener currently wants, so a derived handle's close can retract it
+				// and its session stops asking the peer for announcements nothing will land.
+				const wants = new Map<Path.Valid, number>();
+				const unlisten = this.#state.interests((absolute, wanted) => {
+					for (const prefix of this.#scope.interests(absolute)) {
+						const count = (wants.get(prefix) ?? 0) + (wanted ? 1 : -1);
+						if (count > 0) wants.set(prefix, count);
+						else wants.delete(prefix);
+						listener(prefix, wanted);
+					}
+				});
+				return this.#hold(() => {
+					unlisten();
+					for (const [prefix, count] of wants) for (let i = 0; i < count; i++) listener(prefix, false);
+				});
+			},
 			accepts: (prefix) => this.#scope.overlaps(Path.join(this.#scope.root, prefix)),
 			attach: (discovery) => this.#attach(discovery),
-			expect: () => this.#expect(),
-			snapshot: (prefix) => this.#state.addSnapshot(this.#scope.prefix(prefix)),
+			snapshot: (prefix) =>
+				this.#borrowed?.closed ? () => {} : this.#hold(this.#state.addSnapshot(this.#scope.prefix(prefix))),
 			get requests() {
 				if (thisProducer.#scope === Scope.all) return thisProducer.#state.requests;
 				thisProducer.#requests ??= new Derived([thisProducer.#state.requests], (requests) =>
@@ -1172,40 +1386,24 @@ export class Producer implements Table {
 				return thisProducer.#requests;
 			},
 			changed: () => this.#changed(),
-			blind: (slot) => this.#state.blind(slot),
+			blind: (slot) => this.#state.blind(slot as RequestSlot),
 			answer: (path, front) => this.#answer(this.#scope.path(path), front),
 			routes: (path) => wireOf(this.#reader).routes(path),
 		});
 	}
 
-	/** Narrow this handle to patterns beneath root, presenting paths relative to that root. */
+	/**
+	 * Narrow this handle to patterns beneath root, presenting paths relative to that root.
+	 * The result borrows the origin; see {@link close}.
+	 */
 	scope(root: Path.Valid, patterns: Path.Patterns): Producer {
+		if (this.#borrowed?.closed) throw new Error("origin handle is closed");
 		const scope = this.#scope.narrow(root, patterns);
 		const producer = new Producer();
 		producer.#state = this.#state;
 		producer.#scope = scope;
-		producer.#preference = this.#preference;
 		producer.#reader = makeConsumer(this.#state, scope);
-		return producer;
-	}
-
-	/**
-	 * Rank the link this handle (and any handle derived from it) is given to: higher wins, and
-	 * every handle starts at the neutral {@link Preference.default}.
-	 *
-	 * Applies to what {@link dynamic} advertises, which is how a session lands its peer's
-	 * routes, not to a broadcast published here. A route with a newer epoch still wins, but
-	 * among the rest preference decides before cost, so links to different operators rank by
-	 * this instead of comparing their metrics. Hand each CDN's session its own rank to use the
-	 * primary while it has a route and fail over to the next. Mirrors
-	 * `origin::Producer::with_preference` in rs/moq-net.
-	 */
-	withPreference(preference: Preference): Producer {
-		const producer = new Producer();
-		producer.#state = this.#state;
-		producer.#scope = this.#scope;
-		producer.#preference = preference;
-		producer.#reader = makeConsumer(this.#state, this.#scope);
+		producer.#borrowed = { releases: new Set(), closed: false };
 		return producer;
 	}
 
@@ -1218,177 +1416,350 @@ export class Producer implements Table {
 	}
 
 	/**
-	 * Create a broadcast at `path`, returning its producer.
+	 * Create a route at exactly `path`, owning a new broadcast to fill.
 	 *
-	 * The broadcast exists for nobody until {@link broadcast.Producer.announce}: announce
-	 * streams skip it and requests for its path find nothing, on this origin exactly as at
-	 * a peer. Announce once its tracks exist; {@link broadcast.Producer.unannounce}
-	 * withdraws it from everyone again.
+	 * This is how local content enters an origin. Fill the broadcast through
+	 * {@link Route.broadcast}. The route serves a fresh random instance, minted here and kept
+	 * for its lifetime, across {@link Route.withdraw} and {@link Route.announce}, since its
+	 * sequences continue: a new route is a new stream that never splices into an old one. A
+	 * publisher that continues one sequence space across restarts may name a stable instance
+	 * instead ({@link RouteOptions.instance}).
 	 *
-	 * Close the producer to drop it. Creating a path again supersedes the previous
-	 * broadcast: the origin drops its handle on the old one, which closes it unless the
-	 * application still holds a consumer clone. Announce with a {@link Route.epoch}
-	 * (`Epoch.mint()` per run) so a restart replaces the old broadcast rather than resuming
-	 * into it; at the same epoch, a local broadcast competes on cost and wins ties.
+	 * Announced at once unless created {@link RouteOptions.hidden | hidden}. A hidden route
+	 * exists for nobody until {@link Route.announce}: announce streams skip it and a request
+	 * for its path finds nothing, on this origin exactly as at a peer. Create it hidden when
+	 * the tracks a subscriber needs first, such as a catalog, are not there yet. To serve paths
+	 * on demand without publishing each one, use {@link claim}.
+	 *
+	 * Closing the route retracts it and closes its broadcast, and so does closing the
+	 * broadcast. Creating a path again supersedes the previous route: the origin retracts it
+	 * and closes its broadcast, and tracks already subscribed keep serving until they end. At
+	 * the same instance, a local broadcast competes on cost and wins ties.
 	 */
-	createBroadcast(path: Path.Valid): broadcast.Producer {
+	route(path: Path.Valid, options: RouteOptions = {}): Route {
+		return this.#exact(path, options);
+	}
+
+	/** An exact route at `path`, answering `request` on its first announce when it is a job's. */
+	#exact(path: Path.Valid, options: RouteOptions, request?: Request): Route {
 		path = this.#scope.path(path);
+		if (this.#borrowed?.closed) throw new Error("origin handle is closed");
+		publishPath(path);
+		if (this.#state.closed.peek() !== undefined) throw new Error("origin is closed");
 		const created = this.#state.created;
-		if (!created) throw new Error("origin is closed");
+		// Normalized first, so a bad cost throws before anything is created.
+		let info = WireRoute.normalize({
+			instance: options.instance?.id ?? Instance.random(),
+			epoch: options.instance?.epoch ?? 0n,
+			cost: options.cost,
+			auth: options.auth,
+		});
+
+		// A job naming no instance continues its claim's, bound when it first announces or when its
+		// instance is read, whichever comes first. One that never read it is not invalidated by the
+		// claim moving on while it is prepared; one that read it announces under it or not at all.
+		const claim = request && options.instance === undefined ? requestHandoff(request) : undefined;
+		let bound = false;
 
 		const producer = new broadcast.Producer();
 		hooks.stampPath(producer, path);
 		const front = producer.consume();
-
-		hooks.attachAnnouncer(producer, {
-			announce: (route) => this.#advertiseExact(path, front, route),
-			unannounce: () => this.#retractExact(path, front),
-			route: () =>
-				this.#state.local.peek()?.get(path) === front
-					? this.#state.advertisedLocal.peek()?.get(path)
-					: undefined,
-		});
-
+		const announced = () => this.#state.local.peek().get(path) === front;
+		// The claim moves on before the retraction reroutes anything, so no request resolving the
+		// claim in this step is answered under the ended stream.
+		const retract = () => {
+			if (bound && announced()) claim?.advance(info.instance as Instance.Valid);
+			this.#retractExact(path, front);
+		};
+		const entry = { producer, front, retract };
 		const previous = created.get(path);
-		created.set(path, front);
+		created.set(path, entry);
 		if (previous) {
-			this.#retractExact(path, previous);
-			previous.close();
+			previous.retract();
+			retire(previous);
 		}
 
-		// Drop it when the broadcast closes, unless a recreate already replaced it: a
-		// stale broadcast closing must not unpublish the live one.
-		void front.closed.then(() => {
-			this.#retractExact(path, front);
-			if (this.#state.created?.get(path) === front) this.#state.created.delete(path);
+		// The request a job's route answers when it first announces.
+		let pending = request;
+		// Drop the route when its broadcast closes, unless a recreate already replaced it: a
+		// stale broadcast closing must not unpublish the live one. Clearing `created` also stops
+		// a later announce. A job's unanswered request can never be answered now.
+		const release = this.#hold(() => {
+			stop();
+			retract();
+			if (created.get(path) === entry) created.delete(path);
+			retire(entry);
+			const job = pending;
+			pending = undefined;
+			if (job) rejectJob(job, unroutable());
 		});
+		// Synchronous, so a request made right after the broadcast closes finds it gone.
+		const stop = hooks.onClosed(producer, release);
 
-		return producer;
+		const announce = () => {
+			if (producer.closed.peek() !== undefined) throw new Error("broadcast is closed");
+			const job = pending;
+			if (!job) {
+				this.#advertiseExact(path, front, info);
+				return;
+			}
+			pending = undefined;
+			try {
+				// A request released meanwhile can never be answered, so this route never announces.
+				if (!jobPending(job)) throw unroutable();
+				if (claim) {
+					const current = claim.current();
+					// A job that read its instance announces under it or not at all. Its requesters ask
+					// the claim again, so the worker prepares the job under the claim's new instance.
+					if (bound && current.instance !== info.instance) {
+						requeueJob(job);
+						throw unroutable();
+					}
+					info = { ...info, ...current };
+					bound = true;
+				}
+				this.#advertiseExact(path, front, info);
+			} catch (err) {
+				release();
+				rejectJob(job, err instanceof Error ? err : new Error(String(err)));
+				throw err;
+			}
+			answerJob(job);
+		};
+		const change = (next: WireRoute) => {
+			if (producer.closed.peek() !== undefined) throw new Error("broadcast is closed");
+			if (this.#state.closed.peek() !== undefined) throw new Error("origin is closed");
+			info = next;
+			if (announced()) this.#advertiseExact(path, front, info);
+		};
+
+		const route = makeRoute(producer, {
+			instance: () => {
+				if (claim && !bound && pending) {
+					info = { ...info, ...claim.current() };
+					bound = true;
+				}
+				return info.instance as Instance.Valid;
+			},
+			announce,
+			withdraw: retract,
+			announced,
+			change: (update) => change(WireRoute.normalize({ ...info, ...update })),
+			close: release,
+			end: release,
+			info: () => (announced() ? this.#state.advertisedLocal.peek().get(path) : undefined),
+			update: (next) => {
+				const named = WireRoute.normalize(next);
+				info = named.instance === undefined ? { ...named, instance: info.instance, epoch: info.epoch } : named;
+				announce();
+			},
+		});
+		if (!options.hidden) announce();
+		return route;
 	}
 
-	#advertiseExact(path: Path.Valid, front: broadcast.Consumer, route: Route): void {
-		if (!this.#state.local.peek()) throw new Error("origin is closed");
-		if (this.#state.created?.get(path) !== front) throw new Error("broadcast is closed");
+	#advertiseExact(path: Path.Valid, front: broadcast.Consumer, route: WireRoute): void {
+		if (this.#state.closed.peek() !== undefined) throw new Error("origin is closed");
+		if (this.#state.created.get(path)?.front !== front) throw new Error("broadcast is closed");
 		// Both maps move together, so every reader sees the broadcast and its route at once.
 		this.#state.local.mutate((broadcasts) => {
-			broadcasts?.set(path, front);
+			broadcasts.set(path, front);
 		});
 		this.#state.advertisedLocal.mutate((advertised) => {
-			advertised?.set(path, route);
+			advertised.set(path, route);
 		});
 		this.#state.rebuildOriginated();
 		this.#state.refresh(path);
 	}
 
 	#retractExact(path: Path.Valid, front: broadcast.Consumer): void {
-		if (this.#state.local.peek()?.get(path) !== front) return;
+		if (this.#state.local.peek().get(path) !== front) return;
 		this.#state.local.mutate((broadcasts) => {
-			broadcasts?.delete(path);
+			broadcasts.delete(path);
 		});
 		this.#state.advertisedLocal.mutate((advertised) => {
-			advertised?.delete(path);
+			advertised.delete(path);
 		});
 		this.#state.rebuildOriginated();
 		this.#state.refresh(path);
 	}
 
 	/**
-	 * Advertise `prefix` and serve the requests beneath it.
+	 * Claim `prefix`, yielding the requests beneath it.
 	 *
-	 * A route is always a prefix: it claims `prefix` and every path beneath it (the
-	 * empty prefix claims every path). A service that only serves some of them
-	 * advertises the covering prefix and rejects the rest as they are requested;
-	 * consumers narrow with a {@link Path.Pattern} locally. The advertisement is
-	 * visible to {@link Consumer.announced} and forwarded by sessions for as long as
-	 * the returned {@link Dynamic} lives. A consumer resolving a path under it that
-	 * no announced local broadcast wins is handed to the handle as a {@link Request}.
-	 */
-	dynamic(prefix: Path.Valid): Dynamic {
-		return this.#insertRoute(prefix, Route.default, true, true);
-	}
-
-	/** Insert an originated claim with route metadata that answers through `accept`, for tests and benches. @internal */
-	dynamicRoute(
-		prefix: Path.Valid,
-		route:
-			| Route
-			| {
-					epoch?: Route["epoch"];
-					hops?: Route["hops"];
-					cost?: Route["cost"];
-					auth?: Route["auth"];
-			  } = Route.default,
-	): Dynamic {
-		return this.#insertRoute(prefix, Route.normalize(route), true, false);
-	}
-
-	/**
-	 * Land a route a peer announced, served through the returned handle. Same as
-	 * {@link dynamic} but not originated, so a session never announces it back.
+	 * A route is always a prefix on the wire: a claim covers `prefix` and every path beneath it
+	 * (the empty prefix claims every path). A service that only serves some of them advertises
+	 * the covering prefix and rejects the rest as they are requested; consumers narrow with a
+	 * {@link Path.Pattern} locally. The claim is priced, credentialed and shown like an exact
+	 * route, and forwarded by sessions while it is visible.
 	 *
-	 * @internal
+	 * A consumer resolving a path under it that no announced local broadcast wins is handed to
+	 * {@link Claim.requested} as a {@link Request}: answer it by serving a broadcast already held
+	 * ({@link Request.serve}), under this claim's instance, or by creating the path's own exact
+	 * route ({@link Request.route}), a job. Without {@link RouteOptions.instance} this claim
+	 * serves a minted instance that its jobs continue, so a reader resolved through it keeps
+	 * reading when the job's route lands; once a job stops being advertised, this claim moves to
+	 * a fresh instance, so restarting the job never splices into a copy of the last. With a named
+	 * instance, each job mints its own. A publisher that knows its broadcasts creates each one's
+	 * exact {@link route} instead, so subscribers can enumerate them.
 	 */
-	#receive(
-		prefix: Path.Valid,
-		route:
-			| Route
-			| {
-					epoch?: Route["epoch"];
-					hops?: Route["hops"];
-					cost?: Route["cost"];
-					auth?: Route["auth"];
-			  } = Route.default,
-	): Dynamic {
-		return this.#insertRoute(prefix, Route.normalize(route), false, false);
+	claim(prefix: Path.Valid, options: RouteOptions = {}): Claim {
+		const info = WireRoute.normalize({
+			instance: options.instance?.id,
+			epoch: options.instance?.epoch,
+			cost: options.cost,
+			auth: options.auth,
+		});
+		return this.#serving(prefix, info, true, true, !options.hidden);
 	}
 
-	#insertRoute(prefix: Path.Valid, route: Route, originated: boolean, publishes: boolean): Dynamic {
+	/** Land a route a peer announced, taken as given. Not originated, so a session never announces it back. */
+	#receive(prefix: Path.Valid, route?: Partial<WireRoute>): Claim {
+		return this.#serving(prefix, WireRoute.normalize(route), false, false, true);
+	}
+
+	#serving(prefix: Path.Valid, route: WireRoute, originated: boolean, publishes: boolean, visible: boolean): Claim {
 		prefix = this.#scope.prefix(prefix);
-		const server = new ServeState(this.#scope.root, prefix, originated);
+		// A route that names no instance serves one of its own, and a claim hands that one to its jobs.
+		const minted = route.instance === undefined;
+		if (minted) route = { ...route, instance: Instance.random(), epoch: 0n };
+		publishPath(prefix);
+		const server = new ServeState(this.#scope.root, prefix);
 		server.onChange = (path) => this.#state.refresh(path);
 		const entry: RouteEntry = {
 			identity: {},
 			scope: this.#scope,
 			claim: this.#scope.allowed?.intersect(new Path.Patterns([Path.Pattern.subtree(prefix)])),
 			route: new Signal(route),
-			preference: this.#preference,
 			originated,
 			server,
+			lost: false,
 		};
 		server.onReject = (path, err) => this.#state.refuse(path, entry, err);
 
-		let closed = false;
-		this.#state.routes.mutate((routes) => {
-			if (!routes) {
-				closed = true;
-				return;
-			}
-			const entries = routes.get(prefix);
-			if (entries) entries.unshift(entry);
-			else routes.set(prefix, [entry]);
-		});
-		if (closed) {
-			server.close();
-			return makeDynamic(prefix, entry, this.#state, () => {}, publishes ? this : undefined);
-		}
-		this.#state.rebuildOriginated();
-		this.#state.refreshPrefix(prefix);
-
-		const retract = () => {
+		let inserted = false;
+		let ended = false;
+		// Closing the origin drops the whole table without visiting each route, so a route
+		// still marked inserted learns of it here, matching an exact route's "origin is closed".
+		const open = () => {
+			if (ended) throw new Error("claim is closed");
+			if (this.#state.closed.peek() === undefined) return;
+			inserted = false;
+			throw new Error("origin is closed");
+		};
+		const insert = () => {
+			open();
+			if (inserted) return;
 			this.#state.routes.mutate((routes) => {
-				const entries = routes?.get(prefix);
-				if (!entries) return;
-				const index = entries.indexOf(entry);
-				if (index < 0) return;
-				entries.splice(index, 1);
-				if (entries.length === 0) routes?.delete(prefix);
+				const entries = routes.get(prefix);
+				if (entries) entries.unshift(entry);
+				else routes.set(prefix, [entry]);
 			});
-			server.close();
+			inserted = true;
 			this.#state.rebuildOriginated();
 			this.#state.refreshPrefix(prefix);
 		};
+		// Take the entry out of the table, then end (or renew) the server before the requests
+		// beneath it reroute, so none of them resolves through an answer it already gave.
+		const remove = (server: () => void) => {
+			if (inserted) {
+				inserted = false;
+				this.#state.routes.mutate((routes) => {
+					const entries = routes.get(prefix);
+					if (!entries) return;
+					const index = entries.indexOf(entry);
+					if (index < 0) return;
+					entries.splice(index, 1);
+					if (entries.length === 0) routes.delete(prefix);
+				});
+			}
+			server();
+			this.#state.rebuildOriginated();
+			this.#state.refreshPrefix(prefix);
+		};
+		// A received route torn down by any path (its handle, or the scoped handle it came through)
+		// was lost with its session; only its announcer ending it on the wire withdraws it.
+		let lost = !originated;
+		const release = this.#hold(() => {
+			if (!ended) entry.lost = lost;
+			ended = true;
+			this.#state.servers.delete(server);
+			remove(() => server.close());
+		});
+		// A route made after its origin (or this handle) closed is born retracted.
+		if (this.#borrowed?.closed || this.#state.closed.peek() !== undefined) {
+			ended = true;
+			server.close();
+		} else {
+			this.#state.servers.add(server);
+			if (visible) insert();
+		}
 
-		return makeDynamic(prefix, entry, this.#state, retract, publishes ? this : undefined);
+		// An `advance` to a fresh instance of the claim's own keeps the requests its handler holds,
+		// which a job binding at announce answers under the new instance, and the held answers it
+		// served; only readers restart.
+		const update = (next: WireRoute, advance = false) => {
+			open();
+			const previous = entry.route.peek().instance;
+			const restart = inserted && previous !== next.instance;
+			if (restart) this.#state.restart(entry);
+			entry.route.set(next);
+			if (previous !== next.instance) {
+				// Wakes a peer's demand pinned to the old instance, which then refuses it.
+				if (advance) server.settled.update((n) => n + 1);
+				else server.reset();
+			}
+			if (!inserted) return;
+			this.#state.rebuildOriginated();
+			this.#state.refreshPrefix(prefix);
+			this.#state.routes.mutate(() => {});
+		};
+
+		if (publishes && minted) {
+			server.handoff = {
+				current: () => {
+					const { instance, epoch } = entry.route.peek();
+					return { instance: instance as Instance.Valid, epoch: epoch ?? 0n };
+				},
+				advance: (instance) => {
+					if (ended || this.#state.closed.peek() !== undefined || entry.route.peek().instance !== instance)
+						return;
+					update({ ...entry.route.peek(), instance: Instance.random(), epoch: 0n }, true);
+				},
+			};
+		}
+
+		const publisher = publishes ? this : undefined;
+		return makeClaim(
+			{
+				instance: () => entry.route.peek().instance as Instance.Valid,
+				announce: insert,
+				withdraw: () => {
+					if (ended || !inserted) return;
+					remove(() => server.reset());
+				},
+				announced: () => inserted && this.#state.closed.peek() === undefined,
+				change: (changed) => update(WireRoute.normalize({ ...entry.route.peek(), ...changed })),
+				close: release,
+				end: () => {
+					lost = false;
+					release();
+				},
+				info: () => (inserted && this.#state.closed.peek() === undefined ? entry.route.peek() : undefined),
+				update: (next) => {
+					// A route naming no instance keeps the one it serves.
+					const named = WireRoute.normalize(next);
+					const current = entry.route.peek();
+					update(
+						named.instance === undefined
+							? { ...named, instance: current.instance, epoch: current.epoch }
+							: named,
+					);
+					insert();
+				},
+			},
+			() => serveRequests(server, publisher),
+		);
 	}
 
 	/**
@@ -1398,15 +1769,9 @@ export class Producer implements Table {
 	 * @internal
 	 */
 	#attach(discovery: boolean): Dispose {
+		if (this.#borrowed?.closed) return () => {};
 		this.#sessions(1, discovery);
-		const release = this.#expect();
-		let detached = false;
-		return () => {
-			if (detached) return;
-			detached = true;
-			this.#sessions(-1, discovery);
-			release();
-		};
+		return this.#hold(() => this.#sessions(-1, discovery));
 	}
 
 	#sessions(delta: number, discovery: boolean): void {
@@ -1414,30 +1779,23 @@ export class Producer implements Table {
 			total: total + delta,
 			discovery: d + (discovery ? delta : 0),
 		}));
+		// Losing a session without discovery can leave every pending request synced.
+		this.#state.settle(Path.empty());
 	}
 
-	/**
-	 * Declare that something will answer requests on this origin, even with no session
-	 * attached right now.
-	 *
-	 * A reconnecting connection holds one for its whole life, so a request made during a
-	 * reconnect (or before the first session establishes) stays pending instead of reading as
-	 * unroutable. Without it, {@link Request.unroutable} would fire on every page load, in the
-	 * window between wiring the origin up and the handshake completing. Call the returned
-	 * dispose when the connection is done for good.
-	 *
-	 * @internal
-	 */
-	#expect(): Dispose {
-		this.#state.answerers.update((count) => count + 1);
-		let released = false;
-		return () => {
-			if (released) return;
-			released = true;
-			// Clamped because closing the origin zeroes the count, and the sessions attached at
-			// the time still release afterwards.
-			this.#state.answerers.update((count) => Math.max(0, count - 1));
+	// Run `release` once, at the first of its own call or this derived handle's close, so a
+	// borrower's close withdraws what it registered. The owner's close tears down everything.
+	#hold(release: Dispose): Dispose {
+		const borrowed = this.#borrowed;
+		let done = false;
+		const held = () => {
+			if (done) return;
+			done = true;
+			borrowed?.releases.delete(held);
+			release();
 		};
+		borrowed?.releases.add(held);
+		return held;
 	}
 
 	/**
@@ -1468,18 +1826,18 @@ export class Producer implements Table {
 	 * @internal
 	 */
 	#answer(path: Path.Valid, front: broadcast.Consumer): Dispose | undefined {
-		const slot = this.#state.requests.peek()?.get(path);
-		if (!slot || slot.answer !== undefined) {
+		const slot = this.#state.requests.peek().get(path);
+		if (!slot || slot.answer !== undefined || this.#borrowed?.closed) {
 			front.close();
 			return undefined;
 		}
 		slot.answer = front;
 		this.#state.refresh(path);
 
-		return () => {
+		return this.#hold(() => {
 			if (slot.answer === front) {
 				// A request the answer resolved ends with its session: the next session is another
-				// publisher instance, since nothing (no epoch) says it serves the same bytes.
+				// publisher instance, since nothing (no instance) says it serves the same bytes.
 				if (slot.route.peek()?.front === front) {
 					this.#state.drop(path, slot, unroutable());
 				} else {
@@ -1491,7 +1849,7 @@ export class Producer implements Table {
 				}
 			}
 			front.close();
-		};
+		});
 	}
 
 	/** A read handle for this origin, the side a connection's `publish` option borrows. */
@@ -1504,49 +1862,74 @@ export class Producer implements Table {
 		return this.#reader.discovery;
 	}
 
-	/** Resolve `path`, optionally waiting for an announcement; see {@link Consumer.request}. */
+	/** Resolve one publisher instance at `path`; see {@link Consumer.request}. */
 	request(path: Path.Valid, options?: RequestOptions): Requesting {
 		return this.#reader.request(path, options);
 	}
 
+	/** Follow `path` across publisher instances; see {@link Consumer.follow}. */
+	follow(path: Path.Valid, options?: FollowOptions): Following {
+		return this.#reader.follow(path, options);
+	}
+
 	/** The available broadcasts under `scope`, as a live stream; see {@link Consumer.announced}. */
-	announced(scope?: Path.Pattern, options?: announce.Options): announce.Consumer {
+	announced(scope?: Path.Pattern, options?: Announce.Options): Announce.Consumer {
 		return this.#reader.announced(scope, options);
 	}
 
-	/** Close the origin, every broadcast it still routes, and its announcement streams. Idempotent. */
+	/** Every route change under `scope`; see {@link Consumer.routes}. @internal */
+	routes(scope?: Path.Pattern, options?: Announce.Options): announce.Routes {
+		return this.#reader.routes(scope, options);
+	}
+
+	/**
+	 * Close the origin, every broadcast it still routes, and its announcement streams. Idempotent.
+	 *
+	 * A handle from {@link scope} borrows the origin: closing it
+	 * withdraws only the broadcasts, routes, and sessions (with their answers) registered
+	 * through it and refuses new ones, ignoring `abort`. Only the handle made with `new Producer()` closes the origin.
+	 */
 	close(abort?: Error) {
+		const borrowed = this.#borrowed;
+		if (borrowed) {
+			if (borrowed.closed) return;
+			borrowed.closed = true;
+			for (const release of [...borrowed.releases]) release();
+			borrowed.releases.clear();
+			return;
+		}
 		if (this.#state.closed.peek() !== undefined) return;
 		this.#state.closed.set(abort ?? null);
 		for (const watch of this.#state.watchers.values()) watch.version.update((n) => n + 1);
-		for (const front of this.#state.created?.values() ?? []) {
-			front.close();
-		}
-		this.#state.created = undefined;
-		this.#state.local.update(() => undefined);
-		this.#state.advertisedLocal.update(() => undefined);
+		// Cleared before the broadcasts close, so each route's synchronous retraction finds
+		// nothing left to rebuild rather than rebuilding the table once per route.
+		const created = this.#state.created;
+		this.#state.created = new Map();
+		this.#state.local.update(() => new Map());
+		this.#state.advertisedLocal.update(() => new Map());
+		for (const entry of created.values()) retire(entry);
 		this.#state.routes.update((routes) => {
-			for (const entries of routes?.values() ?? []) {
+			for (const entries of routes.values()) {
 				for (const entry of entries) entry.server?.close(abort);
 			}
-			return undefined;
+			return new Map();
 		});
+		// A hidden or withdrawn prefix route is out of the table but its handler still waits.
+		for (const server of this.#state.servers) server.close(abort);
+		this.#state.servers.clear();
 		this.#state.originated.update(() => undefined);
 		// Materialized broadcasts are handles we opened; release them.
 		for (const cached of this.#state.materialized.values()) {
 			cached.front.close();
 		}
 		this.#state.materialized.clear();
-		// Nothing will answer a request on a closed origin, whatever is still attached, so
-		// existing requests report unroutable rather than waiting on a corpse.
-		this.#state.answerers.set(0);
 		this.#state.requests.update((requests) => {
-			for (const slot of requests?.values() ?? []) {
+			for (const slot of requests.values()) {
 				slot.answer?.close();
 				slot.answer = undefined;
 				slot.route.set(undefined);
 			}
-			return undefined;
+			return new Map();
 		});
 		for (const [path, slots] of [...this.#state.detached]) {
 			for (const slot of slots) {
@@ -1561,30 +1944,34 @@ export class Producer implements Table {
 // that would leak the unexported OriginState. Assigned in the class's static block.
 let makeConsumer: (state: OriginState, scope: Scope) => Consumer;
 
-// Same for Requesting: a public constructor would let a caller forge a handle that no origin
+// Same for Requesting and Following: a public constructor would let a caller forge a handle that no origin
 // ever registered, whose lifecycle guarantees are then false. `@internal` alone would not
 // stop it, since the declaration emit keeps the constructor.
 let makeRequesting: (
 	path: Path.Valid,
 	active: Getter<broadcast.Consumer | undefined>,
-	unroutable: Getter<boolean>,
 	closed: Once<Error | null>,
 	dispose: Dispose,
 ) => Requesting;
 
-let makeDynamic: (
-	prefix: Path.Valid,
-	entry: RouteEntry,
-	state: OriginState,
-	retract: Dispose,
-	publisher?: Producer,
-) => Dynamic;
+let makeFollowing: (
+	path: Path.Valid,
+	active: Getter<broadcast.Consumer | undefined>,
+	closed: Once<Error | null>,
+	dispose: Dispose,
+) => Following;
 
 let makeRequest: (path: Path.Valid, server: ServeState) => Request;
 let finishRequest: (request: Request, err: Error) => void;
+let setRequestPublisher: (request: Request, publisher: Producer | undefined) => void;
+let jobPending: (request: Request) => boolean;
+let answerJob: (request: Request) => void;
+let rejectJob: (request: Request, err: Error) => void;
+let requeueJob: (request: Request) => void;
+let requestHandoff: (request: Request) => Handoff | undefined;
 
 /**
- * An owned request for a broadcast path; see {@link Consumer.request}.
+ * An owned request for one publisher instance at a broadcast path; see {@link Consumer.request}.
  *
  * @public
  */
@@ -1593,29 +1980,16 @@ export class Requesting {
 	readonly path: Path.Valid;
 
 	/**
-	 * The current broadcast, or undefined while nothing provides the path.
-	 * Announced requests without an epoch follow publisher restarts. Blind and epoch-pinned
-	 * requests retain their accepted instance. Another route of the same epoch taking over keeps
+	 * The accepted broadcast, or undefined while the request is pending.
+	 * Another route of the same instance taking over keeps
 	 * this handle: its tracks resume on that route from the first group each reader lacks.
 	 * Closing this handle affects only this request.
 	 */
 	readonly active: Getter<broadcast.Consumer | undefined>;
 
 	/**
-	 * Whether nothing can serve this path, as opposed to not having served it yet.
-	 *
-	 * True when the origin routes nothing here and nothing is prepared to answer: no session
-	 * attached and no connection reconnecting toward one. False whenever {@link active} is
-	 * set, and false while a connection is still coming up, so the ordinary page-load window
-	 * before the first handshake reads as pending rather than as a missing broadcast.
-	 * An announced request can still resolve on a later announcement. True once refused or closed.
-	 */
-	readonly unroutable: Getter<boolean>;
-
-	/**
-	 * Settles on refusal, origin shutdown, or explicit close.
-	 * A pinned or blind request also ends when its accepted instance stops serving;
-	 * an unpinned announced request waits for a later start instead.
+	 * Settles on refusal, origin shutdown, explicit close, or the accepted instance ending.
+	 * Fails `Unroutable` while pending once discovery syncs without a route for it.
 	 */
 	readonly closed: GetPromise<Error | null>;
 
@@ -1625,23 +1999,70 @@ export class Requesting {
 	private constructor(
 		path: Path.Valid,
 		active: Getter<broadcast.Consumer | undefined>,
-		unroutable: Getter<boolean>,
 		closed: GetPromise<Error | null>,
 		dispose: Dispose,
 	) {
 		this.path = path;
 		this.active = active;
-		this.unroutable = unroutable;
 		this.closed = closed;
 		this.#dispose = dispose;
 	}
 
 	static {
-		makeRequesting = (path, active, unroutable, closed, dispose) =>
-			new Requesting(path, active, unroutable, closed, dispose);
+		makeRequesting = (path, active, closed, dispose) => new Requesting(path, active, closed, dispose);
 	}
 
 	/** Withdraw the request. The path stays routed for any other open request. Idempotent. */
+	close(): void {
+		if (this.#disposed) return;
+		this.#disposed = true;
+		this.#dispose();
+	}
+}
+
+/**
+ * An owned follower of the publisher instances announced at a broadcast path; see {@link Consumer.follow}.
+ *
+ * @public
+ */
+export class Following {
+	/** The followed path. */
+	readonly path: Path.Valid;
+
+	/**
+	 * The current announced broadcast, or undefined between publisher instances.
+	 * Moves to each new instance, or waits for the pinned instance when one was requested.
+	 * Another route of the same instance keeps this handle and resumes its tracks.
+	 * Closing this handle affects only this follower.
+	 */
+	readonly active: Getter<broadcast.Consumer | undefined>;
+
+	/**
+	 * Settles on refusal, origin shutdown, or explicit close.
+	 * Waits through gaps in announcements for a later start, even when pinned to an instance.
+	 */
+	readonly closed: GetPromise<Error | null>;
+
+	#dispose: Dispose;
+	#disposed = false;
+
+	private constructor(
+		path: Path.Valid,
+		active: Getter<broadcast.Consumer | undefined>,
+		closed: GetPromise<Error | null>,
+		dispose: Dispose,
+	) {
+		this.path = path;
+		this.active = active;
+		this.closed = closed;
+		this.#dispose = dispose;
+	}
+
+	static {
+		makeFollowing = (path, active, closed, dispose) => new Following(path, active, closed, dispose);
+	}
+
+	/** Withdraw the follower. The path stays routed for any other open request. Idempotent. */
 	close(): void {
 		if (this.#disposed) return;
 		this.#disposed = true;
@@ -1658,7 +2079,7 @@ export class Requesting {
  *
  * @public
  */
-export class Consumer {
+export class Consumer implements Reader {
 	#state: OriginState;
 	#scope: Scope;
 
@@ -1673,19 +2094,29 @@ export class Consumer {
 		);
 		registerWire(this, {
 			routes: (path) => this.#routes(scope.path(path)),
-			broadcasts:
-				scope === Scope.all ? state.local : new Derived([state.local], (local) => scope.projectPaths(local)),
 			advertised:
 				scope === Scope.all
 					? state.originated
 					: new Derived([state.originated], (routes) => scope.projectRoutes(routes)),
-			local: (path, epoch) => this.#local(scope.path(path), epoch),
-			demand: (path, epoch, signal) => this.#demand(scope.path(path), epoch, signal),
+			local: (path, instance) => this.#local(scope.path(path), instance),
+			demand: (path, instance, signal) => this.#demand(scope.path(path), instance, signal),
+			own: state.own,
+			covers: (prefix) => scope.covers(prefix),
 		});
 	}
 
 	static {
 		makeConsumer = (state, scope) => new Consumer(state, scope);
+		hooks.withholdHidden = (origin) => {
+			const withheld = origin.#state.withheld;
+			withheld.update((count) => count + 1);
+			let held = true;
+			return () => {
+				if (!held) return;
+				held = false;
+				withheld.update((count) => count - 1);
+			};
+		};
 	}
 
 	/** Settles once the origin closes; see {@link Producer.closed}. */
@@ -1721,25 +2152,34 @@ export class Consumer {
 	 * @internal
 	 */
 	#routes(path: Path.Valid): boolean {
-		if (this.#state.local.peek()?.has(path)) return true;
+		if (this.#state.local.peek().has(path)) return true;
 		return this.#state.bestEntry(path) !== undefined;
 	}
 
 	/**
-	 * Resolve a path, following publisher restarts when `announced` is true and no epoch is pinned.
-	 * Announced requests clear `active` on an end and resolve again on the next start. A refusal
-	 * is terminal. An epoch-pinned request never changes instance; a plain request keeps its
-	 * accepted instance and may resolve blindly when discovery has no answer. Either one,
-	 * once resolved through a discovered route, watches its path until closed.
-	 * Announcement gating falls back to blind resolution when discovery is unavailable.
-	 * Close the request to release its handle and announcement watch.
+	 * Resolve one publisher instance serving `path`, pinned to `instance` when given.
+	 *
+	 * The request owns discovery of its path until closed and retries route churn while
+	 * pending. It fails `Unroutable` once at least one session is attached and every
+	 * session's discovery has synced without a route for it, and can use a session without
+	 * discovery instead. With no session attached, such as between reconnects, it waits. Once resolved it keeps
+	 * that instance, ending when the instance stops serving. Use {@link follow} to move on
+	 * to the next one.
 	 */
 	request(path: Path.Valid, options: RequestOptions = {}): Requesting {
-		if (options.announced && options.epoch === undefined) return this.#following(path, options);
-		return this.#resolve(path, options);
+		return this.#resolve(path, options.instance, false);
 	}
 
-	#following(path: Path.Valid, options: RequestOptions): Requesting {
+	/**
+	 * Follow `path` across publisher instances, pinned to `instance` when given.
+	 *
+	 * `active` moves to each instance announced at the path, clears between them, and never
+	 * closes on a gap: a pinned follower waits for its instance to return. Owns discovery of
+	 * its path until closed. Requires discovery: a session without it never serves a follower.
+	 * A selected handler's refusal or the origin closing ends it.
+	 */
+	follow(path: Path.Valid, options: FollowOptions = {}): Following {
+		const instance = options.instance;
 		const absolute = this.#scope.path(path);
 		Path.Pattern.literal(path);
 		let watch = this.#state.watchers.get(absolute);
@@ -1753,13 +2193,7 @@ export class Consumer {
 		let previous = this.#state.instance(absolute);
 		const active = new Signal<broadcast.Consumer | undefined>(undefined);
 		const closed = new Once<Error | null>();
-		const missing = new Derived(
-			[active, this.#state.answerers, closed],
-			(value, answerers, error) => error !== undefined || (!value && answerers === 0),
-		);
 		let current: Requesting | undefined;
-		// Whether `current` ever resolved, so losing it reads as an end rather than a refusal.
-		let resolved = false;
 		let subscriptions: Dispose[] = [];
 		let disposed = false;
 		const release = () => {
@@ -1777,10 +2211,15 @@ export class Consumer {
 			active.set(undefined);
 			closed.set(error);
 		};
-		const ended = (error: Error | null | undefined) => {
+		const ended = (error: Error | null | undefined, request: Requesting | undefined = current) => {
 			if (!error) return;
-			// Losing an accepted instance waits for its next announcement; a refusal is final.
-			if (resolved && error instanceof StreamError && error.code === StreamCode.Unroutable) {
+			// Provenance survives a coalesced end/start, even when both routes serve one instance.
+			if (
+				error instanceof StreamError &&
+				error.code === StreamCode.Unroutable &&
+				request &&
+				!refusedRequests.has(request.closed)
+			) {
 				active.set(undefined);
 				return;
 			}
@@ -1797,7 +2236,7 @@ export class Consumer {
 				current?.closed.peek() === undefined &&
 				value &&
 				value.closed === current?.active.peek()?.closed &&
-				value.epoch === current.active.peek()?.epoch
+				value.instance === current.active.peek()?.instance
 			) {
 				next.close();
 				return;
@@ -1806,18 +2245,16 @@ export class Consumer {
 			current = next;
 			active.set(value);
 			if (!next) return;
-			resolved = value !== undefined;
 			subscriptions.push(
 				next.active.subscribe((value) => {
-					if (value) resolved = true;
 					active.set(value);
 				}),
 			);
-			subscriptions.push(next.closed.subscribe(ended));
-			ended(next.closed.peek());
+			subscriptions.push(next.closed.subscribe((error) => ended(error, next)));
+			ended(next.closed.peek(), next);
 		};
 		try {
-			replace(this.#resolve(path, options));
+			replace(this.#resolve(path, instance, true));
 		} catch (error) {
 			finish(error instanceof Error ? error : new Error(String(error)));
 			throw error;
@@ -1836,36 +2273,59 @@ export class Consumer {
 			const same = previous && next && sameInstance(previous, next);
 			previous = next;
 			if (!next) {
-				if (had) replace(this.#resolve(path, options));
-			} else if (!same || !current || current.closed.peek() !== undefined) replace(this.#resolve(path, options));
+				if (had) replace(this.#resolve(path, instance, true));
+			} else if (!same || !current || current.closed.peek() !== undefined)
+				replace(this.#resolve(path, instance, true));
 		};
 		if (!disposed) {
 			unwatch = watched.version.subscribe(changed);
 			changed();
 		}
 
-		return makeRequesting(path, active, missing, closed, () => finish(null));
+		return makeFollowing(path, active, closed, () => finish(null));
 	}
 
-	#resolve(path: Path.Valid, options: RequestOptions): Requesting {
-		const epoch = options.epoch;
+	// One resolution of `path`. A follower's (`announced`) takes only an announced front and
+	// never reports absence: {@link follow} retries it on the next instance instead.
+	#resolve(path: Path.Valid, instance: Instance.Valid | undefined, announced: boolean): Requesting {
+		Path.Pattern.literal(path);
 		const relative = path;
 		path = this.#scope.path(path);
 		const requests = this.#state.requests.peek();
-		if (!requests) {
-			// Closed origin: a request that can never resolve, and says so.
+		if (this.#state.closed.peek() !== undefined) {
+			// Closed origin: a request that can never resolve ends at once.
 			const closed = new Once<Error | null>();
-			return makeRequesting(
-				relative,
-				new Signal<broadcast.Consumer | undefined>(undefined),
-				getter(true),
-				closed,
-				() => closed.set(null),
-			);
+			closed.set(this.#state.closed.peek() ?? null);
+			return makeRequesting(relative, new Signal<broadcast.Consumer | undefined>(undefined), closed, () => {});
 		}
 
-		let slot = requests.get(path);
-		if (!slot) {
+		// A pin naming another instance than the winner follows that instance's own routes, on a
+		// slot shared only by requests pinned to it, rather than filter the winner afterward.
+		const pin =
+			instance !== undefined && this.#state.instance(path)?.route.instance !== instance ? instance : undefined;
+		let slot =
+			pin === undefined
+				? requests.get(path)
+				: [...(this.#state.detached.get(path) ?? [])].find(
+						(other) => other.pin === pin && !this.#state.retained.has(other),
+					);
+		if (!slot && pin !== undefined) {
+			const created: RequestSlot = {
+				blind: 0,
+				handles: new Set(),
+				absent: new Set(),
+				route: new Signal<Resolution | undefined>(undefined),
+				pin,
+			};
+			slot = created;
+			let detached = this.#state.detached.get(path);
+			if (!detached) {
+				detached = new Set();
+				this.#state.detached.set(path, detached);
+			}
+			detached.add(created);
+			this.#state.follow(path, created, pin, undefined);
+		} else if (!slot) {
 			// Seeded through the constructor, so a path the table already routes resolves on the
 			// first read. It must not go through a silent set: that still captures the pre-seed
 			// value as the baseline the next change is compared against, and never flushes to
@@ -1873,23 +2333,21 @@ export class Consumer {
 			// notify nobody.
 			const created: RequestSlot = {
 				blind: 0,
-				announced: 0,
 				handles: new Set(),
+				absent: new Set(),
 				route: new Signal(this.#state.route(path, {})),
 			};
 			slot = created;
 			this.#state.requests.mutate((map) => {
-				map?.set(path, created);
+				map.set(path, created);
 			});
 		}
 		const closed = new Once<Error | null>();
 		slot.handles.add(closed);
 		// Counted, not subscribed: serving sessions decide blindness from the live discovery state.
-		const announced = options.announced === true;
-		if (announced) slot.announced += 1;
-		else slot.blind += 1;
-		// An announced request is a watch: sessions ask their peer about this path while it lives.
-		let unwatch = announced ? this.#state.watch([path]) : undefined;
+		if (!announced) slot.blind += 1;
+		// Resolution owns discovery from the first ask, not just after a route arrives.
+		const unwatch = this.#state.watch([path]);
 		this.#state.requests.mutate(() => {});
 
 		// Hand out a handle of the request's own rather than the table's. Closing a consumer
@@ -1901,31 +2359,38 @@ export class Consumer {
 		// Memoized on the route's identity: the same front resolving again returns the handle
 		// we already made, and only a real swap clones a new one (cloning before closing the
 		// old, so a broadcast that both routes share never briefly loses its last handle).
-		// Under an epoch the handle is a logical front instead: another route of the same epoch
-		// serves the same broadcast, so the front re-sources its tracks and the handle stays.
+		// Under a carried instance the handle is a logical front instead: another route of it
+		// serves the same stream, so the front re-sources its tracks and the handle stays.
 		let released = false;
 		let source: Resolution | undefined;
 		let handle: broadcast.Consumer | undefined;
 		let logical: Front | undefined;
 		const own = (resolution: Resolution | undefined): broadcast.Consumer | undefined => {
 			if (released) return undefined;
-			const front = epoch === undefined || resolution?.epoch === epoch ? resolution?.front : undefined;
-			if (logical && source?.epoch !== undefined && resolution?.epoch === source.epoch) {
+			// A follower takes only a front something announced; a blind answer is for plain handles.
+			const offered = announced && !resolution?.source ? undefined : resolution?.front;
+			const front = instance === undefined || resolution?.instance === instance ? offered : undefined;
+			if (logical && source?.instance !== undefined && resolution?.instance === source.instance) {
 				// Between routes of the instance, readers wait for the next one to answer.
 				if (front) logical.serve(front);
 				else logical.park();
 				return handle;
 			}
-			if (front !== source?.front || resolution?.epoch !== source?.epoch) {
+			if (front !== source?.front || resolution?.instance !== source?.instance) {
 				const previous = handle;
 				const concluded = logical;
-				source = front ? { front, epoch: resolution?.epoch } : undefined;
-				logical = front && resolution?.epoch !== undefined ? new Front() : undefined;
+				source = front ? { front, instance: resolution?.instance } : undefined;
+				// A minted instance names an announcement over a wire that carries none, whose
+				// route may answer a re-request with another stream, so nothing re-sources it.
+				const carried = resolution?.instance !== undefined && !Instance.isMinted(resolution.instance);
+				logical = front && carried ? new Front() : undefined;
 				logical?.serve(front as broadcast.Consumer);
 				handle = logical ? logical.consumer : front?.clone();
 				if (handle) {
 					hooks.stampPath(handle, relative);
-					hooks.stampEpoch(handle, resolution?.epoch);
+					hooks.stampInstance(handle, resolution?.instance);
+					// A logical front lists what the route it was made through lists.
+					if (front && hooks.unlisted(front)) hooks.stampUnlisted(handle);
 				}
 				concluded?.conclude();
 				previous?.close();
@@ -1940,47 +2405,45 @@ export class Consumer {
 		// holder that only ever peeked would then pin a route that has already been retracted
 		// until it happened to read again. Following the route as well retires it promptly,
 		// and the memo makes the two paths agree: whichever runs first does the swap.
-		// Any other request watches its path once it resolves through a discovered route, so that
-		// route stays discovered after whatever watch found it, such as a listing, is gone.
-		const discovered = (resolution: Resolution | undefined) => {
-			if (unwatch || !resolution?.front) return;
-			// Only a route a session received; a local broadcast or dynamic route needs no discovery.
-			const entry = this.#state.materialized.get(path)?.entry;
-			if (!entry || entry.identity !== resolution.source || !received(entry)) return;
-			unwatch = this.#state.watch([path]);
+		// A pending plain request reports absence, as Rust's request does, once discovery of
+		// its path has synced without a route for its instance. Sessions hold that sync from
+		// when the watch opens, so a fresh request waits for its peer's answer. A follower
+		// keeps waiting for a start, and a resolved request ends only with its instance.
+		const absent = () => {
+			if (released || closed.peek() !== undefined) return;
+			if (source) {
+				taken.absent.delete(absent);
+				return;
+			}
+			const resolution = route.peek();
+			if (resolution && (instance === undefined || resolution.instance === instance)) return;
+			if (!this.#state.synced(path)) return;
+			closed.set(unroutable());
+			release();
 		};
-		discovered(route.peek());
+		if (!announced) taken.absent.add(absent);
+
 		const unsubscribe = route.subscribe((resolution) => {
 			own(resolution);
-			discovered(resolution);
+			if (!announced) absent();
 		});
 
-		// Only meaningful while nothing is routed, so it reads the route rather than `active`:
-		// the two cannot disagree, since a routed path always has an answerer-independent
-		// answer.
-		const unroutable = new Derived(
-			[route, this.#state.answerers, closed],
-			(resolution, answerers, ended) =>
-				ended !== undefined ||
-				(epoch !== undefined && resolution?.epoch !== epoch) ||
-				(!own(resolution) && answerers === 0),
-		);
-
-		return makeRequesting(relative, active, unroutable, closed, () => {
+		const release = () => {
 			// Releases this request's handle; the route itself belongs to the table.
+			if (released) return;
 			released = true;
 			unsubscribe();
+			taken.absent.delete(absent);
 			logical?.conclude();
 			logical = undefined;
 			handle?.close();
 			handle = undefined;
 			source = undefined;
 
-			unwatch?.();
+			unwatch();
 			taken.handles.delete(closed);
 			if (closed.peek() === undefined) closed.set(null);
-			if (announced) taken.announced -= 1;
-			else taken.blind -= 1;
+			if (!announced) taken.blind -= 1;
 			this.#state.requests.mutate(() => {});
 			if (taken.handles.size > 0) return;
 
@@ -1991,13 +2454,13 @@ export class Consumer {
 				if (taken.handles.size > 0) return;
 				// A refused slot already tore itself down, and the path may hold a newer one. A
 				// detached slot owns the front it took.
-				if (this.#state.requests.peek()?.get(path) !== taken) {
+				if (this.#state.requests.peek().get(path) !== taken) {
 					this.#state.detach(path, taken);
 					this.#state.forget(path);
 					return;
 				}
 				this.#state.requests.mutate((map) => {
-					map?.delete(path);
+					map.delete(path);
 				});
 				taken.answer?.close();
 				taken.answer = undefined;
@@ -2005,62 +2468,86 @@ export class Consumer {
 				this.#state.releaseMaterialized(path);
 				this.#state.forget(path);
 			});
-		});
+		};
+
+		if (!announced) absent();
+		return makeRequesting(relative, active, closed, release);
 	}
 
 	/**
-	 * The announced routes matching `scope`, as a live stream: every currently advertised
-	 * route arrives first as `start`, then changes as they happen.
+	 * The paths announced matching `scope`, each reported as it becomes present or absent:
+	 * every currently advertised one arrives first as `present`. Another instance taking a
+	 * path over keeps it present; {@link follow} it to see the broadcast change.
 	 * Any pattern is accepted. A local broadcast appears once it announces, exactly as a
-	 * peer sees it. A dynamic or received route announces the prefix it covers when its
-	 * subtree overlaps the scope. The stream ends when the origin closes or the consumer is
-	 * closed. Hidden routes are left out unless `options.hidden` opts in (see {@link announce.Options}).
+	 * peer sees it. Only routes whose literal name matches the scope are listed, unless
+	 * `options.covering` also asks for every dynamic or received route whose subtree
+	 * overlaps it. The stream ends when the origin closes or the consumer is closed. Hidden
+	 * routes are left out unless `options.hidden` opts in (see {@link Announce.Options}).
 	 * While open, it watches the scope's literal head: a `consume` session asks its peer for
 	 * announcements there.
 	 */
-	announced(scope: Path.Pattern = Path.Pattern.all(), options?: announce.Options): announce.Consumer {
+	announced(scope: Path.Pattern = Path.Pattern.all(), options?: Announce.Options): Announce.Consumer {
+		return announce.list(this.routes(scope, options));
+	}
+
+	/**
+	 * Every change to the routes matching `scope`, for code that forwards routes: a re-price
+	 * is an `update`, and another instance serving a path a `restart`. Scope, options and the
+	 * watch are as for {@link announced}.
+	 *
+	 * @internal
+	 */
+	routes(scope: Path.Pattern = Path.Pattern.all(), options?: Announce.Options): announce.Routes {
 		const producer = new announce.Producer();
 		const patterns = this.#scope.patterns(scope);
 		void producer.closed.then(this.#state.watch([...patterns].map(scopeHead)));
-		void this.#runAnnounced(producer, patterns, options?.hidden ?? false);
-		return producer.consume();
+		void this.#runAnnounced(producer, patterns, options?.hidden ?? false, options?.covering ?? false);
+		const consumer = producer.consume();
+		// The last reader leaving ends the stream and its watch.
+		closeUnwanted(producer);
+		return consumer;
 	}
 
 	/** The routes visible to one announcement watcher. */
-	#listed(patterns: Path.Patterns, hidden: boolean): Map<Path.Valid, Presented> {
+	#listed(patterns: Path.Patterns, hidden: boolean, covering: boolean): Map<Path.Valid, Presented> {
 		const next = new Map<Path.Valid, Presented>();
-		const covering = new CoveringRoot(this.#scope.root);
+		const rooted = new CoveringRoot(this.#scope.root);
 		const scopes = [...patterns]
 			.sort((a, b) => Path.compareSpecificity(b.specificity(), a.specificity()))
 			.map((pattern) => ({ pattern, head: scopeHead(pattern) }));
 		for (const [path, candidates] of this.#state.snapshot()) {
-			// The first candidate this reader can see wins, since the preferred one overall may not be.
-			let entry: Candidate | undefined;
-			let scope: (typeof scopes)[number] | undefined;
-			for (const candidate of candidates) {
-				scope = scopes.find(
+			// The first candidate this reader can see wins, since the preferred one overall may not be,
+			// unless a higher epoch of its instance that the reader also sees supersedes it.
+			const scopeOf = (candidate: Candidate) =>
+				scopes.find(
 					({ pattern, head }) =>
+						(covering || pattern.matches(path)) &&
 						(candidate.exact ? pattern.matches(path) : advertOverlaps(candidate, path, pattern)) &&
 						(hidden || !hiddenBelow(head, path)),
 				);
-				if (scope) {
-					entry = candidate;
-					break;
-				}
-			}
+			const entry = firstEligible(candidates, (candidate) => scopeOf(candidate) !== undefined);
+			const scope = entry && scopeOf(entry);
 			if (!entry || !scope) continue;
-			const relative = covering.relative(path);
+			const relative = rooted.relative(path);
 			if (relative === undefined) continue;
 			next.set(relative, {
 				identity: entry.identity,
-				route: entry.route,
+				// Draining is this node's selection state: readers, and the peers a relay
+				// forwards to, see the route as it is.
+				route: entry.route.draining === undefined ? entry.route : { ...entry.route, draining: undefined },
 				captures: scopeCaptures(scope.pattern, path),
+				lost: entry.lost,
 			});
 		}
 		return next;
 	}
 
-	async #runAnnounced(producer: announce.Producer, patterns: Path.Patterns, hidden: boolean): Promise<void> {
+	async #runAnnounced(
+		producer: announce.Producer,
+		patterns: Path.Patterns,
+		hidden: boolean,
+		covering: boolean,
+	): Promise<void> {
 		// Keyed by the presented path (from the origin, not the scope), valued by identity
 		// plus route. Diffing the instance rather than mere presence means a republish emits a
 		// restart; a re-price of the same instance emits an update.
@@ -2068,19 +2555,16 @@ export class Consumer {
 
 		try {
 			for (;;) {
-				const local = this.#state.local.peek();
-				const advertisedLocal = this.#state.advertisedLocal.peek();
-				const routes = this.#state.routes.peek();
-				if (local === undefined && advertisedLocal === undefined && routes === undefined) break;
+				if (this.#state.closed.peek() !== undefined) break;
 
-				const next = this.#listed(patterns, hidden);
+				const next = this.#listed(patterns, hidden, covering);
 
 				for (const [path, snap] of active) {
 					if (!next.has(path))
 						producer.append({
 							prefix: path,
 							captures: snap.captures,
-							kind: "end",
+							kind: snap.lost?.() ? "offline" : "end",
 							route: snap.route,
 						});
 				}
@@ -2125,28 +2609,17 @@ export class Consumer {
 	}
 
 	/**
-	 * The local table, borrowed by the wire publishers to answer subscribes.
-	 *
-	 * Deliberately excludes received routes: a session never re-announces what a peer
-	 * told it, so an origin wired to both directions of a connection cannot echo.
-	 * Borrowed, not owned: do not close the fronts. Undefined once the origin closes.
-	 *
-	 * @internal
-	 */
-	/**
-	 * Originated advertisements a session should forward: exact-path announces plus
-	 * originated dynamics. Undefined once the origin closes.
-	 *
-	 * @internal
-	 */
-	/**
 	 * The announced local broadcast at `path`, when it beats the originated routes there.
 	 * Resolves through what rebuildOriginated advertised: a peer never sees received routes.
 	 */
-	#local(path: Path.Valid, epoch?: Epoch.Valid): broadcast.Consumer | undefined {
-		const local = this.#state.local.peek()?.get(path);
-		if (!local || !this.#state.localWins(path, this.#state.bestEntry(path, received))) return undefined;
-		if (epoch !== undefined && this.#state.advertisedLocal.peek()?.get(path)?.epoch !== epoch) return undefined;
+	#local(path: Path.Valid, instance?: Instance.Valid): broadcast.Consumer | undefined {
+		const local = this.#state.local.peek().get(path);
+		if (!local) return undefined;
+		if (instance !== undefined && this.#state.advertisedLocal.peek().get(path)?.instance !== instance)
+			return undefined;
+		// Pinned, it competes only with its own instance's routes, whichever instance wins.
+		const skip = unservable(instance);
+		if (!this.#state.localWins(path, this.#state.bestEntry(path, skip), skip)) return undefined;
 		return local;
 	}
 
@@ -2158,7 +2631,7 @@ export class Consumer {
 	 */
 	async #demand(
 		path: Path.Valid,
-		epoch?: Epoch.Valid,
+		instance?: Instance.Valid,
 		signal?: AbortSignal,
 	): Promise<broadcast.Consumer | undefined> {
 		signal?.throwIfAborted();
@@ -2171,19 +2644,19 @@ export class Consumer {
 		};
 		signal?.addEventListener("abort", abort, { once: true });
 		try {
-			// Each pass asks the instance that wins now; an epoch change releasing the request starts another.
+			// Each pass asks the instance that wins now; an instance change releasing the request starts another.
 			for (;;) {
 				signal?.throwIfAborted();
-				const local = this.#local(path);
-				if (local) {
-					// A peer naming one publisher instance is never handed another.
-					if (epoch !== undefined && this.#state.advertisedLocal.peek()?.get(path)?.epoch !== epoch)
+				// A peer naming one publisher instance takes that instance's own routes, whichever
+				// wins, and is never handed another.
+				const local = this.#local(path, instance);
+				if (local) return local;
+				const entry = this.#state.bestEntry(path, unservable(instance));
+				if (!entry?.server) {
+					if (instance !== undefined && (this.#local(path) || this.#state.bestEntry(path, received)?.server))
 						throw unroutable();
-					return local;
+					return undefined;
 				}
-				const entry = this.#state.bestEntry(path, received);
-				if (!entry?.server) return undefined;
-				if (epoch !== undefined && entry.route.peek().epoch !== epoch) throw unroutable();
 
 				const server = entry.server;
 				const live = server.served.get(path);
@@ -2209,9 +2682,14 @@ export class Consumer {
 				try {
 					for (;;) {
 						signal?.throwIfAborted();
-						// The route may name another instance by the time its handler answers.
-						if (epoch !== undefined && this.#state.bestEntry(path, received)?.route.peek().epoch !== epoch)
+						// The route may name another instance by the time its handler answers, as when a
+						// sibling job ending moves a claim on. A job's route still carrying the requested
+						// instance serves it.
+						if (instance !== undefined && entry.route.peek().instance !== instance) {
+							const job = this.#local(path, instance);
+							if (job) return job;
 							throw unroutable();
+						}
 						const served = server.served.get(path);
 						if (served && served.closed.peek() === undefined) return served;
 						const rejected = server.rejected.get(path);
@@ -2223,9 +2701,17 @@ export class Consumer {
 							if (closed) throw closed;
 							return undefined;
 						}
-						// Released by an epoch change, which also dropped this pass's count: ask again.
+						// Released by an instance change, which also dropped this pass's count: ask again.
 						if (server.resets !== resets) break;
-						if (!server.pending.has(path)) return undefined;
+						if (!server.pending.has(path)) {
+							// Answered by a job's exact route. A peer naming no instance cannot tell
+							// that route's stream from the claim's, so it is refused and subscribes
+							// again once the route's announcement reaches it.
+							if (instance === undefined) return undefined;
+							const job = this.#local(path, instance);
+							if (job) return job;
+							throw unroutable();
+						}
 						await race([Signal.race(server.settled, server.closed), cancelled]);
 					}
 				} finally {
@@ -2238,128 +2724,277 @@ export class Consumer {
 	}
 }
 
+/** What a {@link Route} and a {@link Claim} share: the advertisement and how it is changed. */
+interface RouteControl {
+	instance(): Instance.Valid;
+	announce(): void;
+	withdraw(): void;
+	announced(): boolean;
+	change(update: Partial<Pick<WireRoute, "cost" | "auth">>): void;
+	close(): void;
+	/** Close as its announcer ending it; {@link close} on a received route means its session lost it. */
+	end(): void;
+	info(): WireRoute | undefined;
+	update(info: Partial<WireRoute>): void;
+}
+
+// Expose `control` to the protocol layer, which advertises a route as a session's update does.
+function registerControl(handle: Route | Claim, control: RouteControl): void {
+	registerWire(handle, {
+		get info() {
+			return control.info();
+		},
+		update: (info) => control.update(info),
+		end: () => control.end(),
+	});
+}
+
+/** The requests arriving on a claim's `server`, each answerable with a route of `publisher`'s when it has one. */
+async function* serveRequests(server: ServeState, publisher: Producer | undefined): AsyncIterableIterator<Request> {
+	let current: Request | undefined;
+	const drop = () => {
+		current?.reject(unroutable());
+		current = undefined;
+	};
+	// Keep the cursor while draining: restarting it would rescan deleted entries.
+	let queued = server.queue.peek().values();
+	try {
+		for (;;) {
+			const next = queued.next();
+			if (!next.done) {
+				drop();
+				server.queue.mutate((queue) => {
+					queue.delete(next.value);
+				});
+				current = next.value;
+				setRequestPublisher(current, publisher);
+				yield next.value;
+				continue;
+			}
+			if (server.closed.peek() !== undefined) return;
+			await Signal.race(server.queue, server.closed);
+			queued = server.queue.peek().values();
+		}
+	} finally {
+		drop();
+	}
+}
+
 /**
- * A served route from {@link Producer.dynamic}: advertises a prefix and answers the
- * requests beneath it.
+ * An exact route in an origin, owning its broadcast.
  *
- * Drop it (or {@link close}) to retract the route and reject anything still waiting
- * with {@link StreamCode.Unroutable}. {@link update} re-prices it in place.
+ * Create one with {@link Producer.route}, or a job's with {@link Request.route}.
+ *
+ * ```ts
+ * // Fill the catalog before readers can find it.
+ * const route = origin.route(Path.from("live/alice"), { hidden: true });
+ * route.broadcast.createTrack("catalog.json");
+ * route.announce(); // visible now, same instance
+ * route.setCost(5n); // re-prices in place
+ * route.withdraw(); // hidden; announce() again continues the same stream
+ * ```
+ *
+ * {@link close} retracts it and closes its broadcast, and so does closing the broadcast.
  *
  * @public
  */
-export class Dynamic {
-	/** The prefix this handle advertises. */
-	readonly prefix: Path.Valid;
+export class Route {
+	/** The broadcast this route owns, to fill with tracks. */
+	readonly broadcast: broadcast.Producer;
+	readonly #control: RouteControl;
 
-	#entry: RouteEntry;
-	#state: OriginState;
-	#retract: Dispose;
-	#publisher?: Producer;
-	#closed = false;
-
-	private constructor(
-		prefix: Path.Valid,
-		entry: RouteEntry,
-		state: OriginState,
-		retract: Dispose,
-		publisher?: Producer,
-	) {
-		this.prefix = Path.stripPrefix(entry.scope.root, prefix) ?? Path.empty();
-		this.#entry = entry;
-		this.#state = state;
-		this.#retract = retract;
-		this.#publisher = publisher;
+	private constructor(producer: broadcast.Producer, control: RouteControl) {
+		this.broadcast = producer;
+		this.#control = control;
+		registerControl(this, control);
 	}
 
 	static {
-		makeDynamic = (prefix, entry, state, retract, publisher) =>
-			new Dynamic(prefix, entry, state, retract, publisher);
-	}
-
-	/** The route this handle advertises. */
-	get route(): Route {
-		return this.#entry.route.peek();
+		makeRoute = (producer, control) => new Route(producer, control);
 	}
 
 	/**
-	 * Replace the route in place. The prefix is fixed at announce time.
+	 * The stream this route serves, minted when it was created unless {@link RouteOptions.instance}
+	 * named one.
 	 *
-	 * The route is taken as given. At the same epoch this re-prices: consumers see an update
-	 * and every handle survives. Another epoch, or none, names another publisher instance:
-	 * consumers see a restart, resolved requests keep their old broadcast until closed, and a
-	 * re-request never joins it. Requests still waiting on this handle carry over: the handler
-	 * is asked again under the new epoch, and its answer to a request asked before the change
-	 * is dropped, never served under the new epoch. A new or unresolved request pinned to the
-	 * old epoch is refused as unroutable. The answers already served are forgotten, so the next
-	 * request for one of those paths asks the handler again too. The broadcasts it served keep
-	 * running for the subscriptions already on them; close them to end those too.
-	 * Route selection still applies: another route still at the old epoch outranks one
-	 * without. To re-price, start from the current route, `updateRoute({ ...dynamic.route, cost })`.
-	 *
-	 * @internal
+	 * A job's route ({@link Request.route}) naming none takes its claim's current one when it
+	 * first announces, or when this reads it first. Read before announcing, it is the one the job
+	 * announces under, and {@link announce} throws {@link StreamCode | StreamCode.Unroutable} once
+	 * the claim has moved past it, so a signer built from it stays valid.
 	 */
-	// pending: /quest/m1/public-model/answer.md
-	updateRoute(
-		route: Route | { epoch?: Route["epoch"]; hops?: Route["hops"]; cost?: Route["cost"]; auth?: Route["auth"] },
-	): void {
-		if (this.#closed) throw new Error("dynamic is closed");
-		const next = Route.normalize(route);
-		const previous = this.#entry.route.peek().epoch;
-		if (previous !== next.epoch) this.#state.restart(this.#entry);
-		this.#entry.route.set(next);
-		if (previous !== next.epoch) this.#entry.server?.reset();
-		this.#state.rebuildOriginated();
-		this.#state.refreshPrefix(Path.join(this.#entry.scope.root, this.prefix));
-		this.#state.routes.mutate(() => {});
+	get instance(): Instance.Valid {
+		return this.#control.instance();
 	}
 
-	/** Retract the route and reject anything still waiting. Idempotent. */
+	/**
+	 * Make the route visible, or keep it so. Idempotent.
+	 *
+	 * Visible to local consumers before it returns. A job's route ({@link Request.route}) also
+	 * answers the requesters waiting on its path. Throws once the route or its broadcast closed,
+	 * and, announcing nothing, with {@link StreamCode | StreamCode.Unroutable} when a job's request
+	 * was released or its claim retracted meanwhile, or when the job read its {@link instance} and
+	 * its claim has moved past it since: that route can never announce. In that last case its
+	 * requesters ask the claim again.
+	 */
+	announce(): void {
+		this.#control.announce();
+	}
+
+	/**
+	 * Hide the route from everyone, local and remote alike, keeping its broadcast and instance:
+	 * {@link announce} brings the same stream back. Requests for the path fail with
+	 * {@link StreamCode | StreamCode.Unroutable} meanwhile, while tracks already in flight carry
+	 * on to their own end. Idempotent.
+	 */
+	withdraw(): void {
+		this.#control.withdraw();
+	}
+
+	/** Whether the route is visible. */
+	get announced(): boolean {
+		return this.#control.announced();
+	}
+
+	/**
+	 * Re-price the route: lower wins among routes covering the same prefix and anonymity. A
+	 * visible route changes in place, as an update to its readers; a hidden one announces at
+	 * this price. Throws once the route or its broadcast closed.
+	 */
+	setCost(cost: Cost): void {
+		this.#control.change({ cost });
+	}
+
+	/**
+	 * Swap the credential the advertising request carries; see {@link RouteOptions.auth}.
+	 * Undefined advertises under the session's scope. Throws once the route or its broadcast closed.
+	 */
+	setAuth(auth?: Credential): void {
+		this.#control.change({ auth });
+	}
+
+	/** Retract the route for good, closing its broadcast and refusing a job's waiting requesters. Idempotent. */
 	close(): void {
-		if (this.#closed) return;
-		this.#closed = true;
-		this.#retract();
+		this.#control.close();
 	}
 
-	/** Requests under this prefix, as they arrive, each to {@link Request.prepare} or reject. */
-	async *requested(): AsyncIterableIterator<Request> {
-		const server = this.#entry.server;
-		if (!server) return;
-		let current: Request | undefined;
-		const drop = () => {
-			current?.reject(unroutable());
-			current = undefined;
-		};
-		// Keep the cursor while draining: restarting it would rescan deleted entries.
-		let queued = server.queue.peek().values();
-		try {
-			for (;;) {
-				const next = queued.next();
-				if (!next.done) {
-					drop();
-					server.queue.mutate((queue) => {
-						queue.delete(next.value);
-					});
-					current = next.value;
-					current.publisher = this.#publisher;
-					yield next.value;
-					continue;
-				}
-				if (server.closed.peek() !== undefined) return;
-				await Signal.race(server.queue, server.closed);
-				queued = server.queue.peek().values();
-			}
-		} finally {
-			drop();
-		}
+	/** Calls {@link close}, so `using` retracts the route. */
+	[Symbol.dispose](): void {
+		this.close();
+	}
+}
+
+/**
+ * A prefix route in an origin: a claim that every path beneath a prefix can be served,
+ * answering each request as it arrives.
+ *
+ * Create one with {@link Producer.claim}. Requests arrive on {@link requested}; answer each by
+ * serving a broadcast already held or by creating the path's own {@link Route}.
+ *
+ * ```ts
+ * const claim = origin.claim(Path.from("room"));
+ * for await (const request of claim.requested()) {
+ * 	const route = request.route({ hidden: true });
+ * 	route.broadcast.createTrack("catalog.json");
+ * 	route.announce(); // answers the requesters
+ * }
+ * ```
+ *
+ * {@link close} retracts it and rejects the requests still waiting.
+ *
+ * @public
+ */
+export class Claim {
+	readonly #control: RouteControl;
+	readonly #requested: () => AsyncIterableIterator<Request>;
+
+	private constructor(control: RouteControl, requested: () => AsyncIterableIterator<Request>) {
+		this.#control = control;
+		this.#requested = requested;
+		registerControl(this, control);
+	}
+
+	static {
+		makeClaim = (control, requested) => new Claim(control, requested);
+	}
+
+	/**
+	 * The stream this claim serves, minted when it was created unless {@link RouteOptions.instance}
+	 * named one.
+	 *
+	 * Unnamed, it can change: the claim moves to a fresh instance, as a restart, each time a job's
+	 * route holding its current one stops being advertised. A claim naming its instance gives each
+	 * job a fresh one instead. See {@link Producer.claim}.
+	 */
+	get instance(): Instance.Valid {
+		return this.#control.instance();
+	}
+
+	/**
+	 * Make the claim visible, or keep it so. Idempotent. Visible to local consumers before it
+	 * returns. Throws once the claim or the origin closed.
+	 */
+	announce(): void {
+		this.#control.announce();
+	}
+
+	/**
+	 * Hide the claim from everyone, local and remote alike, keeping its instance: {@link announce}
+	 * brings it back. Requests beneath it fail with {@link StreamCode | StreamCode.Unroutable}
+	 * meanwhile. Idempotent.
+	 */
+	withdraw(): void {
+		this.#control.withdraw();
+	}
+
+	/** Whether the claim is visible. */
+	get announced(): boolean {
+		return this.#control.announced();
+	}
+
+	/**
+	 * Re-price the claim: lower wins among routes covering the same prefix and anonymity. A
+	 * visible claim changes in place, as an update to its readers; a hidden one announces at
+	 * this price. Throws once the claim or the origin closed.
+	 */
+	setCost(cost: Cost): void {
+		this.#control.change({ cost });
+	}
+
+	/**
+	 * Swap the credential the advertising request carries; see {@link RouteOptions.auth}.
+	 * Undefined advertises under the session's scope. Throws once the claim or the origin closed.
+	 */
+	setAuth(auth?: Credential): void {
+		this.#control.change({ auth });
+	}
+
+	/**
+	 * The requests beneath this claim, as they arrive, each to answer with {@link Request.serve},
+	 * {@link Request.route} or {@link Request.reject}. Advancing the iterator or closing it without
+	 * answering rejects the request. Ends once the claim is closed or the origin closes.
+	 */
+	requested(): AsyncIterableIterator<Request> {
+		return this.#requested();
+	}
+
+	/** Retract the claim for good, rejecting the requests still waiting. Idempotent. */
+	close(): void {
+		this.#control.close();
+	}
+
+	/** Calls {@link close}, so `using` retracts the claim. */
+	[Symbol.dispose](): void {
+		this.close();
 	}
 }
 
 /**
  * A pending request for a broadcast to be served on demand.
  *
- * Yielded by {@link Dynamic.requested}. {@link accept} resolves it with a live
- * broadcast; {@link reject} resolves it with an error. Advancing the iterator or
- * closing it without either rejects the request.
+ * Yielded by {@link Claim.requested}. Answer it one of three ways: {@link serve} a broadcast
+ * already held, under the claim's instance; create the path's own exact route with
+ * {@link route}, a job; or {@link reject} it with an error. Advancing the iterator or closing it
+ * without answering rejects the request.
  *
  * @public
  */
@@ -2368,10 +3003,9 @@ export class Request {
 	readonly path: Path.Valid;
 
 	#server: ServeState;
-	#done = false;
-	#withdrawn = false;
-	/** @internal Set only by an application claim. */
-	publisher?: Producer;
+	// Answered by the application, or withdrawn by the origin before it was.
+	#state: "pending" | "answered" | "withdrawn" = "pending";
+	#publisher?: Producer;
 
 	private constructor(path: Path.Valid, server: ServeState) {
 		this.path = path;
@@ -2380,120 +3014,80 @@ export class Request {
 
 	static {
 		makeRequest = (path, server) => new Request(path, server);
+		setRequestPublisher = (request, publisher) => {
+			request.#publisher = publisher;
+		};
+		jobPending = (request) => request.#server.has(request);
+		answerJob = (request) => {
+			// Its exact route owns availability: never cache a published job under the
+			// prefix, which would keep serving it after that exact route is withdrawn.
+			request.#server.forget(Path.join(request.#server.root, request.path), request);
+			request.#server.settled.update((n) => n + 1);
+		};
+		rejectJob = (request, err) => request.#server.reject(request, err);
+		requeueJob = (request) => {
+			const path = Path.join(request.#server.root, request.path);
+			request.#server.forget(path, request);
+			request.#server.enqueue(path);
+		};
+		requestHandoff = (request) => request.#server.handoff;
 		finishRequest = (request, err) => {
-			request.#done = true;
-			request.#withdrawn = true;
+			request.#state = "withdrawn";
 			void err;
 		};
 	}
 
-	/** Start answering as a new publisher instance, hidden until published. */
-	prepare(epoch: Epoch.Valid): Prepared {
-		if (this.#done) throw new Error("request is closed");
-		if (!this.publisher) throw new Error("forwarded requests cannot be prepared");
-		this.#done = true;
-		const answer = this.publisher.createBroadcast(this.path);
-		// Withheld until publish, so the answer cannot announce itself under another
-		// epoch or skip the request's admission.
-		const announcer = hooks.withholdAnnouncer(answer);
-		if (!announcer) throw new Error("origin is closed");
-		return new Prepared(this, answer, announcer, epoch);
-	}
-
-	/** @internal Publish a prepared answer after its tracks have been filled. */
-	publishPrepared(
-		answer: broadcast.Producer,
-		announcer: broadcast.Announcer,
-		epoch: Epoch.Valid,
-	): broadcast.Producer {
-		if (!this.#server.has(this)) throw new Error("request is closed");
-		if (answer.closed.peek() !== undefined) throw new Error("broadcast is closed");
-		hooks.attachAnnouncer(answer, announcer);
-		// The exact route usually settles the request on its own, resolving its waiters
-		// through the new epoch; answer it directly if it is still pending.
-		answer.announce({ epoch });
-		if (this.#server.has(this)) this.#server.accept(this, answer.consume());
-		return answer;
-	}
-
-	/** @internal Refuse the request a prepared answer abandoned. */
-	rejectPrepared(err: Error): void {
-		this.#server.reject(this, err);
+	/**
+	 * Answer with the path's own exact route, owning a new broadcast.
+	 *
+	 * Unless `options` names an instance, the route continues the claim's minted
+	 * instance, bound when it first announces or {@link Route.instance} first reads it, so readers that resolved the path through the
+	 * claim keep reading the same stream. Once this route stops being advertised the
+	 * claim moves to a fresh instance, so a job that restarts beneath it is a new stream
+	 * for its restarted sequences, and a request naming the ended instance is refused. Under a
+	 * claim naming its instance, the route mints a fresh one. Closing the route withdraws
+	 * only this path: the claim keeps answering later requests. Created
+	 * visible, the route announces now and answers the requesters waiting on its path. Created
+	 * {@link RouteOptions.hidden | hidden}, they wait until {@link Route.announce}, so the job can
+	 * fill its catalog first; closing the route or its broadcast before then refuses them.
+	 *
+	 * Throws {@link StreamCode | StreamCode.Unroutable} on a request a session forwarded, which can
+	 * only {@link serve} its peer's broadcast, and, announcing nothing, once the request was
+	 * released or its claim retracted. Otherwise it throws as {@link Producer.route} does.
+	 */
+	route(options: RouteOptions = {}): Route {
+		if (this.#state !== "pending") throw new Error("request is closed");
+		if (!this.#publisher) throw unroutable();
+		const route = exactRoute(this.#publisher, this.path, options, this);
+		this.#state = "answered";
+		return route;
 	}
 
 	/**
-	 * Resolve a session-forwarded request with its peer's routed broadcast.
+	 * Serve a held broadcast under this claim without announcing an exact route.
 	 *
-	 * The caller keeps producing into `broadcast`; repeat requests for the path share
-	 * it for as long as it stays live.
-	 *
-	 * A JS app does not proxy: a broadcast a session delivered would go out labeled with
-	 * this origin's hop. To serve upstream content, copy its tracks into a prepared answer
-	 * and publish it.
-	 *
-	 * @throws Error when handed a broadcast a session delivered. The request stays open.
-	 * @internal
+	 * Takes ownership of a consumer; a producer stays the caller's. Every answer at this
+	 * path belongs to the claim's instance and must continue the same sequences and
+	 * bytes. Start a new claim for different content, or use {@link route} for a job
+	 * that can restart independently.
 	 */
-	// pending: /quest/m1/public-model/answer.md
-	accept(source: broadcast.Producer | broadcast.Consumer): void {
-		if (this.#done) {
+	serve(source: broadcast.Producer | broadcast.Consumer): void {
+		if (this.#state !== "pending") {
 			// A withdrawn request takes no answer. Only the handed-off consumer is ours;
 			// the application still owns its producer and any other consumers.
-			if (this.#withdrawn && source instanceof broadcast.Consumer) source.close();
+			if (this.#state === "withdrawn" && source instanceof broadcast.Consumer) source.close();
 			return;
 		}
-		if (this.publisher) throw new Error("claim answers must be prepared and published");
-		if (this.#server.originated && !(source instanceof broadcast.Producer) && wireOf(source).fromSession) {
-			throw new Error("origin cannot serve a broadcast it did not produce");
-		}
-		this.#done = true;
+		this.#state = "answered";
 		const front = source instanceof broadcast.Producer ? source.consume() : source;
 		this.#server.accept(this, front);
 	}
 
 	/** Reject the request, resolving every awaiting requester with `err`. */
 	reject(err: Error): void {
-		if (this.#done) return;
-		this.#done = true;
+		if (this.#state !== "pending") return;
+		this.#state = "answered";
+
 		this.#server.reject(this, err);
-	}
-}
-
-/** A claim answer being filled before its exact route is announced. */
-export class Prepared {
-	/** The unannounced broadcast to fill before publishing; only {@link publish} announces it. */
-	readonly broadcast: broadcast.Producer;
-	readonly #request: Request;
-	readonly #announcer: broadcast.Announcer;
-	readonly #epoch: Epoch.Valid;
-	#done = false;
-
-	/** @internal */
-	constructor(request: Request, answer: broadcast.Producer, announcer: broadcast.Announcer, epoch: Epoch.Valid) {
-		this.#request = request;
-		this.broadcast = answer;
-		this.#announcer = announcer;
-		this.#epoch = epoch;
-	}
-
-	/** Announce the filled broadcast and resolve every waiting requester, refusing them if it cannot be announced. */
-	publish(): broadcast.Producer {
-		if (this.#done) throw new Error("prepared answer is closed");
-		this.#done = true;
-		try {
-			return this.#request.publishPrepared(this.broadcast, this.#announcer, this.#epoch);
-		} catch (err) {
-			this.broadcast.close();
-			this.#request.rejectPrepared(err instanceof Error ? err : new Error(String(err)));
-			throw err;
-		}
-	}
-
-	/** Abandon the answer unpublished, closing its broadcast and resolving every waiting requester with `err`. */
-	reject(err: Error): void {
-		if (this.#done) return;
-		this.#done = true;
-		this.broadcast.close();
-		this.#request.rejectPrepared(err);
 	}
 }

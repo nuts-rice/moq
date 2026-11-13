@@ -13,8 +13,6 @@ use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
 
-use hang::moq_net;
-
 use super::MoqSink as Element;
 
 pub(crate) static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
@@ -137,37 +135,20 @@ pub struct ResolvedSettings {
 	pub url: url::Url,
 	/// Name to publish the broadcast under.
 	pub broadcast: String,
-	/// Disable TLS certificate verification (local/dev use).
-	pub tls_disable_verify: bool,
-	/// QUIC idle timeout override.
-	pub quic_idle_timeout: Option<std::time::Duration>,
-	/// QUIC keep-alive override, including zero to disable it.
-	pub quic_keep_alive: Option<std::time::Duration>,
-	/// Write TLS session secrets to the file `SSLKEYLOGFILE` names.
-	pub quic_keylog: bool,
+	/// The shared connection properties resolved before startup.
+	pub connect: moq_tokio::connect::Config,
+	/// The shared QUIC properties resolved before startup.
+	pub quic: moq_tokio::quic::Config,
 }
 
 /// Builds the connect configuration with the sink's TLS and backoff overrides.
 pub(super) fn connect_config(settings: &ResolvedSettings) -> moq_tokio::connect::Config {
-	let mut config = moq_tokio::connect::Config::default();
-	config.tls.insecure = Some(settings.tls_disable_verify);
-	config.backoff.timeout = Some(std::time::Duration::ZERO);
-	config
+	settings.connect.clone()
 }
 
 /// The QUIC transport overrides the sink exposes as properties.
 pub(super) fn quic_config(settings: &ResolvedSettings) -> moq_tokio::quic::Config {
-	let mut config = moq_tokio::quic::Config::default();
-	// The properties are optional and the config fields are not: an unset property
-	// leaves the library default rather than overriding it with one of its own.
-	if let Some(idle_timeout) = settings.quic_idle_timeout {
-		config.idle_timeout = Some(idle_timeout);
-	}
-	if let Some(keep_alive) = settings.quic_keep_alive {
-		config.keep_alive = Some(keep_alive);
-	}
-	config.keylog = Some(settings.quic_keylog);
-	config
+	settings.quic.clone()
 }
 
 /// Whether the publication is still open, and if not, how it ended.
@@ -269,6 +250,9 @@ pub(crate) struct Session {
 	/// The live recv-bitrate estimate, tracked across reconnects by the reconnect loop. Read directly
 	/// by the `estimated-recv-rate` getter.
 	recv_bandwidth: moq_net::bandwidth::Consumer,
+	/// Divides this publication's send estimate among tracks that opt into a ceiling. The reconnect
+	/// handle owns the registry, so reservations and their probe target survive reconnects.
+	bandwidth: moq_net::bandwidth::Allocator,
 	connection_stats: moq_tokio::connection::Monitor,
 	/// This publication's completion. The task moves it to `Failed` on a fatal transport error, so the
 	/// pad streaming threads stop feeding a dead session without consulting the element.
@@ -276,27 +260,32 @@ pub(crate) struct Session {
 }
 
 impl Session {
-	/// Create the broadcast/catalog producers and spawn the connect task. Returns the producers for the
-	/// element to write into; the session task owns only the origin, the connection, and the status.
+	/// Create the route and catalog producer and spawn the connect task. Returns them for the element
+	/// to hold and write into; the session task owns only the origin, the connection, and the status.
 	pub fn start(
 		settings: ResolvedSettings,
 		element: glib::WeakRef<Element>,
 	) -> Result<(
 		Self,
 		SessionRegistration,
-		moq_net::broadcast::Producer,
+		moq_net::origin::Route,
 		moq_mux::catalog::Producer,
 	)> {
 		// Producer setup may touch tokio time (group eviction), so run it inside the runtime context.
 		let _rt = RUNTIME.enter();
 
 		let origin = moq_tokio::origin::spawn();
-		// Each run is a new publisher instance: a restarted pipeline takes over from one whose route still
-		// lingers, rather than resuming viewers into the old run's group sequence. Reconnects keep it.
-		let epoch = moq_net::Epoch::mint();
-		gst::info!(CAT, "publishing {} under epoch {epoch}", settings.broadcast);
-		let mut broadcast = origin.publish(&settings.broadcast, moq_net::origin::Route::default().with_epoch(epoch))?;
-		let catalog = moq_mux::catalog::Producer::new(&mut broadcast, moq_mux::catalog::Config::default())?;
+		// Each run is a new stream under a fresh instance, which the route mints: a restarted
+		// pipeline never resumes viewers into the old run's group sequence. Reconnects keep it.
+		let route = origin.route(&settings.broadcast, moq_net::origin::RouteOptions::default())?;
+		gst::info!(
+			CAT,
+			"publishing {} under instance {}",
+			settings.broadcast,
+			route.instance()
+		);
+		let catalog =
+			moq_mux::catalog::Producer::new(&mut route.broadcast().clone(), moq_mux::catalog::Config::default())?;
 
 		let status = Arc::new(Status::default());
 		let completion = CompletionState::new();
@@ -316,6 +305,7 @@ impl Session {
 		// Persistent handles that survive reconnects; the getters read them without touching the loop.
 		let send_bandwidth = reconnect.send_bandwidth();
 		let recv_bandwidth = reconnect.recv_bandwidth();
+		let bandwidth = reconnect.allocator();
 		let connection_stats = reconnect.monitor();
 
 		// The task is spawned parked. An immediate auth rejection would otherwise race the element
@@ -338,11 +328,12 @@ impl Session {
 				status,
 				send_bandwidth,
 				recv_bandwidth,
+				bandwidth,
 				connection_stats,
 				completion,
 			},
 			SessionRegistration { gate },
-			broadcast,
+			route,
 			catalog,
 		))
 	}
@@ -360,6 +351,16 @@ impl Session {
 	/// The estimated receive bitrate in bits per second, 0 when disconnected or unavailable.
 	pub fn estimated_recv_rate(&self) -> u64 {
 		self.recv_bandwidth.peek().map_or(0, moq_net::bandwidth::Rate::as_bps)
+	}
+
+	/// The allocator shared by tracks published in this session.
+	pub fn bandwidth(&self) -> moq_net::bandwidth::Allocator {
+		self.bandwidth.clone()
+	}
+
+	#[cfg(test)]
+	pub(super) fn replace_bandwidth(&mut self, bandwidth: moq_net::bandwidth::Allocator) {
+		self.bandwidth = bandwidth;
 	}
 
 	/// Snapshot the current connection statistics, or None while disconnected.
@@ -381,11 +382,10 @@ impl Session {
 
 	/// Stop the session: a clean local close, never an error. Returns once the reconnect loop has ended.
 	///
-	/// Aborting only cancels the loop at its next await point, and a worker may be mid-dial, generating
-	/// TLS randomness. A process exiting in that window (`gst-launch` right after NULL) races aws-lc's
-	/// exit destructors, which free its seed DRBG and then `abort()` a thread asking for more.
+	/// Aborting only cancels the loop at its next await point, and a worker may be mid-dial. Without the
+	/// wait, that dial outlives the state change an application waits on before it exits (`gst-launch`
+	/// right after NULL).
 	pub fn stop(self) {
-		// The status task goes first, so it never reports the loop's end as a failure.
 		self.join.abort();
 		self.connection.abort(moq_net::Error::Cancel);
 		crate::block_on(async {
@@ -471,7 +471,13 @@ async fn forward_registered(
 					}
 					notify(&element, &["status", "connected", "moq-version", "connection-stats"]);
 				}
-				Err(err) => {
+				Err(_) => {
+					// `closed` tells a stop from a give-up. A stop is what `Session::stop` asked for: its
+					// abort cannot cancel a poll already in flight, so the loop's end can reach the task
+					// before the task ends.
+					let Err(err) = reconnect.closed().await else {
+						return;
+					};
 					// The reconnect loop stopped on a terminal error (a non-retryable auth failure, or a
 					// bounded backoff's give-up). Ending the publication stops the pad threads feeding a
 					// dead session; losing that race means it already ended, so there is nothing to report.
@@ -550,19 +556,17 @@ mod tests {
 		assert_eq!(structure.get::<u64>("ended"), Ok(2));
 	}
 
-	fn started_with_broadcast() -> (Session, moq_net::broadcast::Producer) {
+	fn started_with_broadcast() -> (Session, moq_net::origin::Route) {
 		gst::init().unwrap();
 		let settings = ResolvedSettings {
 			url: "https://127.0.0.1:1".parse().unwrap(),
 			broadcast: "test".into(),
-			tls_disable_verify: false,
-			quic_idle_timeout: None,
-			quic_keep_alive: None,
-			quic_keylog: false,
+			connect: crate::connection::Settings::default().resolve().unwrap().0,
+			quic: Default::default(),
 		};
-		let (session, registration, broadcast, _) = Session::start(settings, glib::WeakRef::new()).unwrap();
+		let (session, registration, route, _) = Session::start(settings, glib::WeakRef::new()).unwrap();
 		registration.mark_registered();
-		(session, broadcast)
+		(session, route)
 	}
 
 	fn started() -> (Session, moq_tokio::Connection) {
@@ -571,28 +575,29 @@ mod tests {
 		(session, connection)
 	}
 
-	fn announced_epoch(broadcast: &moq_net::broadcast::Producer) -> moq_net::Epoch {
-		broadcast.route().expect("announced").epoch.expect("an epoch")
+	fn announced_instance(route: &moq_net::origin::Route) -> moq_net::Instance {
+		assert!(route.is_announced());
+		route.instance()
 	}
 
-	// Without an epoch, a restart whose old route lingers resumes viewers into the old run's groups.
+	// Under one instance, a restart whose old route lingers would resume viewers into the old run's groups.
 	#[test]
-	fn each_run_announces_a_newer_epoch() {
+	fn each_run_announces_a_new_instance() {
 		let (first, first_broadcast) = started_with_broadcast();
-		let first_epoch = announced_epoch(&first_broadcast);
+		let first_instance = announced_instance(&first_broadcast);
 		first.stop();
 
 		let (second, second_broadcast) = started_with_broadcast();
-		assert!(announced_epoch(&second_broadcast) > first_epoch);
+		assert_ne!(announced_instance(&second_broadcast), first_instance);
 		second.stop();
 	}
 
 	fn is_closed(connection: &moq_tokio::Connection) -> bool {
-		connection.poll_closed(&moq_net::kio::Waiter::noop()).is_ready()
+		connection.poll_closed(&kio::Waiter::noop()).is_ready()
 	}
 
-	// A dial still running once the element reached NULL can outlive `main`, and aws-lc aborts the
-	// process when a thread asks it for randomness after its exit destructors ran.
+	// A dial still running once the element reached NULL would outlive the state change an application
+	// waits on before it exits.
 	#[test]
 	fn stop_returns_after_the_reconnect_loop_ends() {
 		let (session, connection) = started();
@@ -623,6 +628,26 @@ mod tests {
 		let (session, connection) = started();
 		futures::executor::block_on(async move { session.stop() });
 		assert!(is_closed(&connection));
+	}
+
+	// The losing order of a stop: the status task polls only after the loop it follows has ended.
+	#[test]
+	fn a_local_stop_is_not_a_session_failure() {
+		let (session, connection) = started();
+		let completion = session.completion();
+		let status = session.status().clone();
+		connection.abort(moq_net::Error::Cancel);
+		let _ = crate::block_on(connection.closed());
+		crate::block_on(forward_registered(
+			connection,
+			moq_tokio::origin::spawn(),
+			status.clone(),
+			completion.clone(),
+			glib::WeakRef::new(),
+		));
+		assert!(completion.is_open(), "the stopped publication is not failed");
+		assert_ne!(status.status(), ConnectionStatus::Failed);
+		session.stop();
 	}
 
 	#[tokio::test]

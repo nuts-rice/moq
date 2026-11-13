@@ -10,7 +10,7 @@
 //! [`Surface`] holding the pixels. Capture and [`decode`] produce them, [`encode`]
 //! consumes them and hands back the compressed [`encode::Encoded`], and [`Size`]
 //! names a resolution. Group boundaries are the encoder's business: it places
-//! them per [`encode::Config::gop`], and [`encode::Encoder::cut`] is there for
+//! them per [`encode::Config::join`], and [`encode::Encoder::cut`] is there for
 //! the rarer case where a caller needs one at a specific frame.
 //!
 //! - `capture` describes a frame source and grabs frames per platform:
@@ -25,13 +25,12 @@
 //!   and framing. The codec is chosen via [`encode::Codec`]: H.264 (openh264 /
 //!   VideoToolbox / Media Foundation / NVENC / VAAPI / V4L2) or H.265
 //!   (VideoToolbox / Media Foundation / NVENC). Entry points:
-//!   - `encode::Control::new` returns a `Control` handle (ask for a keyframe
-//!     with `cut`) and the `Driver` that captures and publishes the webcam.
-//!   - `encode::publish_capture` captures a webcam and publishes it (turnkey).
-//!     It encodes strictly on demand: the track and catalog are advertised up
-//!     front (the camera opens once at startup so they can be exact), and the
-//!     encoder runs only while a subscriber is watching. Requires the `capture`
-//!     feature.
+//!   - `encode::publish_capture` captures a webcam and publishes it (turnkey),
+//!     returning a `Publication` handle and the `Driver` that runs it.
+//!     The track and catalog are advertised up front (the camera opens at
+//!     startup so they can be exact), and the camera stays open and encodes
+//!     whether or not anyone is watching, unless `encode::Capture::on_demand`
+//!     limits it to while a subscriber is. Requires the `capture` feature.
 //!   - [`encode::Encoder`] encodes [`Frame`]s you supply (from capture, a
 //!     decoder, or your own pixels via [`Surface::rgba`]) and
 //!     [`encode::Producer`] publishes the results.
@@ -58,7 +57,7 @@
 //! The public API is codec-agnostic: no public type, signature, or error
 //! variant names a backend (openh264 / VideoToolbox / NVENC / NVDEC / VAAPI / V4L2) or a
 //! codec implementation. [`encode::Encoder`] takes a [`Frame`],
-//! [`decode::Consumer`] and `capture::Stream` return one (CPU I420 on demand,
+//! [`decode::Read::Frame`] and `capture::Stream` carry one (CPU I420 on demand,
 //! GPU-resident when hardware decoded). So swapping
 //! or bumping any backend crate is not a breaking change for consumers. Config
 //! structs are `#[non_exhaustive]`: build them via `default()`/`new()` and set
@@ -85,8 +84,8 @@ pub mod resize;
 
 mod error;
 pub mod frame;
+mod frame_rate;
 mod output;
-mod rate;
 mod size;
 // Only the threaded sinks use this, and both are compiled out on macOS and iOS, where
 // the codecs run inline (no COM apartment to confine). Ungated it is dead code
@@ -103,32 +102,8 @@ mod v4l2;
 pub use color::Color;
 pub use error::Error;
 #[cfg(all(target_os = "linux", feature = "dmabuf"))]
-pub use frame::{DmaBuf, DmaBufExport, DmaBufLayout, DmaBufPlane, DrmFormat};
+pub use frame::{DmaBuf, DmaBufExport, DmaBufPlane, DrmFormat};
 pub use frame::{Frame, I420, Surface};
+pub use frame_rate::{FrameRate, FrameRateError, MAX_FRAMES_PER_SECOND};
 pub use output::Output;
-pub use rate::{MAX_FRAMES_PER_SECOND, Rate, RateError};
 pub use size::Size;
-
-/// The NDK bindings [`frame::android::HardwareBuffer::buffer`] hands back,
-/// re-exported for the same reason as the Apple and Windows ones: name the
-/// exact version this crate links rather than guessing at a matching one, since a
-/// hardware buffer from a different `ndk` build is a different type. A major bump
-/// here is a breaking change for this crate.
-#[cfg(all(target_os = "android", feature = "mediacodec"))]
-pub use ndk;
-/// The CoreFoundation bindings owning the handle [`Surface::into_pixel_buffer`]
-/// returns, re-exported alongside [`objc2_core_video`] for the same reason.
-#[cfg(apple)]
-pub use objc2_core_foundation;
-/// The CoreVideo bindings [`Surface::into_pixel_buffer`] hands back,
-/// re-exported so you name the exact version this crate links rather than guessing
-/// at a matching one. A major bump here is a breaking change for this crate.
-#[cfg(apple)]
-pub use objc2_core_video;
-/// The Direct3D11 bindings [`frame::d3d11::Texture`] hands back, re-exported for
-/// the same reason as the Apple ones above: name the exact version this crate
-/// links rather than guessing at a matching one, since a device and a texture
-/// from a different `windows` build are different types. A major bump here is a
-/// breaking change for this crate.
-#[cfg(target_os = "windows")]
-pub use windows;

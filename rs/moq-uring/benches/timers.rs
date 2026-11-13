@@ -25,18 +25,21 @@ fn benchmark(c: &mut criterion::Criterion) {
 	for armed in [1, 64, 1024, 16384] {
 		// The rest of the table, spread across a minute so the re-armed timer
 		// lands among them.
-		let now = moq_clock::now();
+		let now = kio::clock::now();
 		let _others: Vec<_> = (0..armed)
 			.map(|i| {
 				let mut timer = handle.timer();
-				timer.set(Some(now + Duration::from_secs(60) * i / armed));
+				timer.set(Some(now.saturating_add(Duration::from_secs(60) * i / armed)));
 				timer
 			})
 			.collect();
 
 		// Two instants a re-arm alternates between, so every set moves it.
 		let mut timer = handle.timer();
-		let at = [now + Duration::from_secs(30), now + Duration::from_secs(31)];
+		let at = [
+			now.saturating_add(Duration::from_secs(30)),
+			now.saturating_add(Duration::from_secs(31)),
+		];
 		let mut flip = 0;
 		group.bench_function(BenchmarkId::new("rearm", armed), |b| {
 			b.iter(|| {

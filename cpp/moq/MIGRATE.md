@@ -1,144 +1,74 @@
-# Migrating the C++ moq library
-
-How to update your code for each breaking change, newest first.
+# Migrating the C++ MoQ package
 
 ## Unreleased
 
-### Priorities are signed (#6142)
+### Socket sessions
 
-`TrackInfo::priority`, `Subscription::priority`, and `FetchGroupOptions::priority` are `int8_t`, and `GroupRequest::priority()` returns one.
-Higher is first and 0 is the unset midpoint; `TrackInfo::priority` defaulted to 127 and now defaults to 0.
-To keep a value's moq-lite byte, subtract 128 from it, widening first (`static_cast<int8_t>(int(old) - 128)`): 255 becomes 127, 128 becomes 0, and 0 becomes -128.
+The generated SocketEndpoint, SocketIncomingTcp, SocketIncomingTrack, SocketTcpStream, and SocketTrackStream handles now expose TCP group halves and reliably subscribed track halves beside origin. Regenerate bindings and rebuild the matching native library together. Existing callers need no migration. Socket endpoints require lite-07 or moq-transport on every hop; there is no wire change.
 
-### A client asks only about what it watches (#6165)
+`moq::GroupProducer::ready(size)` is a new async call that completes once a frame of `size` bytes fits a window ahead of the fastest reader. `co_await` it before each `write_frame` so the writer waits for its fastest reader instead of evicting it, though not for slower readers; a TCP socket stream's producer needs it to behave like TCP. Existing writers are unchanged.
 
-On moq-lite, a client session asks its relay for announcements only under paths something watches, through `announced` or `announced_broadcast`, instead of under its whole scope at connect.
-`OriginConsumer::request_broadcast` watches nothing, so on a client it fails with an unroutable error for a path nothing watches, even when the relay announces it.
-Resolve the path with `announced_broadcast`, or hold `announced` over its prefix while requesting.
-moq-transport and moq-lite-03/04 sessions are unchanged.
+### `Following::available()` reports the path going offline ([#7678](https://github.com/moq-dev/moq/pull/7678))
 
-### `moq::ContainerFormat::kFmp4` unwraps to Legacy (#6250)
+`moq::Following::available()` resolves to a null `std::shared_ptr<moq::BroadcastConsumer>` once the path goes offline (or, for a follow pinned to an instance, once another instance takes it over), then the next broadcast when something serves the path again. The first call is never null. Check for null before using a later result, and treat it like the previous instance ending.
 
-A container import with `moq::ContainerFormat::kFmp4` now publishes one Legacy frame per sample instead of one CMAF frame per fragment.
-Pass the new `moq::ContainerFormat::kCmaf` to keep publishing CMAF.
+### Publishing goes through one `moq::Route` handle
 
-### Catalog references carry their epoch
+`OriginProducer::create_broadcast(path)` is `route(path, options)`, and `requests(prefix)` is `route_prefix(prefix, options)`; `{}` options are the default. Each returns a `std::shared_ptr<moq::Route>`, which replaces `moq::Publication`, `moq::OriginRequests`, and `moq::BroadcastPrepared`:
 
-`Video` and `Audio` gain `epoch`, the publisher instance their `broadcast` reference names, right after `broadcast`; positional initializers shift by one.
-`BroadcastConsumer::resolve(reference)` becomes `resolve(reference, epoch)`; pass the rendition's `epoch` alongside its `broadcast`, or `std::nullopt` to resolve whichever instance answers.
-Resolving, and the rendition-based consumers, fail with `moq::Error::kMux` for a rendition whose broadcast is proven to serve another epoch.
+- `Publication::broadcast()` is `Route::broadcast()`, which returns an error on a prefix route.
+- `Publication::announce(route)` is `announce()`, and re-pricing is `set_cost(cost)`; `unannounce()` is `withdraw()`.
+- `OriginRequests::requested_broadcast()` is `requested()`, which resolves to `nullptr` once the origin closes.
+- `BroadcastRequest::prepare()` then `BroadcastPrepared::publish()` is `BroadcastRequest::route(options)`: create it hidden to fill it first, then `announce()`.
+- `instance_id()` is the stream's instance, kept across `withdraw()` and `announce()`.
 
-### Finished tracks stay until the broadcast ends (#6157)
+`moq::AnnounceRoute` is `moq::RouteOptions{hidden, cost, instance, epoch}`, given at creation. A route is visible at once unless `hidden`; set it and call `announce()` after filling the catalog to keep the old order. Hold the route while the broadcast should stay announced: `cancel()` or releasing its last handle retracts it, and closing its broadcast ends both. `moq::Route`, the record on `moq::Announce::route`, is `moq::RouteInfo`.
 
-A finished track now stays listed, with its catalog rendition and demand, until its broadcast closes or the new `BroadcastProducer::finish` lets go.
-Publish a replacement under a new name, and expect a finished track's demand watch to end with the broadcast.
+### Separate datagram tracks
 
-### A claim answers by publishing (#5678)
+Replace stream-track datagram methods with `BroadcastProducer::create_datagrams(name, info)` and `BroadcastConsumer::datagrams(name)`. The generated `DatagramProducer` exposes `append(timestamp, payload)` and `insert(Datagram)`; `DatagramConsumer::recv()` returns an optional datagram through a future. `DatagramInfo` has only priority and optional timescale. Demand is aggregate subscriber `priority()` / `priority_changed(last)`; on-demand datagram requests come from `BroadcastRequests::datagrams()` / `DatagramRequests::requested()`. Stream tracks of the same name are independent.
 
-`OriginProducer::dynamic(prefix)` takes no route, and `OriginDynamic::update` is gone.
-Replace `request->accept(broadcast)` with `request->prepare(epoch)`, which returns a `BroadcastPrepared`: fill its `broadcast()`, then `publish()` announces it at the exact path under that epoch and returns its producer.
+### Authored tracks default to a zero max age ([#7729](https://github.com/moq-dev/moq/pull/7729))
 
-### Anchors can name a time (#6074)
+An unset `moq::TrackInfo::max_age`, and a `std::nullopt` info, now advertise a zero max age, serving only the live edge, instead of no publisher limit. Set the new `max_age_unlimited`, which ignores `max_age`, where you relied on `std::nullopt` meaning no limit. A received track's `info()` sets it when its publisher advertised no limit.
 
-`Anchor` gains a `Time` case holding `timestamp_us`, the group containing that presentation time, so exhaustive visits need a case for it.
-`TrackConsumer::update` now returns a result, failing with `TimestampMismatch` on a time anchor an untimed track can't serve.
+### Viewer targets are bounded ([#7090](https://github.com/moq-dev/moq/pull/7090))
 
-### Rebuild the matching raw bindings
+Viewer ceilings and PROBE target overrides are refused with the new `moq::Error::kOutOfRange` once they would sum above 2^53 - 1 bps, the most a PROBE target carries; nothing changes on a refusal. `Viewers::watch` and `set_target` and `Viewer::update` return a `moq::expected` carrying it. Handle the new variant wherever you match the error exhaustively. Regenerate bindings and rebuild the matching native library together.
 
-The documentation update changes UniFFI's audio-producer method metadata checksums.
-Regenerate the C++ binding headers and sources from the rebuilt native library,
-then rebuild the application; older generated guards reject the rebuilt library.
-Application calls are unchanged.
+### `moq::VideoInit::lower` takes either producer kind ([#7699](https://github.com/moq-dev/moq/pull/7699))
 
-### JSON consumers return `JsonValue` (#5677)
+`lower` is `std::optional<moq::MediaProducer>` instead of a `std::shared_ptr<moq::MediaTrackProducer>`. Assign `moq::MediaProducer(moq::MediaProducer::kTrack{producer})`, or `kStream` for a `moq::MediaTrackStreamProducer`.
 
-`JsonSnapshotConsumer::next()` and `JsonStreamConsumer::next()` return `JsonValue` (`value`, `timestamp_us`) instead of a string; `timestamp_us` is empty when untimed.
-A snapshot consumer's `next()` now yields every state in order; call `latest()` for the newest.
-Timestamps are rounded down to a whole microsecond.
+### Media setup refusals are typed
 
-### Ranges filter reads (#5929)
+Audio and video subscribe setup now reports `moq::Error::kUnsupportedConfig` when the decoder refuses a codec, layout, or description, or when every video decoder for the codec reports that this device cannot decode the stream. Handle this variant to try another rendition instead of inspecting an audio/video error message or `Unsupported`. Decoder faults, such as a missing driver or no device, and later peer and decode failures keep their existing errors. Regenerate bindings and rebuild the matching native library together.
 
-A subscription now reads only the groups its own `ranges` cover.
+### JSON writes take a broadcast-clock timestamp ([#7691](https://github.com/moq-dev/moq/pull/7691))
 
-### Track demand reports the wanted group (#5930)
+`moq::JsonSnapshotProducer::update`, `moq::JsonStreamProducer::append`, and `moq::JsonWindowProducer::push` and `pop` take a required `moq::Timestamp` instead of an optional one. Stamp it from `moq::MediaCatalogProducer::now()`, the broadcast clock every track shares. Their constructors refuse a track created without a `timescale`. Regenerate bindings and rebuild with the matching native library.
 
-`TrackDemand::is_used`, `used`, and `unused` are gone.
-`wanted()` returns `std::nullopt` while nobody subscribes, otherwise the group subscribers want next, and `wanted_changed()` waits for it to change (the first call returns at once).
-Loop on `wanted_changed()` until it returns a value where you awaited `used()`, and `std::nullopt` where you awaited `unused()`.
-`TrackInfo` gains `refresh`, the ratio past which a joining subscriber asks for a new group.
+### Subscriptions take a `moq::Delay` ([#7697](https://github.com/moq-dev/moq/pull/7697))
 
-### `CongestionControl` gained `kNone` (#5926)
+`moq::Subscription::max_delay` is `moq::Delay delay`: set `delay.max` to the old `max_delay`, or start from `moq::subscription_defaults()`.
+`moq::Delay::min` is a `std::optional`: `std::nullopt` leaves the target latency unstated, which a decoder plays as zero. A bare `moq::Subscription{}` leaves both bounds unset, so its `delay.max` still sets no subscriber limit.
 
-`moq::CongestionControl::kNone` runs no congestion control and no pacing, for tests and controlled links.
-A `switch` without a `default` needs one more case.
+### Announcement captures are required ([#7484](https://github.com/moq-dev/moq/pull/7484))
 
-### Container byte streams use `MediaContainerProducer` (#5919)
+`moq::Announce.captures` is `std::vector<std::string>` instead of an optional vector. Remove optional checks and dereferences; an empty vector means the filter has no wildcards. Regenerate bindings and rebuild with the matching native library.
 
-`moq::MediaContainerStreamProducer` and `moq::ContainerStreamInit` are gone: a container recovers its own framing, so `moq::MediaContainerProducer` takes chunks split anywhere.
-Pass empty `data` and write the stream through it.
+### Decoder outputs take a `moq::Delay` ([#7311](https://github.com/moq-dev/moq/pull/7311))
 
-```cpp
-auto stream = ok(moq::MediaContainerProducer::init(broadcast, {moq::ContainerFormat::kFmp4, {}}));
-```
+`moq::AudioDecoderOutput` replaces `max_delay` and the playout `delay` with `std::optional<moq::Delay> delay` and `bool estimate = true`.
+`moq::VideoDecoderOutput::max_delay` is `std::optional<moq::Delay> delay`.
+`moq::Delay{min, max}`: `max` (`std::nullopt` for no limit) is the old `max_delay`, and `min` is the playout delay, where a cold join starts.
+A fixed audio playout delay `d` is `delay = moq::Delay{d, max}` with `estimate = false`.
 
-### Key logging is opt-in (#5907)
+### Paths with an empty segment are refused ([#6648](https://github.com/moq-dev/moq/pull/6648))
 
-`SSLKEYLOGFILE` alone no longer writes TLS session secrets.
-Set `QuicConfig::keylog` to `true` as well to capture them; without `SSLKEYLOGFILE` the client or server refuses to build.
+Publishing, serving, or requesting a broadcast at a path with a leading, trailing, or doubled `/` fails instead of collapsing it. Pass the canonical path, such as `room/cam`.
 
-### Subscriptions carry group ranges (#5732)
+### First release
 
-`Subscription::group_start` and `group_end` are replaced by `ranges`, a list of `Range` whose ends are an `Anchor` (an absolute group and frame, or a count of groups before the latest), and an optional `order`.
-To start at group `n`, pass one range starting at the absolute anchor for group `n`, frame 0.
-
-### Receive estimates come from `Session::recv_bandwidth` (#5777)
-
-The connection stats no longer carry a receive estimate.
-Hold the consumer `Session::recv_bandwidth` returns to request PROBE, read it with `peek()` or wait with `changed()`, and `cancel()` it to stop.
-
-```cpp
-auto bandwidth = session->recv_bandwidth();
-auto rate = bandwidth ? bandwidth->peek() : std::nullopt;
-```
-
-### `AnnouncedBroadcast::available()` waits for the next publisher instance (#5700)
-
-The first call returns the broadcast serving the path, as before.
-Each later call waits for the next instance to take over the path, instead of returning whatever serves it now.
-
-### A timed track refuses a group that rewinds (#5803)
-
-Writing a frame fails with `TimestampMismatch` when a group's first frame starts before a lower-sequence group's, or after a higher one's.
-A publisher whose timeline restarts publishes a new broadcast instead.
-
-### Bandwidth reserves a track's demand (#5845)
-
-`Bandwidth::reserve` takes the track's `demand()` instead of the producer, and no longer fails: pass `ok(track->demand())`.
-
-### Generated types drop the `Moq` prefix (#5727)
-
-`moq::MoqFoo` is `moq::Foo`, the name the aliases already gave it.
-`moq::expected` is `tl::expected` at every C++ standard instead of `std::expected` under C++23, and `MOQ_ABI`, `MOQ_ABI_NAME`, and `MOQ_IMPLEMENTATION` are gone.
-
-### Media subscribe and fetch take a catalog rendition (#5834)
-
-`moq::MediaTrackConfig` and `moq::MediaGroupConfig` replace `name` and `container` with a `moq::Rendition` and follow its broadcast and track themselves.
-
-```cpp
-auto media = ok(moq::MediaTrackConsumer::subscribe(broadcast, {moq::Rendition::kVideo{id, video}}).get());
-```
-
-### Native codecs have audio and video types (#5694)
-
-`BroadcastProducer::encode_audio` / `encode_video` are `moq::AudioProducer::init` / `moq::VideoProducer::init`, which take a `moq::MediaCatalogProducer`.
-The audio track name moves into `AudioEncoderOutput::track`, and a zero `frame_duration_us` takes the codec's own frame.
-`BroadcastConsumer::decode_audio` / `decode_video` are `moq::AudioConsumer::subscribe` / `moq::VideoConsumer::subscribe`, taking the broadcast first.
-Producers expose subscriber state only through `demand()`, and a video `gop` is a `moq::VideoGop` keyframe variant.
-`moq::AudioEncoder` / `moq::VideoEncoder` encode without publishing.
-
-```cpp
-moq::AudioEncoderOutput output{moq::AudioCodec::opus()};
-output.track = "audio";
-auto catalog = ok(moq::MediaCatalogProducer::init(broadcast));
-auto audio = ok(moq::AudioProducer::init(catalog, input, output, nullptr));
-```
+There is no published C++ package to migrate from. Start with the current headers and examples, and build the wrapper, generated bindings, and native library together.
+The underlying generated API follows the [moq-ffi migration guide](../../rs/moq-ffi/MIGRATE.md).

@@ -15,11 +15,15 @@ test("parse refuses a repeated key and accepts its near misses", () => {
 	for (const text of vectors.accepted) expect(parse(encode(text)), text).toEqual(JSON.parse(text));
 });
 
-test("parse accepts nesting deeper than the call stack", () => {
-	const depth = 100_000;
-	const text = `${'[{"a":'.repeat(depth)}0${"}]".repeat(depth)}`;
-	expect(() => parse(encode(text))).not.toThrow();
-	expect(() => parse(encode(`${'[{"a":0,"a":'.repeat(depth)}0${"}]".repeat(depth)}`))).toThrow(DuplicateKey);
+// Shared with Rust: nesting serde_json refuses and numbers outside the double range.
+const limits = (await Bun.file(new URL("../../../rs/moq-json/tests/limits.json", import.meta.url)).json()) as {
+	refused: string[];
+	accepted: string[];
+};
+
+test("parse refuses what Rust refuses", () => {
+	for (const text of limits.refused) expect(() => parse(encode(text)), text).toThrow(SyntaxError);
+	for (const text of limits.accepted) expect(parse(encode(text)), text).toEqual(JSON.parse(text));
 });
 
 test("malformed JSON stays a syntax error", () => {
@@ -66,4 +70,17 @@ test("window headers, records, and ops refuse a repeated key", () => {
 	expect(() => group.decode(encode('{"offset":0,"offset":0,"records":[]}'))).toThrow(DuplicateKey);
 	group.decode(encode('{"offset":0,"records":[]}'));
 	expect(() => group.decode(encode('{"pop":0,"pop":0}'))).toThrow(DuplicateKey);
+});
+
+// A JSON string must encode Unicode scalar values, including object keys.
+test("parse refuses malformed Unicode and accepts scalar-value boundaries", () => {
+	for (const text of ['"\\ud800"', '"\\udfff"', '{"\\ud800":0}', '{"x":["\\udfff"]}', "\ufeff{}"]) {
+		expect(() => parse(encode(text)), text).toThrow();
+	}
+	for (const bytes of [[0x80], [0xc0, 0xaf], [0xed, 0xa0, 0x80], [0xf4, 0x90, 0x80, 0x80], [0xe2, 0x82]]) {
+		expect(() => parse(new Uint8Array([0x22, ...bytes, 0x22]))).toThrow();
+	}
+	for (const text of ['"\\ud800\\udc00"', '"\\udbff\\udfff"', '"\\ufffd"', '{"é":"🌍"}', '"\ufeff"']) {
+		expect(parse(encode(text))).toEqual(JSON.parse(text));
+	}
 });

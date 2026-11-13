@@ -6,7 +6,6 @@ use std::net::SocketAddr;
 
 use anyhow::Context;
 use axum::http::Method;
-use hang::moq_net;
 use moq_tokio::RedactedUrl;
 use url::Url;
 
@@ -58,11 +57,8 @@ pub struct Listen {
 /// WHIP server: accept incoming WebRTC publishes into the Origin as `target.name` (import).
 pub async fn listen_import(target: ImportTarget, listen: Listen) -> anyhow::Result<()> {
 	let publisher = scope_producer(&target.origin, &target.name)?;
-	let mut config = server_config(&listen);
-	config.max_age = target.max_age;
-	config.bandwidth = target.bandwidth;
-	let server = moq_rtc::Server::new(config);
-	serve(server.publish_router(publisher), "WHIP", listen).await
+	let server = moq_webrtc::Server::new(server_config(&listen));
+	serve(server.publish_router(publisher, target.ingest), "WHIP", listen).await
 }
 
 /// WHEP server: serve WebRTC plays of `name` from the Origin (export).
@@ -73,7 +69,7 @@ pub async fn listen_export(origin: moq_net::origin::Consumer, name: String, list
 	let subscriber = origin
 		.scope("", &scope)
 		.with_context(|| format!("failed to scope origin to broadcast `{name}`"))?;
-	let server = moq_rtc::Server::new(server_config(&listen));
+	let server = moq_webrtc::Server::new(server_config(&listen));
 	serve(server.subscribe_router(subscriber), "WHEP", listen).await
 }
 
@@ -88,50 +84,52 @@ fn scope_producer(origin: &moq_net::origin::Producer, name: &str) -> anyhow::Res
 }
 
 /// WHEP client: pull a remote broadcast into the Origin under `target.name` (import),
-/// announced under `epoch`.
-pub async fn connect_import(target: ImportTarget, url: Url, epoch: moq_net::Epoch) -> anyhow::Result<()> {
+/// announced under `instance`.
+pub async fn connect_import(target: ImportTarget, url: Url, instance: moq_net::Instance) -> anyhow::Result<()> {
 	let name = &target.name;
-	let producer = target
-		.origin
-		.create_broadcast(name)
-		.context("failed to create broadcast")?;
 	// The WHEP pull fills the tracks as they arrive; announce up front so viewers
-	// can discover the broadcast while it connects.
-	producer
-		.announce(moq_net::origin::Route::default().with_epoch(epoch))
-		.context("failed to announce broadcast")?;
+	// can discover the broadcast while it connects. Held until the pull ends.
+	let route = target
+		.origin
+		.route(
+			name,
+			moq_net::origin::RouteOptions::default().with_instance(instance, 0),
+		)
+		.context("failed to create broadcast")?;
 
 	tracing::info!(url = %RedactedUrl::new(&url), %name, "WHEP client pulling");
 	notify_ready();
 
-	let mut config = moq_rtc::client::Config::default();
-	config.max_age = target.max_age;
-	config.bandwidth = target.bandwidth;
-	let client = moq_rtc::Client::new(config);
-	client.subscribe(url, producer).await?;
+	let client = moq_webrtc::Client::new(moq_webrtc::client::Config::default())?;
+	client
+		.subscribe(url, route.broadcast().clone(), target.ingest.catalog())
+		.await?;
 	Ok(())
 }
 
 /// WHIP client: push a broadcast from the Origin to a remote (export).
 pub async fn connect_export(origin: moq_net::origin::Consumer, url: Url, name: String) -> anyhow::Result<()> {
-	// Confirm the broadcast is reachable (and wait for it to be announced) before dialing;
-	// the egress re-resolves it (and any referenced sibling broadcast) through the origin.
-	origin
-		.routed(&name)
+	// Wait for the broadcast to be announced before dialing; the egress resolves any
+	// referenced sibling broadcast through the same origin.
+	let broadcast = origin
+		.follow(name.as_str(), None)?
+		.available()
 		.await
-		.with_context(|| format!("origin closed before broadcast `{name}` was announced"))?;
+		.with_context(|| format!("failed to resolve broadcast `{name}`"))?
+		.context("went offline before serving")?;
+	let source = moq_mux::Source::new(origin, broadcast);
 
 	tracing::info!(url = %RedactedUrl::new(&url), %name, "WHIP client pushing");
 	notify_ready();
 
-	let client = moq_rtc::Client::new(moq_rtc::client::Config::default());
-	client.publish(url, origin, &name).await?;
+	let client = moq_webrtc::Client::new(moq_webrtc::client::Config::default())?;
+	client.publish(url, source).await?;
 	Ok(())
 }
 
-fn server_config(listen: &Listen) -> moq_rtc::server::Config {
-	let mut config = moq_rtc::server::Config::default();
-	config.udp_bind = listen.udp_bind;
+fn server_config(listen: &Listen) -> moq_webrtc::server::Config {
+	let mut config = moq_webrtc::server::Config::default();
+	config.socket = moq_webrtc::server::Socket::Bind(listen.udp_bind);
 	config.ice_candidates.clone_from(&listen.public_addr);
 	config
 }

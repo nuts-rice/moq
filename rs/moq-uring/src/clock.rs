@@ -1,16 +1,15 @@
 //! The worker's clock: the only module that reads the host clock.
 //!
 //! The worker samples it once per turn and hands that instant to its
-//! [`moq_clock::Deadlines`] queue, which it enters as the thread's ambient clock,
+//! [`kio::clock::Deadlines`] queue, which it enters as the thread's ambient clock,
 //! so everything it runs reads the sample instead of the host clock. The host
 //! clock is `CLOCK_MONOTONIC`, read directly so the park can hand the next
 //! deadline to the kernel as an absolute timeout without a second read.
-#![allow(clippy::disallowed_methods)]
 
 use std::task::Context;
 use std::time::Duration;
 
-use moq_clock::Instant;
+use kio::clock::Instant;
 
 /// Where a worker's time comes from.
 #[derive(Clone)]
@@ -21,14 +20,17 @@ pub(crate) enum Clock {
 	///
 	/// The host clock alongside bounds teardown, which must end however long
 	/// the test leaves its clock alone.
-	#[cfg(feature = "manual")]
-	Installed(moq_clock::Installed, Host),
+	#[cfg(feature = "_manual")]
+	Installed(kio::clock::Installed, Host),
 }
 
 /// How the worker waits for its next deadline while parked.
 pub(crate) enum Wait {
 	/// The deadline already passed: run another turn instead of parking.
-	#[cfg_attr(not(feature = "manual"), allow(dead_code))]
+	#[cfg_attr(
+		not(feature = "_manual"),
+		allow(dead_code, reason = "only the `_manual` feature uses it")
+	)]
 	Elapsed,
 	/// Park until a completion or a wake, with no timeout.
 	Forever,
@@ -39,8 +41,8 @@ pub(crate) enum Wait {
 impl Clock {
 	/// The clock installed on the current tokio runtime, or else the host's.
 	pub fn new() -> Self {
-		#[cfg(feature = "manual")]
-		if let Some(clock) = moq_clock::Installed::current() {
+		#[cfg(feature = "_manual")]
+		if let Some(clock) = kio::clock::Installed::current() {
 			return Self::Installed(clock, Host::calibrate());
 		}
 		Self::Host(Host::calibrate())
@@ -50,7 +52,7 @@ impl Clock {
 	pub fn now(&self) -> Instant {
 		match self {
 			Self::Host(host) => host.now(),
-			#[cfg(feature = "manual")]
+			#[cfg(feature = "_manual")]
 			Self::Installed(clock, _) => clock.now(),
 		}
 	}
@@ -60,20 +62,20 @@ impl Clock {
 	pub fn host_now(&self) -> Instant {
 		match self {
 			Self::Host(host) => host.now(),
-			#[cfg(feature = "manual")]
+			#[cfg(feature = "_manual")]
 			Self::Installed(_, host) => host.now(),
 		}
 	}
 
 	/// How to park for `deadline`. A manual clock keeps its alarm in `alarm`, so
 	/// advancing it wakes the worker through `cx`.
-	pub fn wait(&self, deadline: Option<Instant>, alarm: &mut Option<moq_clock::Sleep>, cx: &mut Context<'_>) -> Wait {
+	pub fn wait(&self, deadline: Option<Instant>, alarm: &mut Option<kio::clock::Sleep>, cx: &mut Context<'_>) -> Wait {
 		match self {
 			Self::Host(host) => {
 				let _ = (alarm, cx);
 				deadline.map_or(Wait::Forever, |at| Wait::Until(host.monotonic(at)))
 			}
-			#[cfg(feature = "manual")]
+			#[cfg(feature = "_manual")]
 			Self::Installed(clock, _) => {
 				use std::future::Future;
 
@@ -94,23 +96,23 @@ impl Clock {
 	}
 }
 
-/// `CLOCK_MONOTONIC`, mapped onto moq-clock's instants at one calibration point.
+/// `CLOCK_MONOTONIC`, mapped onto `kio::clock`'s instants at one calibration point.
 ///
-/// moq-clock's host clock reads the same monotonic clock from an origin it keeps
+/// `kio::clock`'s host clock reads the same monotonic clock from an origin it keeps
 /// to itself, so the two differ by a constant that one reading of each pins down
 /// to within the gap between them.
 #[derive(Clone, Copy)]
 pub(crate) struct Host {
 	/// A monotonic reading.
 	monotonic: Duration,
-	/// moq-clock's instant at that reading.
+	/// `kio::clock`'s instant at that reading.
 	instant: Instant,
 }
 
 impl Host {
 	fn calibrate() -> Self {
 		let before = monotonic();
-		let instant = moq_clock::now();
+		let instant = kio::clock::now();
 		let after = monotonic();
 		Self {
 			monotonic: before + (after - before) / 2,
@@ -119,7 +121,7 @@ impl Host {
 	}
 
 	fn now(&self) -> Instant {
-		self.instant + monotonic().saturating_sub(self.monotonic)
+		self.instant.saturating_add(monotonic().saturating_sub(self.monotonic))
 	}
 
 	/// The monotonic reading at `at`; one before calibration maps to calibration.
@@ -140,31 +142,31 @@ fn monotonic() -> Duration {
 mod tests {
 	use super::*;
 
-	/// The calibrated clock agrees with moq-clock's host clock, which reads the same
+	/// The calibrated clock agrees with `kio::clock`'s host clock, which reads the same
 	/// monotonic clock from another origin.
 	#[test]
-	fn host_tracks_moq_clock() {
+	fn host_tracks_kio_clock() {
 		// Off by at most the gap between the two calibration reads, which a
 		// preemption can stretch, so measure it rather than assume one.
 		let start = monotonic();
 		let host = Host::calibrate();
 		let slack = monotonic() - start;
-		let before = moq_clock::now();
+		let before = kio::clock::now();
 		let now = host.now();
-		let after = moq_clock::now();
+		let after = kio::clock::now();
 		assert!(
-			before <= now + slack && now <= after + slack,
+			before <= now.saturating_add(slack) && now <= after.saturating_add(slack),
 			"{before:?} <= {now:?} <= {after:?}"
 		);
 	}
 
 	/// The host's time keeps passing while a manual clock stands still, so the
 	/// teardown bound it measures expires.
-	#[cfg(feature = "manual")]
+	#[cfg(feature = "_manual")]
 	#[test]
 	fn host_time_passes_on_a_standing_manual_clock() {
 		let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
-		let manual = moq_clock::Manual::new().install(runtime.handle());
+		let manual = kio::clock::Manual::new().install(runtime.handle());
 		let _entered = runtime.enter();
 		let clock = Clock::new();
 		let start = clock.host_now();
@@ -179,10 +181,10 @@ mod tests {
 	fn deadlines_map_onto_the_monotonic_clock() {
 		let host = Host {
 			monotonic: Duration::from_secs(100),
-			instant: Instant::ZERO + Duration::from_secs(1 << 32),
+			instant: Instant::ZERO.saturating_add(Duration::from_secs(1 << 32)),
 		};
 		assert_eq!(
-			host.monotonic(host.instant + Duration::from_millis(1500)),
+			host.monotonic(host.instant.saturating_add(Duration::from_millis(1500))),
 			Duration::from_millis(101_500)
 		);
 		assert_eq!(

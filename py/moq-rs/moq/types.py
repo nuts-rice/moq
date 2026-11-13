@@ -1,11 +1,9 @@
 """Re-export moq-ffi record types without the Moq prefix.
 
-Records with duration fields are owned in `_records` instead, so they read as `timedelta`.
+Records the wrapper gives Python defaults or timestamp conversions, and handles that return a
+timestamp, are owned in `_records` instead.
 """
 
-from moq_ffi import (
-    MoqAnchor as Anchor,
-)
 from moq_ffi import (
     MoqAudioCodec as AudioCodec,
 )
@@ -13,14 +11,18 @@ from moq_ffi import (
     MoqAudioEncoderInput as AudioEncoderInput,
 )
 from moq_ffi import (
-    MoqAudioPreset as AudioPreset,
-)
-from moq_ffi import (
     MoqAudioSampleFormat as AudioSampleFormat,
 )
 from moq_ffi import (
-    MoqConnectionStatus as ConnectionStatus,
+    MoqCompression as Compression,
 )
+from moq_ffi import (
+    MoqConnectionPhase as ConnectionPhase,
+)
+from moq_ffi import (
+    MoqConnectionState as ConnectionState,
+)
+from moq_ffi import MoqDatagramInfo as DatagramInfo
 from moq_ffi import (
     MoqErrorScope as ErrorScope,
 )
@@ -28,7 +30,13 @@ from moq_ffi import (
     MoqFetchGroupOptions as FetchGroupOptions,
 )
 from moq_ffi import (
+    MoqInstance as Instance,
+)
+from moq_ffi import (
     MoqOrder as Order,
+)
+from moq_ffi import (
+    MoqPosition as Position,
 )
 from moq_ffi import (
     MoqProtocolError as ProtocolError,
@@ -37,16 +45,13 @@ from moq_ffi import (
     MoqProtocolKind as ProtocolKind,
 )
 from moq_ffi import (
-    MoqRange as Range,
+    MoqRateTarget as RateTarget,
 )
 from moq_ffi import (
-    MoqRoute as Route,
+    MoqRouteInfo as RouteInfo,
 )
 from moq_ffi import (
     MoqVideoCodec as VideoCodec,
-)
-from moq_ffi import (
-    MoqVideoDecodedFrame as VideoDecodedFrame,
 )
 from moq_ffi import (
     MoqVideoEncoderInput as VideoEncoderInput,
@@ -58,40 +63,68 @@ from moq_ffi import (
     MoqVideoEncoderOutput as VideoEncoderOutput,
 )
 from moq_ffi import (
-    MoqVideoGop as VideoGop,
-)
-from moq_ffi import (
     MoqVideoPixelFormat as VideoPixelFormat,
 )
 
-from ._records import Backoff, ConnectionStats, Datagram, Frame, Grant, Subscription, TrackInfo
+from ._records import (
+    Anchor,
+    Backoff,
+    ClientTls,
+    ConnectionStats,
+    Datagram,
+    Delay,
+    Frame,
+    Grant,
+    QuicConfig,
+    Range,
+    Subscription,
+    Timestamp,
+    TrackInfo,
+    VideoDecodedFrame,
+    VideoSurface,
+    VideoSurfacePixelBuffer,
+    VideoSurfaceUnknown,
+    WebSocketConfig,
+)
 
 __all__ = [
     "Anchor",
     "AudioCodec",
     "AudioEncoderInput",
-    "AudioPreset",
     "AudioSampleFormat",
     "Backoff",
+    "ClientTls",
+    "Compression",
     "ConnectionStats",
-    "ConnectionStatus",
+    "ConnectionPhase",
+    "ConnectionState",
     "Datagram",
+    "DatagramInfo",
+    "Delay",
     "ErrorScope",
     "Frame",
     "FetchGroupOptions",
     "Grant",
+    "Instance",
     "Order",
+    "Position",
     "ProtocolError",
     "ProtocolKind",
+    "QuicConfig",
     "Range",
-    "Route",
+    "RateTarget",
+    "RouteInfo",
     "Subscription",
+    "Timestamp",
     "TrackInfo",
     "VideoCodec",
     "VideoEncoderInput",
     "VideoEncoderKind",
-    "VideoGop",
     "VideoEncoderOutput",
     "VideoDecodedFrame",
+    "VideoSurface",
+    "VideoSurfacePixelBuffer",
+    "VideoSurfaceUnknown",
     "VideoPixelFormat",
+    "WebSocketConfig",
 ]

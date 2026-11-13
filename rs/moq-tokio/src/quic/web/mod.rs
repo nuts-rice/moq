@@ -27,17 +27,13 @@
 //! connection instead.
 
 // External
-mod client;
 mod error;
-mod recv;
-mod send;
+pub mod recv;
+pub mod send;
 mod server;
 mod session;
 
-pub use client::*;
 pub use error::*;
-pub use recv::*;
-pub use send::*;
 pub use server::*;
 pub use session::*;
 
@@ -49,17 +45,5 @@ mod settings;
 use connect::*;
 use settings::*;
 
-// Required to access proto::ConnectError wrapped in ClientError
-pub use connect::ConnectError;
-
 /// The HTTP/3 ALPN is required when negotiating a QUIC connection.
 pub const ALPN: &str = "h3";
-
-/// Export our simple crypto provider.
-pub mod crypto;
-
-/// Re-export the http crate because it's in the public API.
-pub use http;
-
-/// Re-export the WebTransport protocol implementation.
-pub use web_transport_proto as proto;

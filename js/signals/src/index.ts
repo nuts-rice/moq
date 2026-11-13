@@ -4,18 +4,20 @@
  *
  * @module
  */
-import { Instant, Nano, now, Second, sleep, sleepUntil } from "@moq/clock";
+import { Duration, Instant, now, sleep, sleepUntil, Wall } from "@moq/clock";
 
 /** Cancels a subscription, effect, or other registration when called. */
 export type Dispose = () => void;
 
 const noop: Dispose = () => {};
 
-type Subscriber<T> = (value: T) => void;
+/** Receives a value each time it changes. */
+export type Subscriber<T> = (value: T) => void;
 
 // Symbols to identify our instances across different package versions.
-// SIGNAL_BRAND is Signal only (it implies a write side); GETTER_BRAND is every readable we ship.
+/** Marks a {@link Signal}, even one from another copy of this package; it implies a write side. */
 const SIGNAL_BRAND = Symbol.for("@moq/signals");
+/** Marks every readable this package ships, even one from another copy of it. */
 const GETTER_BRAND = Symbol.for("@moq/signals.getter");
 const CHANGE_LISTEN = Symbol.for("@moq/signals.change.listen");
 
@@ -47,7 +49,7 @@ export interface Setter<T> {
 
 /**
  * The read side of a {@link Once}: observe it reactively ({@link Getter}, `undefined` while
- * pending) or await it ({@link PromiseLike}, resolves with the settled value, immediately if it
+ * pending) or await it (a `PromiseLike` that resolves with the settled value, immediately if it
  * already settled). Expose this to callers so they can peek/observe/await but not settle it.
  */
 export interface GetPromise<T> extends Getter<T | undefined>, PromiseLike<T> {}
@@ -61,12 +63,15 @@ export class Signal<T> implements Getter<T>, Setter<T> {
 
 	// Microtask coalescing state
 	#pending = false;
+	// Watchers owed their first value at the next flush, unless it delivers a change anyway.
+	#initial: Set<Subscriber<T>> = new Set();
 	#oldValue: T | undefined;
 	#hasCapturedOldValue = false;
 	#forceNotify = false;
 
-	// Brands to identify this as a Signal (and a readable) across package instances.
+	/** Marks this as a Signal across package instances. */
 	readonly [SIGNAL_BRAND] = true;
+	/** Marks this as a readable across package instances. */
 	readonly [GETTER_BRAND] = true;
 
 	constructor(value: T) {
@@ -93,6 +98,13 @@ export class Signal<T> implements Getter<T>, Setter<T> {
 	 * A function is stored as the value; use {@link update} to transform instead.
 	 */
 	set(value: T, notify?: boolean): void {
+		// A silent write captures nothing: a listener that subscribes after it starts from the new
+		// value, so comparing a later write against the value it replaced would hide a change.
+		if (notify === false) {
+			this.#value = value;
+			return;
+		}
+
 		// Capture old value before the first set in this microtask.
 		if (!this.#hasCapturedOldValue) {
 			this.#oldValue = this.#value;
@@ -101,13 +113,11 @@ export class Signal<T> implements Getter<T>, Setter<T> {
 
 		this.#value = value;
 
-		// If notify is false, don't notify.
-		if (notify === false) return;
-
 		if (notify === true) this.#forceNotify = true;
 
 		// If there are no subscribers, don't queue a microtask.
-		// Reset all pending state since no flush will occur to clear it.
+		// Drop the capture since no listener saw the old value; a flush already queued finds
+		// nothing to deliver.
 		if (this.#subscribers.size === 0 && this.#changed.size === 0) {
 			this.#hasCapturedOldValue = false;
 			this.#oldValue = undefined;
@@ -124,34 +134,60 @@ export class Signal<T> implements Getter<T>, Setter<T> {
 
 	#flush(): void {
 		this.#pending = false;
-		this.#hasCapturedOldValue = false;
-		const old = this.#oldValue;
-		this.#oldValue = undefined;
-
-		const force = this.#forceNotify;
-		this.#forceNotify = false;
-
-		// Check if the net change is zero (value returned to what it was before).
-		// Use === for class instances, dequal for plain objects/primitives.
-		if (!force && isEqual(old as T, this.#value)) return;
-
 		const value = this.#value;
-		const changed = this.#changed;
-		this.#changed = new Set();
 
-		for (const fn of this.#subscribers) {
-			try {
-				fn(value);
-			} catch (error) {
-				console.error("signal subscriber error", error);
+		// Watchers added during this flush wait for the flush their watch() queued.
+		let initial: Set<Subscriber<T>> | undefined;
+		if (this.#initial.size > 0) {
+			initial = this.#initial;
+			this.#initial = new Set();
+		}
+
+		// A write while nobody listened dropped the capture, so any listener since then saw the
+		// current value when it subscribed and there is no change to deliver.
+		if (this.#hasCapturedOldValue) {
+			this.#hasCapturedOldValue = false;
+			const old = this.#oldValue;
+			this.#oldValue = undefined;
+
+			const force = this.#forceNotify;
+			this.#forceNotify = false;
+
+			// Deliver unless the net change is zero (value returned to what it was before).
+			if (force || !isEqual(old as T, value)) {
+				const changed = this.#changed;
+				this.#changed = new Set();
+
+				for (const fn of this.#subscribers) {
+					if (this.#initial.size > 0 && this.#initial.has(fn)) continue;
+					try {
+						fn(value);
+					} catch (error) {
+						console.error("signal subscriber error", error);
+					}
+				}
+
+				for (const fn of changed) {
+					try {
+						fn(value);
+					} catch (error) {
+						console.error("signal changed error", error);
+					}
+				}
+
+				// Pending watchers are subscribers, so the loop above was their first value.
+				return;
 			}
 		}
 
-		for (const fn of changed) {
+		if (!initial) return;
+		for (const fn of initial) {
+			// Disposed during this flush.
+			if (!this.#subscribers.has(fn)) continue;
 			try {
 				fn(value);
 			} catch (error) {
-				console.error("signal changed error", error);
+				console.error("signal watch error", error);
 			}
 		}
 	}
@@ -178,8 +214,9 @@ export class Signal<T> implements Getter<T>, Setter<T> {
 		return () => this.#subscribers.delete(fn);
 	}
 
-	/** Resolves with the value the next time it changes, or calls `fn` once on the next change. */
+	/** Resolves with the value the next time it changes. */
 	changed(): Promise<T>;
+	/** Calls `fn` once the next time the value changes. Returns a function to cancel. */
 	changed(fn: Subscriber<T>): Dispose;
 	changed(fn?: Subscriber<T>): Promise<T> | Dispose {
 		if (fn) {
@@ -191,11 +228,23 @@ export class Signal<T> implements Getter<T>, Setter<T> {
 		});
 	}
 
-	/** Calls `fn` with the current value now, and again every time it changes. */
+	/**
+	 * Calls `fn` with the current value on a microtask, and again every time it changes.
+	 * A change before that first call is delivered once, as the first call.
+	 */
 	watch(fn: Subscriber<T>): Dispose {
-		const dispose = this.subscribe(fn);
-		queueMicrotask(() => fn(this.#value));
-		return dispose;
+		// A wrapper per call, so watching with the same `fn` twice stays two watchers.
+		const watcher: Subscriber<T> = (value) => fn(value);
+		const dispose = this.subscribe(watcher);
+		this.#initial.add(watcher);
+		if (!this.#pending) {
+			this.#pending = true;
+			queueMicrotask(() => this.#flush());
+		}
+		return () => {
+			this.#initial.delete(watcher);
+			dispose();
+		};
 	}
 
 	/**
@@ -325,7 +374,7 @@ class Changed<T> implements GetPromise<Awaited<T>> {
 export class Once<T> implements GetPromise<T> {
 	#signal = new Signal<T | undefined>(undefined);
 
-	// Brand to identify this as a readable across package instances.
+	/** Marks this as a readable across package instances. */
 	readonly [GETTER_BRAND] = true;
 
 	/** Settle the value. Throws if it has already settled. */
@@ -341,8 +390,9 @@ export class Once<T> implements GetPromise<T> {
 		return this.#signal.peek();
 	}
 
-	/** Resolves when it settles, or calls `fn` once when it settles. */
+	/** Resolves when it settles. */
 	changed(): Promise<T | undefined>;
+	/** Calls `fn` once when it settles. Returns a function to cancel. */
 	changed(fn: (value: T | undefined) => void): Dispose;
 	changed(fn?: (value: T | undefined) => void): Promise<T | undefined> | Dispose {
 		return fn ? this.#signal.changed(fn) : this.#signal.changed();
@@ -486,7 +536,8 @@ export function race<const T extends readonly unknown[]>(values: T): Promise<Awa
 	return raceUntil(values);
 }
 
-type SetterType<S> = S extends Setter<infer T> ? T : never;
+/** The value type a {@link Setter} accepts, e.g. `number` for `Signal<number>`. */
+export type SetterType<S> = S extends Setter<infer T> ? T : never;
 
 /** The value type a {@link Getter} yields, e.g. `number` for `Getter<number>`. */
 export type GetterType<G> = G extends Getter<infer T> ? T : never;
@@ -589,10 +640,6 @@ function getterShaped(value: unknown): boolean {
  */
 export type Inputs<I extends SignalMap> = { [K in keyof I]?: GetterInit<GetterType<I[K]>> };
 
-// Excludes common falsy values from a type
-type Falsy = false | 0 | "" | null | undefined;
-type Truthy<T> = Exclude<T, Falsy>;
-
 /**
  * Runs a function that reads signals via `effect.get(...)` and reruns whenever
  * any of them change. Registers cleanup, timers, and event listeners that are
@@ -683,7 +730,7 @@ export class Effect {
 		if (this.#async.size > 0) {
 			// Diagnostic only: a task that ignores cancellation stalls the rerun, so name it.
 			const warn = new AbortController();
-			sleep(Nano.fromSecond(Second(5)), { signal: warn.signal, ref: false }).then(() => {
+			sleep(Duration.secs(5), { signal: warn.signal, ref: false }).then(() => {
 				// A close() racing the timer disarms it, but the wakeup can already be
 				// queued by then. There is nothing to warn about once the effect is gone.
 				if (this.#dispose === undefined) return;
@@ -737,12 +784,16 @@ export class Effect {
 		}
 	}
 
-	/** Reads a signal and tracks it, rerunning the effect whenever it changes. */
+	/**
+	 * Reads a signal and tracks it, rerunning the effect whenever it changes. A {@link spawn} task
+	 * that outlived its run only reads: the next run tracks what it reads itself.
+	 */
 	get<T>(signal: Getter<T>): T {
 		if (this.#dispose === undefined) {
 			console.warn("Effect.get called when closed, returning current value");
 			return signal.peek();
 		}
+		if (this.#stale) return signal.peek();
 
 		const value = signal.peek();
 
@@ -802,7 +853,7 @@ export class Effect {
 	}
 
 	/** Runs `fn` after `duration` on the installed clock, unless the effect reruns or closes first. */
-	timer(fn: () => void, duration: Nano) {
+	timer(fn: () => void, duration: Duration) {
 		if (this.#dispose === undefined) {
 			console.warn("Effect.timer called when closed, ignoring");
 			return;
@@ -822,7 +873,7 @@ export class Effect {
 	 * Shares {@link run}'s handling of a task that outlived its run: the child is closed at the
 	 * next teardown, not immediately.
 	 */
-	timeout(fn: (effect: Effect) => void, duration: Nano) {
+	timeout(fn: (effect: Effect) => void, duration: Duration) {
 		if (this.#dispose === undefined) {
 			console.warn("Effect.timeout called when closed, ignoring");
 			return;
@@ -858,16 +909,15 @@ export class Effect {
 	 * Runs `fn` every positive period until cleanup, arming the first deadline before returning.
 	 * Each period uses the clock installed then; a late callback delays the next by a full period.
 	 */
-	interval(fn: () => void, period: Nano) {
+	interval(fn: () => void, period: Duration) {
 		if (this.#dispose === undefined) {
 			console.warn("Effect.interval called when closed, ignoring");
 			return;
 		}
 
-		Instant.add(Instant.zero, period);
-		if (period === 0) throw new RangeError("interval period must be positive");
+		if (period.isZero()) throw new RangeError("interval period must be positive");
 		const abort = new AbortController();
-		let next = Instant.add(now(), period);
+		let next = now().saturatingAdd(period);
 		void (async () => {
 			for (;;) {
 				await sleepUntil(next, { signal: abort.signal });
@@ -879,7 +929,7 @@ export class Effect {
 				}
 				// A callback may install a clock with a different origin. A full Delay period
 				// starts from that clock's now, never from the previous clock's deadline.
-				next = Instant.add(now(), period);
+				next = now().saturatingAdd(period);
 			}
 		})().catch(noop);
 		this.cleanup(() => abort.abort());
@@ -927,14 +977,14 @@ export class Effect {
 	/** Reads and tracks several signals, returning their values or `undefined` if any is falsy. */
 	getAll<S extends readonly Getter<unknown>[]>(
 		signals: [...S],
-	): { [K in keyof S]: Truthy<GetterType<S[K]>> } | undefined {
+	): { [K in keyof S]: Exclude<GetterType<S[K]>, false | 0 | "" | null | undefined> } | undefined {
 		const values: unknown[] = [];
 		for (const signal of signals) {
 			const value = this.get(signal);
 			if (!value) return undefined;
 			values.push(value);
 		}
-		return values as { [K in keyof S]: Truthy<GetterType<S[K]>> };
+		return values as { [K in keyof S]: Exclude<GetterType<S[K]>, false | 0 | "" | null | undefined> };
 	}
 
 	/** Runs `fn` with the signal's value now and again whenever it changes, scoped to this effect. */
@@ -951,61 +1001,70 @@ export class Effect {
 		});
 	}
 
-	/** Adds an event listener that is removed automatically when the effect reruns or closes. */
+	/** Adds an {@link HTMLElement} listener, removed automatically when the effect reruns or closes. */
 	event<K extends keyof HTMLElementEventMap>(
 		target: HTMLElement,
 		type: K,
 		listener: (this: HTMLElement, ev: HTMLElementEventMap[K]) => void,
 		options?: boolean | AddEventListenerOptions,
 	): void;
+	/** Adds a typed SVGElement listener, removed when the effect reruns or closes. */
 	event<K extends keyof SVGElementEventMap>(
 		target: SVGElement,
 		type: K,
 		listener: (this: SVGElement, ev: SVGElementEventMap[K]) => void,
 		options?: boolean | AddEventListenerOptions,
 	): void;
+	/** Adds a typed Document listener, removed when the effect reruns or closes. */
 	event<K extends keyof DocumentEventMap>(
 		target: Document,
 		type: K,
 		listener: (this: Document, ev: DocumentEventMap[K]) => void,
 		options?: boolean | AddEventListenerOptions,
 	): void;
+	/** Adds a typed Window listener, removed when the effect reruns or closes. */
 	event<K extends keyof WindowEventMap>(
 		target: Window,
 		type: K,
 		listener: (this: Window, ev: WindowEventMap[K]) => void,
 		options?: boolean | AddEventListenerOptions,
 	): void;
+	/** Adds a typed WebSocket listener, removed when the effect reruns or closes. */
 	event<K extends keyof WebSocketEventMap>(
 		target: WebSocket,
 		type: K,
 		listener: (this: WebSocket, ev: WebSocketEventMap[K]) => void,
 		options?: boolean | AddEventListenerOptions,
 	): void;
+	/** Adds a typed XMLHttpRequest listener, removed when the effect reruns or closes. */
 	event<K extends keyof XMLHttpRequestEventMap>(
 		target: XMLHttpRequest,
 		type: K,
 		listener: (this: XMLHttpRequest, ev: XMLHttpRequestEventMap[K]) => void,
 		options?: boolean | AddEventListenerOptions,
 	): void;
+	/** Adds a typed MediaQueryList listener, removed when the effect reruns or closes. */
 	event<K extends keyof MediaQueryListEventMap>(
 		target: MediaQueryList,
 		type: K,
 		listener: (this: MediaQueryList, ev: MediaQueryListEventMap[K]) => void,
 		options?: boolean | AddEventListenerOptions,
 	): void;
+	/** Adds a typed Animation listener, removed when the effect reruns or closes. */
 	event<K extends keyof AnimationEventMap>(
 		target: Animation,
 		type: K,
 		listener: (this: Animation, ev: AnimationEventMap[K]) => void,
 		options?: boolean | AddEventListenerOptions,
 	): void;
+	/** Adds a typed EventSource listener, removed when the effect reruns or closes. */
 	event<K extends keyof EventSourceEventMap>(
 		target: EventSource,
 		type: K,
 		listener: (this: EventSource, ev: EventSourceEventMap[K]) => void,
 		options?: boolean | AddEventListenerOptions,
 	): void;
+	/** Adds a listener for any event on any target, removed when the effect reruns or closes. */
 	event(
 		target: EventTarget,
 		type: string,
@@ -1155,7 +1214,7 @@ export class Computed<T> implements Getter<T | undefined> {
 	#signal = new Signal<T | undefined>(undefined);
 	#effect: Effect;
 
-	// Brand to identify this as a readable across package instances.
+	/** Marks this as a readable across package instances. */
 	readonly [GETTER_BRAND] = true;
 
 	/** Creates a computed that derives its value from `fn`, rerunning when dependencies change. */
@@ -1170,8 +1229,9 @@ export class Computed<T> implements Getter<T | undefined> {
 		return this.#signal.peek();
 	}
 
-	/** Resolves the next time the derived value changes, or calls `fn` once on the next change. */
+	/** Resolves the next time the derived value changes. */
 	changed(): Promise<T | undefined>;
+	/** Calls `fn` once the next time the derived value changes. Returns a function to cancel. */
 	changed(fn: Subscriber<T | undefined>): Dispose;
 	changed(fn?: Subscriber<T | undefined>): Promise<T | undefined> | Dispose {
 		return fn ? this.#signal.changed(fn) : this.#signal.changed();
@@ -1188,6 +1248,7 @@ export class Computed<T> implements Getter<T | undefined> {
 	 */
 	close(): void {
 		this.#effect.close();
+		this.#signal.set(undefined);
 	}
 }
 
@@ -1221,7 +1282,7 @@ export class Derived<const S extends readonly Getter<unknown>[], T> implements G
 	#sources: S;
 	#fn: (...values: GetterValues<S>) => T;
 
-	// Brand to identify this as a readable across package instances.
+	/** Marks this as a readable across package instances. */
 	readonly [GETTER_BRAND] = true;
 
 	/** Creates a view deriving its value from `sources` via `fn`, recomputed on every read. */
@@ -1240,8 +1301,9 @@ export class Derived<const S extends readonly Getter<unknown>[], T> implements G
 		return this.#watch(fn);
 	}
 
-	/** Resolves the next time the derived value changes, or calls `fn` once on the next change. */
+	/** Resolves the next time the derived value changes. */
 	changed(): Promise<T>;
+	/** Calls `fn` once the next time the derived value changes. Returns a function to cancel. */
 	changed(fn: Subscriber<T>): Dispose;
 	changed(fn?: Subscriber<T>): Promise<T> | Dispose {
 		if (fn) return this.#once(fn);
@@ -1253,11 +1315,23 @@ export class Derived<const S extends readonly Getter<unknown>[], T> implements G
 
 	// Calls `fn` with the derived value the first time it changes, then unsubscribes.
 	#once(fn: Subscriber<T>): Dispose {
+		let active = true;
 		const dispose = this.subscribe((value) => {
-			dispose();
-			fn(value);
+			if (!active) return;
+			active = false;
+			// Call `fn` before letting go of the sources: a reactive reader schedules its next
+			// run there, so its replacement subscription coalesces away the gap a source that
+			// counts its listeners (such as demand for an estimate) would otherwise see.
+			try {
+				fn(value);
+			} finally {
+				dispose();
+			}
 		});
-		return dispose;
+		return () => {
+			active = false;
+			dispose();
+		};
 	}
 
 	// Subscribes to every source, recomputing on any notification.
@@ -1269,25 +1343,36 @@ export class Derived<const S extends readonly Getter<unknown>[], T> implements G
 	}
 }
 
-// Deep equality for plain objects/arrays, === for class instances and primitives.
-// Class instances have identity semantics (e.g. two different Broadcast instances are never equal).
-function isEqual(a: unknown, b: unknown): boolean {
-	if (a === b) return true;
+// Nesting past this compares unequal, bounding the work and stack for cyclic or very deep
+// values. A false "changed" only costs an extra notification.
+const EQUAL_DEPTH = 64;
+
+// Deep equality for plain objects/arrays, SameValueZero for everything else.
+// Class instances have identity semantics (e.g. two different Broadcast instances are never equal),
+// except the clock's immutable values, which compare by value like the numbers they replace.
+function isEqual(a: unknown, b: unknown, depth = 0): boolean {
+	if (a === b || (Number.isNaN(a) && Number.isNaN(b))) return true;
 	if (a === null || b === null || typeof a !== "object" || typeof b !== "object") return false;
+	if (depth >= EQUAL_DEPTH) return false;
 
 	const protoA = Object.getPrototypeOf(a);
 	const protoB = Object.getPrototypeOf(b);
 
 	// Both must be plain objects or both arrays to deep-compare.
 	if (protoA !== protoB) return false;
+	if (a instanceof Duration || a instanceof Instant || a instanceof Wall) return a.eq(b as never);
 	if (protoA !== Object.prototype && protoA !== Array.prototype) return false;
 
-	const keysA = Object.keys(a as Record<string, unknown>);
-	const keysB = Object.keys(b as Record<string, unknown>);
-	if (keysA.length !== keysB.length) return false;
+	// Holes are not keys, so a sparse array's length is only visible here.
+	if (protoA === Array.prototype && (a as unknown[]).length !== (b as unknown[]).length) return false;
+
+	const keysA = Object.keys(a);
+	if (keysA.length !== Object.keys(b).length) return false;
 
 	for (const key of keysA) {
-		if (!isEqual((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key])) return false;
+		// Membership matters on its own: `{ a: undefined }` is not `{ b: undefined }`.
+		if (!Object.hasOwn(b, key)) return false;
+		if (!isEqual((a as Record<string, unknown>)[key], (b as Record<string, unknown>)[key], depth + 1)) return false;
 	}
 
 	return true;

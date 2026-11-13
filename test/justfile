@@ -16,6 +16,27 @@ set working-directory := '.'
 # Where cargo puts the in-tree qmux interop examples `just test qmux` runs.
 qmux_examples := absolute_path(env("CARGO_TARGET_DIR", source_directory() / ".." / "target")) / "debug" / "examples"
 
+harness_browser_tests := '''
+    ./capture-idle.browser.ts
+    ./capture-channel-count.browser.ts
+    ./encoded-preview.browser.ts
+    ./harness.browser.ts
+    ./net-cleanups.browser.ts
+    ./open-gop.browser.ts
+    ./publish-ui.browser.ts
+    ./qmux-datagrams.browser.ts
+    ./signals-dom.browser.ts
+    ./source-selection.browser.ts
+    ./tone.test.ts
+    ./src/contract.test.ts
+    ./src/resume.test.ts
+'''
+
+harness_compat_tests := '''
+    ./test/interop/compat/claims.test.ts
+    ./test/interop/compat/resolve.test.ts
+'''
+
 # List the cross-language suites.
 default:
     @just --justfile {{ quote(justfile()) }} --list test
@@ -25,11 +46,15 @@ default:
 # from plain `bun test` so unit tests do not launch a browser.
 harness:
     ./lib/harness.test.sh
+    python3 lib/pulse.test.py
     ./interop/relay-log.test.sh
+    python3 interop/staging.test.py
+    python3 ../rs/moq-gst/smoke.test.py
     python3 interop/report.test.py
-    cd .. && bun test test/interop/compat/resolve.test.ts test/interop/compat/claims.test.ts
-    cd .. && bun install --frozen-lockfile
-    cd interop/clients/js && bun test ./harness.browser.ts ./signals-dom.browser.ts ./publish-ui.browser.ts ./capture-channel-count.browser.ts ./open-gop.browser.ts ./src/contract.test.ts ./src/resume.test.ts
+    python3 interop/tone.test.py
+    cd .. && bun test {{ replace(harness_compat_tests, "\n", " ") }}
+    uv run --no-project python ../sh/js/install.py frozen
+    cd interop/clients/js && bash ../../../../sh/local.sh bun test {{ replace(harness_browser_tests, "\n", " ") }}
 
 # Cross-language media interop test, built from this checkout. Stands up a
 # relay and runs the publisher x subscriber matrix. Default: rust only (fast
@@ -39,18 +64,24 @@ harness:
 # `just test interop --publishers rust,python --subscribers rust,c`.
 # Finite track tails run too; `--tail` selects just the CLI FETCH close and Rust/Node/Bun tail checks.
 # `--versions ietf` reruns them with every client pinned to each even moq-transport draft.
-# Both runs first check js/net's varints against moq-net's encoder at every size boundary,
-# and on lite-06/07 messages (the filter also matches `lite_varint_interop`), then
-# moq-transport OBJECT_DATAGRAMs both ways and the JS answer to TRACK_STATUS on every
-# draft, Lite AUTH_ERROR NOT_SUPPORTED after a grant, Lite padding, and lite-07 TRACKS
-# listings, each in both directions.
+# Both runs first check the Rust/JS wire and session interop suites, in both directions.
 [positional-arguments]
 interop *args:
-    cd .. && bun install --frozen-lockfile
-    just rs test -p moq-net --lib varint_interop ietf_datagram_interop ietf_track_status_interop ietf_compression_fallback_interop auth_unsupported_interop padding_interop tracks_interop --run-ignored all
+    uv run --no-project python ../sh/js/install.py frozen
+    just rs test -p moq-net -p moq-crypto --lib \
+        auth_unsupported_interop \
+        ietf_compression_fallback_interop \
+        ietf_datagram_interop \
+        ietf_track_status_interop \
+        ietf_range_updates_interop \
+        padding_interop \
+        sign_interop \
+        tracks_interop \
+        varint_interop \
+        --run-ignored all
     ./interop/interop.sh "$@"
 
-# The harnesses append one record per case to MOQ_TEST_RESULTS; flags link the page to its
+# The harnesses append one record per case to HARNESS_RESULTS; flags link the page to its
 # workflow run. See interop/report.py.
 
 # Render interop case records as a static HTML report.
@@ -64,6 +95,11 @@ interop-report results out *args:
 [positional-arguments]
 wire-compat *args:
     ./interop/compat.sh "$@"
+
+# Pinned Moxygen sections 1-7, subgroup zero, through one relay under the conformance profile.
+[positional-arguments]
+ietf-conformance *args:
+    ./ietf-conformance/run.sh "$@"
 
 # Installs each client from its public registry, inside test/smoke's own Nix
 # shell rather than this repo's toolchain. The first argument picks a smoke
@@ -92,10 +128,13 @@ interop-negative *args:
 
 # Browser-to-browser media QA against a deterministic fixture: presented frame progress, audible
 # tone, audio/video skew, and the publication lifecycle (cold start, pause, rejoin, detach,
-# republish, late join). Ends with negative controls that inject a frozen picture, silence, a
-# shifted tone, and a leaked session; each must fail the assertion it names. --timeout 30 gives
+# republish, late join), audio format changes, rendition switches, mute and volume at the
+# speakers, AAC, and the same pattern from a native (ffmpeg + Rust CLI) publisher. Ends with
+# negative controls that inject a frozen picture, silence, a shifted tone, a leaked session, and
+# delayed native audio; each must fail the assertion it names. --timeout 30 gives
 
-# headless Chromium cold-start headroom. --media-engines selects player engines; the fixture stays Chromium.
+# headless Chromium cold-start headroom. --media-engines selects player engines, --media-publisher the
+# fixture's (chromium or firefox).
 [positional-arguments]
 media *args:
     ./interop/interop.sh --media --timeout 30 "$@"
@@ -118,11 +157,11 @@ native-play:
     ./native-play/run.sh
 
 # Plays a tone in headless Chromium and the native `moq play` through moq-shaper and grades
-# what the listener heard (underruns, skip-aheads, silence, the resolved delay) against
-# audio-quality/budgets.json. The full matrix is 36 rows at 60 s; nightly runs it with
-# --enforce. Narrow it with `--profiles mild --codecs opus --rings plain --duration 20`;
-# `--rings pulse` is the native player alone.
-# `--replays` grades only the recorded traces, in seconds, as nightly and release PRs touching the player do.
+# what the listener heard (underruns, trimmed audio, silence, A/V lag, the resolved delay) against
+# audio-quality/budgets.json. The full matrix is 28 rows at 60 s; nightly runs it with
+# --enforce. Narrow it with `--profiles mild --codecs opus --runtimes chromium --duration 20`;
+# `--runtimes native` is the native player alone.
+# `--replays` grades only the recorded traces, in seconds, as `just ci` does on a diff touching the player.
 # See audio-quality/README.md.
 
 # Grade browser and native audio playout over an impaired path.
@@ -130,9 +169,15 @@ native-play:
 audio-quality *args:
     ./audio-quality/run.sh "$@"
 
+# Measure 22 push-to-talk presses on the browser defaults over an ideal local path.
+push-to-talk:
+    ./audio-quality/ptt.sh
+
 # Records the arrival traces under audio-quality/traces/ that the replay rows grade: the
 # public relay's bbb.hang, a local relay's AAC tone, and a browser microphone through the
-# public relay. Needs the network. Narrow it with `--lanes relay-bbb --duration 35`.
+# public relay. Needs the network. Narrow it with `--lanes relay-bbb --duration 35`; record a
+# real microphone with `--lanes relay-mic --mic-broadcast <name>`, published by hand to the
+# public relay's anon path.
 
 # Re-record the audio quality arrival traces.
 [positional-arguments]
@@ -155,7 +200,8 @@ drill-sensitivity *args:
 # (use a real capture), `--live` (grade PCR release timing and byte position off
 # the pipe instead, which a capture cannot carry; nightly runs this arm),
 # `--open-gop` (an open-GOP clip whose orphan leading pictures are trimmed), `--hrd`
-# (1080p video filling a broadcast-sized CPB), `--delay 2s` (the exporter's). See
+# (1080p video filling a broadcast-sized CPB), `--mpeg2` (MPEG-2 video carried whole,
+# decoded from the capture), `--delay 2s` (the exporter's). See
 # ts/README.md.
 
 # Check the subscriber's MPEG-TS output for IRD compliance.
@@ -169,6 +215,7 @@ ts *args:
     python3 ./ts/holes.test.py
     python3 ./ts/passthrough.test.py
     python3 ./ts/klv.test.py
+    python3 ./ts/revision.test.py
     python3 ./ts/clockless.test.py
     ./ts/run.sh "$@"
 
@@ -206,32 +253,62 @@ ts-controls:
 drain *args:
     ./drain/run.sh {{ args }}
 
-# Runs the @moq/wasm bindings in headless Chromium against a real relay, one per
-# protocol flavour. The crate is `#![cfg(target_arch = "wasm32")]`, so nothing in
-# `just check` or `just rs wasm` gets past compiling it. See wasm/README.md.
-
-# Browser coverage for the @moq/wasm bindings.
-[positional-arguments]
-wasm *args:
-    ./wasm/run.sh "$@"
-
 # The @moq/video renderer in headless Chromium: WebGPU, a lost device, and the Canvas2D fallback.
 video:
-    cd .. && bun install --frozen-lockfile
+    uv run --no-project python ../sh/js/install.py frozen
     # A desktop display makes software Vulkan request unsupported window surfaces.
-    cd video && env -u DISPLAY -u WAYLAND_DISPLAY bun test ./renderer.browser.ts
+    cd video && bash ../../sh/local.sh env -u DISPLAY -u WAYLAND_DISPLAY bun test ./renderer.browser.ts
 
-# Optional publisher retention across Rust/JS sessions through a Rust relay.
+# Optional publisher max age across Rust/JS sessions through a Rust relay.
 max-age:
-    cargo nextest run --locked -p moq-tokio --test integration -E 'test(/^max_age::/)' --run-ignored all
+    uv run --no-project python ../sh/js/install.py frozen
+    bash ../sh/local.sh cargo nextest run --locked -p moq-tokio --test integration -E 'test(/^max_age::/)' --run-ignored all
+
+# Datagram tracks between Rust and JavaScript on lite-07, direct and through a Rust relay.
+datagram-tracks:
+    uv run --no-project python ../sh/js/install.py frozen
+    bash ../sh/local.sh cargo nextest run --locked -p moq-tokio --test integration -E 'test(/^datagram_tracks::/)' --run-ignored only
+
+# JavaScript publisher and reader over WebSocket, through a Rust relay, past qmux's default stream limit.
+stream-limits:
+    uv run --no-project python ../sh/js/install.py frozen
+    bash ../sh/local.sh cargo nextest run --locked -p moq-tokio --test integration -E 'test(/^stream_limits::/)' --run-ignored only
+
+# A JavaScript relay between Rust peers FETCHes upstream what its copy misses, below its start and once evicted.
+relay-fill:
+    uv run --no-project python ../sh/js/install.py frozen
+    bash ../sh/local.sh cargo nextest run --locked -p moq-tokio --test integration -E 'test(/^relay_fill::/)' --run-ignored all
+
+# A JavaScript sender exhausts each native receiver's connection credit, which recovers.
+receive-credit:
+    uv run --no-project python ../sh/js/install.py frozen
+    bash ../sh/local.sh cargo nextest run --locked -p moq-tokio --test integration -E 'test(/^receive_credit::javascript_/)' --run-ignored only
+    bash ../sh/local.sh cargo nextest run --locked -p moq-uring --test integration -E 'test(/^receive_credit::javascript_/)' --run-ignored only
 
 # Cross-language subscription termination over in-memory transports.
 bare-fin:
-    just rs test -p moq-net --lib bare_fin_interop --run-ignored all
+    uv run --no-project python ../sh/js/install.py frozen
+    just rs test -p moq-net --features async --lib bare_fin_interop owed_tail_death_interop --run-ignored all
 
 # Explore JSON snapshot codec sequences with a fresh replayable seed.
 json-properties:
-    bash json-properties.sh
+    bash ../sh/local.sh bash json-properties.sh
+
+# Check resume against its model of one logical track from a fresh replayable seed.
+resume-model:
+    bash ../sh/local.sh bash resume-model.sh
+
+# Model-check every TLA+ config under the given paths (default: all): open findings must still break.
+tla *paths:
+    bash ../sh/tla.sh {{ paths }}
+
+# Prove the route key model, and that each variant breaks the lemmas it names.
+route-key-model:
+    bash route-key-model.sh
+
+# Check random lite-07 meshes against the route rules from a fresh replayable seed.
+route-sweep:
+    bash ../sh/local.sh bash route-sweep.sh
 
 # The TypeScript qmux peer as client and server against the in-tree Rust qmux
 # interop examples, per draft. The manifest path names the in-tree crate, which
@@ -240,16 +317,10 @@ json-properties:
 # TypeScript-to-Rust qmux interop.
 qmux:
     cargo build --locked --quiet --manifest-path ../rs/qmux/Cargo.toml --example interop-server --example interop-client
-    cd .. && bun install --frozen-lockfile
-    cd .. && QMUX_INTEROP_BIN={{ quote(qmux_examples) }} bun test test/qmux/interop.test.ts
+    uv run --no-project python ../sh/js/install.py frozen
+    cd .. && QMUX_INTEROP_BIN={{ quote(qmux_examples) }} bun test ./test/qmux/interop.test.ts
 
 # Complete MoQ SETUP and transfer a frame over a real browser data-channel pair.
 p2p:
-    cd .. && bun install --frozen-lockfile
-    cd p2p && bun test ./transport.browser.ts
-
-# Retain complete backend assets, parity, and raw alternating browser samples.
-[positional-arguments]
-wasm-baseline *args:
-    MOQ_TEST_RUNS="${MOQ_TEST_RUNS:-../target/test/wasm-backend}" ./wasm/run.sh "$@"
-    MOQ_TEST_RUNS="${MOQ_TEST_RUNS:-../target/test/wasm-backend}" ./wasm/run.sh --baseline "$@"
+    uv run --no-project python ../sh/js/install.py frozen
+    cd p2p && bash ../../sh/local.sh bun test ./transport.browser.ts

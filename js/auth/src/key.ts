@@ -1,9 +1,10 @@
 import { wall } from "@moq/clock";
-import * as z from "@zod/mini";
 import * as jose from "jose";
+import * as z from "zod/mini";
 import { type Algorithm, AlgorithmSchema } from "./algorithm.ts";
 import { type Claims, ClaimsSchema, ScopeSchema, scopeAllows } from "./claims.ts";
-import { encodeGrants } from "./wire.ts";
+import * as Path from "./path.ts";
+import { encodeGrants, nestRates } from "./wire.ts";
 
 /**
  * A validated key identifier (kid). At most 128 alphanumeric, hyphen, or underscore characters.
@@ -74,6 +75,8 @@ const RsaKeySchema = z
 		dp: z.optional(Base64FieldSchema),
 		dq: z.optional(Base64FieldSchema),
 		qi: z.optional(Base64FieldSchema),
+		// Multi-prime RSA is unsupported by the shared key contract.
+		oth: z.optional(z.never()),
 	})
 	.check(
 		z.superRefine((data, ctx) => {
@@ -190,18 +193,27 @@ function parse(jwk: string): Key {
  *
  * `iat` is written only when the claims carry one, so an unset field stays off the
  * wire rather than being stamped with the current time.
+ *
+ * Takes each role as its patterns, capped by `publish_rate` or `subscribe_rate` beside
+ * it, as the decoded {@link Claims} spell them; the `{path, rate}` wire form and the
+ * legacy `put`/`get` spelling are refused.
+ *
+ * Throws on a root spelled with an empty segment, a `\` escaping anything but `\` or
+ * `/`, or more than 4096 bytes. Verifying stays lenient on the empty segments, so tokens
+ * minted before stay valid.
  */
-async function sign(key: Key, claims: z.input<typeof ClaimsSchema>): Promise<string> {
+async function sign(key: Key, claims: Claims): Promise<string> {
 	ensureOperationSupported(key, "sign");
 
-	// Scope-check and sign what the schema parsed, never the raw input: an untyped
-	// caller could pass legacy `put`/`get` fields the scope check would not see.
+	// Scope-check and sign what the schema parsed, never the raw input. The caps nest
+	// back into their roles first, which the schema refuses a role already in.
 	let parsed: Claims;
 	try {
-		parsed = ClaimsSchema.parse(claims);
+		parsed = ClaimsSchema.parse(nestRates(claims));
 	} catch (error) {
 		throw new Error(`Invalid claims: ${error instanceof Error ? error.message : "unknown error"}`);
 	}
+	Path.validate(parsed.root);
 	ensureClaimsWithinScope(key, parsed);
 
 	const joseKey = await importJoseKey(key);
@@ -217,27 +229,22 @@ async function sign(key: Key, claims: z.input<typeof ClaimsSchema>): Promise<str
 	return jwt;
 }
 
-/** Decode a signed token, checking only signature, algorithm, and key ID. The payload is unvalidated. */
-async function decode(key: PublicKey | SymmetricKey, token: string): Promise<unknown> {
+/** Verify a token's signature and this crate's strict claims, expiry, not-before, and key scope. */
+async function verify(key: PublicKey | SymmetricKey, token: string): Promise<Claims> {
 	ensureOperationSupported(key, "verify");
 	const joseKey = await importJoseKey(key);
 	const { payload, protectedHeader } = await jose.compactVerify(token, joseKey, {
 		algorithms: [key.alg],
 	});
 	if (protectedHeader.kid !== key.kid) throw new Error("Token kid does not match key");
-	return JSON.parse(new TextDecoder().decode(payload));
-}
-
-/** Verify a token's signature and this crate's strict claims, expiry, not-before, and key scope. */
-async function verify(key: PublicKey | SymmetricKey, token: string): Promise<Claims> {
-	const payload = await decode(key, token);
+	const decoded = JSON.parse(new TextDecoder().decode(payload));
 	let claims: Claims;
 	try {
-		claims = ClaimsSchema.parse(payload);
+		claims = ClaimsSchema.parse(decoded);
 	} catch (error) {
 		throw new Error(`Failed to parse token claims: ${error instanceof Error ? error.message : "unknown error"}`);
 	}
-	const now = wall() / 1000;
+	const now = wall().asUnixMillis() / 1000;
 	if (claims.exp !== undefined && claims.exp <= now) throw new Error("Token has expired");
 	if (claims.nbf !== undefined && claims.nbf > now) throw new Error("Token is not yet valid");
 	ensureClaimsWithinScope(key, claims);
@@ -414,8 +421,6 @@ export const Key = {
 	public: toPublic,
 	/** Sign the claims with this key, returning the encoded token. */
 	sign,
-	/** Decode a signed token with no payload policy. */
-	decode,
 	/** Verify a token's signature and this crate's claims policy. */
 	verify,
 	/** Generate a key for the given algorithm. A random key ID is assigned if none is provided. */

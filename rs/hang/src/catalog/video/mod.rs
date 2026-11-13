@@ -44,6 +44,9 @@ pub struct Video {
 	/// A map of track name to rendition configuration.
 	/// This is not an array in order for it to work with JSON Merge Patch.
 	/// We use a BTreeMap so keys are sorted alphabetically for *some* deterministic behavior.
+	///
+	/// A malformed rendition refuses the whole catalog when decoding.
+	#[serde(deserialize_with = "crate::catalog::deserialize_renditions")]
 	pub renditions: BTreeMap<String, VideoConfig>,
 
 	/// Render the video at this size in pixels.
@@ -188,7 +191,7 @@ pub struct VideoConfig {
 	/// Resolve it with [`Path::resolve`](moq_net::Path::resolve): a reference that walks
 	/// above the root names no broadcast, so the catalog is rejected.
 	#[serde(default)]
-	pub broadcast: Option<moq_net::path::RelativeOwned>,
+	pub broadcast: Option<moq_net::path::Relative>,
 
 	/// The track's name in its broadcast, when it differs from this entry's ID: its key in the
 	/// catalog. Absent means the ID is the track name, as in every catalog before this field.
@@ -200,15 +203,16 @@ pub struct VideoConfig {
 	#[serde(default)]
 	pub track: Option<String>,
 
-	/// The publisher instance the reference names, when the catalog knows it. Absent names
-	/// whichever instance the reader resolves first, as in every catalog before this field.
+	/// The instance of the stream the reference names, when the catalog knows it. Absent names
+	/// whichever stream the reader resolves first, as in every catalog before this field.
 	///
-	/// A reader on an epoch-aware route refuses another instance rather than fall back to it;
-	/// on an epochless route it is best effort, since the route cannot prove the instance.
-	/// Without [`broadcast`](Self::broadcast), it names the catalog's own instance.
+	/// A reader refuses a broadcast of another instance rather than fall back to it. A route
+	/// over a wire that carries no instance has one its session minted, which proves nothing,
+	/// so there it is best effort. Without [`broadcast`](Self::broadcast), it names the
+	/// catalog's own stream.
 	#[serde(default)]
 	#[serde_as(as = "Option<serde_with::DisplayFromStr>")]
-	pub epoch: Option<moq_net::Epoch>,
+	pub instance: Option<moq_net::Instance>,
 
 	/// Human-readable rendition name for track pickers.
 	#[serde(default)]
@@ -227,7 +231,7 @@ pub struct VideoConfig {
 	#[serde_as(as = "Option<Hex>")]
 	pub description: Option<Bytes>,
 
-	/// The largest encoded width/height the track carries, fixed for its name.
+	/// The largest encoded width/height the track carries, fixed for its name, never zero.
 	///
 	/// The picture resizes in band at a keyframe below these ceilings, unless the
 	/// `description` pins it. Absent means unknown; a publisher may fill it once.
@@ -236,17 +240,12 @@ pub struct VideoConfig {
 	pub coded_height: Option<u32>,
 
 	/// The aspect ratio the whole picture is displayed at, as WebCodecs'
-	/// `VideoDecoderConfig.displayAspectWidth` / `displayAspectHeight`.
+	/// `VideoDecoderConfig.displayAspectWidth` / `displayAspectHeight`, never zero.
 	///
 	/// Absent means the decoded picture's own shape. A publisher with non-square
 	/// samples sets the picture's aspect here, never the sample aspect.
-	///
-	/// The `displayRatio*` aliases decode catalogs from publishers predating the
-	/// rename to `displayAspect*`; the current name is what we emit.
-	#[serde(alias = "displayRatioWidth")]
 	pub display_aspect_width: Option<u32>,
 	/// The height counterpart of `display_aspect_width`.
-	#[serde(alias = "displayRatioHeight")]
 	pub display_aspect_height: Option<u32>,
 
 	/// The colour the decoded pixels carry, so a renderer need not guess or reparse the bitstream.
@@ -268,8 +267,15 @@ pub struct VideoConfig {
 	#[serde_as(as = "Option<DisplayFromStr>")]
 	pub stereo: Option<Stereo>,
 
-	/// The maximum bitrate of the video track, if known.
+	/// Each picture weaves two fields, so a renderer deinterlaces it. Only written when true.
+	///
+	/// Decides decoder configuration, since some hardware decoders refuse interlaced streams.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub interlaced: bool,
+
+	/// The maximum bitrate of the video track, if known, at most 2^53 - 1.
 	#[serde(default)]
+	#[serde_as(as = "Option<crate::snapshot::Number>")]
 	pub bitrate: Option<u64>,
 
 	/// Whether this rendition may be selected. When false, no frames are coming and a consumer
@@ -289,6 +295,15 @@ pub struct VideoConfig {
 	/// The maximum frame rate of the video track, if known.
 	#[serde(default)]
 	pub framerate: Option<f64>,
+
+	/// The most frames that can precede a frame in decode order and follow it in presentation
+	/// order, as H.264 `max_num_reorder_frames` and HEVC `sps_max_num_reorder_pics` count them.
+	///
+	/// `0` declares that presentation order is decode order. Absent declares nothing: a consumer
+	/// that authors decode times infers them from the timestamps instead. A publisher that
+	/// declares it keeps it for the track's life, and never reorders deeper.
+	#[serde(default)]
+	pub reorder: Option<u8>,
 
 	/// If true, the decoder will optimize for latency.
 	///
@@ -326,15 +341,25 @@ pub struct VideoConfig {
 	#[serde(default)]
 	pub warmup: Option<std::time::Duration>,
 
-	/// How far this rendition's frames reach the transport behind the broadcast's earliest
-	/// rendition, measured at the publisher from each rendition's minimum flush lateness.
-	/// Absent on the earliest rendition and on any rendition the publisher did not measure.
+	/// How far this rendition's frames reach the transport behind the broadcast's other
+	/// renditions: a constant offset, either supplied by the publisher or measured as the least
+	/// its frames trailed the others' over a window of a second of media, keeping the largest
+	/// window. Lateness only some frames have, such as B-frame reorder, is left out, since a
+	/// consumer measures it. Absent on a rendition that trails nothing, and on any rendition the
+	/// publisher neither supplied nor measured.
+	///
+	/// A consumer adds a frame duration on top, so a publisher that knows its frames trail by no
+	/// more than their own duration, such as an encoder configured not to reorder or queue, states
+	/// `Some(Duration::ZERO)`. It is never measured, and is omitted on the
+	/// wire like an absent value, which means the same to a consumer. `None` leaves it to
+	/// measurement.
 	///
 	/// A consumer holds `delay + jitter` for this rendition and MUST NOT subtract one rendition's
-	/// `delay` from another's: each is a lifetime maximum, so two need not share an origin. It only
-	/// ever grows over the life of a stream, and is serialized like [`jitter`](Self::jitter).
+	/// `delay` from another's: each is taken against whichever rendition was ahead, so two need not
+	/// share an origin. It only ever grows over the life of a stream, and is serialized like
+	/// [`jitter`](Self::jitter).
 	#[serde_as(as = "MillisCeil")]
-	#[serde(default)]
+	#[serde(default, skip_serializing_if = "crate::catalog::millis::no_delay")]
 	pub delay: Option<std::time::Duration>,
 }
 
@@ -349,7 +374,7 @@ impl VideoConfig {
 		Self {
 			broadcast: None,
 			track: None,
-			epoch: None,
+			instance: None,
 			label: None,
 			codec: codec.into(),
 			description: None,
@@ -360,16 +385,53 @@ impl VideoConfig {
 			color: None,
 			projection: None,
 			stereo: None,
+			interlaced: false,
 			bitrate: None,
 			enabled: true,
 			preference: 0,
 			framerate: None,
+			reorder: None,
 			optimize_for_latency: None,
 			container: Container::default(),
 			jitter: None,
 			warmup: None,
 			delay: None,
 		}
+	}
+
+	/// Whether `other` keeps this config's track identity: the fields a consumer cannot change
+	/// without reinitializing its decoder or demuxer (`codec`, `description`, `container`,
+	/// `display_aspect_width`, `display_aspect_height`, and `interlaced`).
+	///
+	/// A track name always means the same content, so a publisher that changes any of them
+	/// publishes under a new name; every other field may update in place. See the draft's
+	/// [Track Identity](https://github.com/moq-dev/moq/blob/main/drafts/draft-lcurley-moq-hang.md#identity).
+	pub fn same_identity(&self, other: &Self) -> bool {
+		self.codec == other.codec
+			&& self.description == other.description
+			&& self.container == other.container
+			&& self.display_aspect_width == other.display_aspect_width
+			&& self.display_aspect_height == other.display_aspect_height
+			&& self.interlaced == other.interlaced
+	}
+}
+
+impl crate::catalog::Rendition for VideoConfig {
+	fn check(&self) -> crate::Result<()> {
+		for (field, value) in [
+			("codedWidth", self.coded_width),
+			("codedHeight", self.coded_height),
+			("displayAspectWidth", self.display_aspect_width),
+			("displayAspectHeight", self.display_aspect_height),
+		] {
+			if value == Some(0) {
+				return Err(crate::Error::Zero(field));
+			}
+		}
+		if let Some(projection) = &self.projection {
+			projection.check()?;
+		}
+		Ok(())
 	}
 }
 
@@ -393,6 +455,19 @@ mod test {
 			assert_eq!(encoded["warmup"], millis);
 			let decoded: VideoConfig = serde_json::from_value(encoded).unwrap();
 			assert_eq!(decoded.warmup, config.warmup);
+		}
+	}
+
+	#[test]
+	fn reorder_keeps_zero_distinct_from_absent() {
+		let mut config = VideoConfig::new(VideoCodec::VP8);
+		assert!(serde_json::to_value(&config).unwrap().get("reorder").is_none());
+		for depth in [0, 2] {
+			config.reorder = Some(depth);
+			let encoded = serde_json::to_value(&config).unwrap();
+			assert_eq!(encoded["reorder"], depth);
+			let decoded: VideoConfig = serde_json::from_value(encoded).unwrap();
+			assert_eq!(decoded.reorder, Some(depth));
 		}
 	}
 
@@ -477,20 +552,6 @@ mod test {
 	}
 
 	#[test]
-	fn decodes_legacy_display_ratio_keys() {
-		// A catalog serialized by a pre-0.20 publisher used displayRatio*; the
-		// alias keeps the aspect ratio from being silently dropped.
-		let json = serde_json::json!({
-			"codec": "avc1.640028",
-			"displayRatioWidth": 16,
-			"displayRatioHeight": 9,
-		});
-		let config: VideoConfig = serde_json::from_value(json).expect("failed to decode legacy keys");
-		assert_eq!(config.display_aspect_width, Some(16));
-		assert_eq!(config.display_aspect_height, Some(9));
-	}
-
-	#[test]
 	fn enabled_is_written_only_when_false() {
 		let mut config = VideoConfig::new(VideoCodec::VP8);
 		let encoded = serde_json::to_value(&config).expect("failed to encode");
@@ -502,6 +563,20 @@ mod test {
 
 		let decoded: VideoConfig = serde_json::from_value(encoded).expect("failed to decode");
 		assert!(!decoded.enabled);
+	}
+
+	#[test]
+	fn interlaced_is_written_only_when_true() {
+		let mut config = VideoConfig::new(VideoCodec::VP8);
+		let encoded = serde_json::to_value(&config).expect("failed to encode");
+		assert!(encoded.get("interlaced").is_none());
+
+		config.interlaced = true;
+		let encoded = serde_json::to_value(&config).expect("failed to encode");
+		assert_eq!(encoded["interlaced"], true);
+
+		let decoded: VideoConfig = serde_json::from_value(encoded).expect("failed to decode");
+		assert!(decoded.interlaced);
 	}
 
 	#[test]

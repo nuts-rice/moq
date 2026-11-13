@@ -64,16 +64,14 @@ async fn main() -> anyhow::Result<()> {
 
 	match config.role {
 		Command::Publish => {
-			let broadcast = origin
-				.create_broadcast(&config.broadcast)
+			// Created hidden, so it is announced only once the track exists and a
+			// subscriber acting on the announcement finds it.
+			let route = origin
+				.route(&config.broadcast, moq_net::origin::RouteOptions::hidden())
 				.context("failed to create broadcast")?;
 			let info = moq_net::track::Info::default().with_timescale(moq_net::Timescale::MILLI);
-			let track = broadcast.create_track(track, info)?;
-			// Announced once the track exists, so a subscriber acting on the
-			// announcement finds it.
-			broadcast
-				.announce(Default::default())
-				.context("failed to announce broadcast")?;
+			let track = route.broadcast().create_track(track, info)?;
+			route.announce().context("failed to announce broadcast")?;
 			let clock = Publisher::new(track);
 
 			let reconnect = client.with_publisher(&origin).connect(url);
@@ -86,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
 			};
 
 			// End the broadcast on exit.
-			broadcast.close();
+			route.broadcast().close();
 			result
 		}
 		Command::Subscribe => {
@@ -97,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
 			// instead. This also makes the subscriber reconnect-aware.
 			tracing::info!(broadcast = %config.broadcast, "waiting for broadcast to be online");
 
-			let path: moq_net::Path<'_> = config.broadcast.into();
+			let path = moq_net::Path::new(&config.broadcast)?;
 			let scope =
 				moq_net::Patterns::from(moq_net::Pattern::subtree(path.as_str()).context("invalid broadcast name")?);
 			let consumer = origin
@@ -112,15 +110,21 @@ async fn main() -> anyhow::Result<()> {
 				tokio::select! {
 					Some(event) = announced.next() => match event {
 						// A restart is a new broadcast: subscribe to it afresh.
-						announce::Event::Start(update) | announce::Event::Update(update) | announce::Event::Restart(update) => {
+						announce::Event::Present(update) => {
 							tracing::info!(broadcast = %update.prefix, "broadcast is online, subscribing to track");
-							let broadcast = consumer.request_broadcast(&update.prefix, None).await?;
+							let broadcast = consumer.request(&update.prefix, None).await?;
 							let track = broadcast
 								.track(&track)?.subscribe(None).await?;
 							clock = Some(Subscriber::new(track));
 						}
-						announce::Event::End(update) => {
+						announce::Event::Absent(update) => {
+							tracing::warn!(broadcast = %update.prefix, "broadcast ended, waiting...");
+						}
+						announce::Event::Offline(update) | announce::Event::Unavailable(update) => {
 							tracing::warn!(broadcast = %update.prefix, "broadcast is offline, waiting...");
+						}
+						announce::Event::Available(update) => {
+							tracing::info!(broadcast = %update.prefix, "broadcast is reachable again");
 						}
 					},
 					res = reconnect.closed() => return Ok(res?),
@@ -163,7 +167,7 @@ impl Publisher {
 			let next = next.with_second(0).unwrap().with_nanosecond(0).unwrap();
 
 			let delay = (next - now).to_std().unwrap();
-			moq_clock::sleep(delay).await;
+			kio::clock::sleep(delay).await;
 
 			now = next; // just assume we didn't undersleep
 		}
@@ -173,17 +177,17 @@ impl Publisher {
 		// Everything but the second.
 		let base = now.format("%Y-%m-%d %H:%M:").to_string();
 
-		segment.write_frame(moq_tokio::moq_net::Timestamp::now(), base.clone())?;
+		segment.write_frame(moq_net::Timestamp::now(), base.clone())?;
 
 		loop {
 			let delta = now.format("%S").to_string();
-			segment.write_frame(moq_tokio::moq_net::Timestamp::now(), delta.clone())?;
+			segment.write_frame(moq_net::Timestamp::now(), delta.clone())?;
 
 			let next = now + chrono::Duration::try_seconds(1).unwrap();
 			let next = next.with_nanosecond(0).unwrap();
 
 			let delay = (next - now).to_std().unwrap();
-			moq_clock::sleep(delay).await;
+			kio::clock::sleep(delay).await;
 
 			// Get the current time again to check if we overslept
 			let actual = Utc::now();

@@ -16,7 +16,6 @@ import asyncio
 import logging
 import struct
 from dataclasses import dataclass
-from datetime import timedelta
 from typing import Callable
 
 import moq
@@ -371,10 +370,8 @@ class BridgeStream:
             raise BridgeError(f"{self.name}: frame before config for rendition {frame.rendition}")
         if self._origin_us is None:
             self._origin_us = frame.timestamp_us
-        timestamp = timedelta(microseconds=max(0, frame.timestamp_us - self._origin_us))
+        timestamp = moq.Timestamp(max(0, frame.timestamp_us - self._origin_us), 1_000_000)
         track.write_frame(frame.payload, timestamp)
-        # Live encoder output: records the handoff for the catalog's jitter.
-        track.flush(timestamp)
         self.published[frame.rendition] += 1
 
     async def watch_demand(self, on_demand: Callable[[bool], None] | None = None) -> None:

@@ -1,10 +1,10 @@
 """Every Bun lockfile is audited, including when an earlier audit fails."""
 
 import os
-from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 # The script finds projects through `git ls-files`, so these only shape the fixture.
@@ -14,7 +14,8 @@ PROJECTS = [".", "demo/pub", "infra/apt", "infra/nix"]
 class Audit(unittest.TestCase):
     def run_audit(self, failing):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            # Resolved, since macOS's /tmp is a symlink and `bun` logs the shell's $PWD.
+            root = Path(directory).resolve()
             for project in PROJECTS:
                 (root / project).mkdir(parents=True, exist_ok=True)
             tools = root / "bin"

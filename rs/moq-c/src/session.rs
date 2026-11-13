@@ -1,27 +1,144 @@
 use std::sync::Arc;
 
-use anyhow::Context;
-use tokio::sync::oneshot;
+use moq_tokio::connection::Phase;
 use url::Url;
 
-use crate::{Error, Id, NonZeroSlab, State, ffi};
+use crate::task::Task;
+use crate::{
+	Error, Id, NonZeroSlab, State, ffi, moq_connection_connected, moq_connection_migrating, moq_connection_offline,
+	moq_connection_phase, moq_connection_phase_data, moq_connection_state, moq_string,
+};
 
-/// A spawned task entry: `close` signals shutdown, `callback` delivers status.
-///
-/// `close` is an `Option` so `close()` can drop just the sender without
-/// removing the entry. The task delivers one final terminal callback and then
-/// removes itself, so `user_data` stays valid until that callback fires.
+/// A session task and the connection backing its handle.
 struct TaskEntry {
-	close: Option<oneshot::Sender<()>>,
-	callback: ffi::OnStatus,
+	task: Task<ffi::OnState>,
 	link: Link,
+}
+
+/// One lifecycle snapshot, converted to a [`moq_connection_state`] for the callback.
+pub(crate) struct Lifecycle {
+	connects: u64,
+	phase: Stage,
+}
+
+/// A [`Lifecycle`]'s phase and its data, mirroring [`Phase`] with moq-c's errors.
+enum Stage {
+	Connecting {
+		failure: Option<Error>,
+	},
+	Connected {
+		version: moq_net::Version,
+	},
+	Disconnected {
+		failure: Option<Error>,
+	},
+	Migrating {
+		version: moq_net::Version,
+		failure: Option<Error>,
+	},
+	Closed {
+		failure: Option<Error>,
+	},
+}
+
+impl Lifecycle {
+	fn observed(state: moq_tokio::connection::Observation) -> Self {
+		let failure = |failure: Option<moq_tokio::Error>| failure.map(map_connect_error);
+		Self {
+			connects: state.connects,
+			phase: match state.phase {
+				Phase::Connecting { failure: err } => Stage::Connecting { failure: failure(err) },
+				Phase::Connected { version, .. } => Stage::Connected { version },
+				Phase::Disconnected { failure: err } => Stage::Disconnected { failure: failure(err) },
+				Phase::Migrating {
+					version, failure: err, ..
+				} => Stage::Migrating {
+					version,
+					failure: failure(err),
+				},
+				Phase::Closed { failure: err } => Stage::Closed { failure: failure(err) },
+			},
+		}
+	}
+
+	/// The terminal snapshot: `res` is the session's final result.
+	fn closed(connects: u64, res: Result<(), Error>) -> Self {
+		Self {
+			connects,
+			phase: Stage::Closed { failure: res.err() },
+		}
+	}
+
+	/// The snapshot's failure, which `moq_error()` describes during the callback.
+	pub fn failure(&self) -> Option<&Error> {
+		match &self.phase {
+			Stage::Connecting { failure }
+			| Stage::Disconnected { failure }
+			| Stage::Migrating { failure, .. }
+			| Stage::Closed { failure } => failure.as_ref(),
+			Stage::Connected { .. } => None,
+		}
+	}
+
+	pub fn to_c(&self) -> moq_connection_state {
+		let code = |failure: &Option<Error>| failure.as_ref().map_or(0, ffi::ReturnCode::code);
+		// Each version's name is static, so the pointer outlives the callback.
+		let name = |version: &moq_net::Version| {
+			let name = version.as_str();
+			moq_string {
+				data: name.as_ptr().cast(),
+				len: name.len(),
+			}
+		};
+		let (phase, data) = match &self.phase {
+			Stage::Connecting { failure } => (
+				moq_connection_phase::MOQ_CONNECTION_PHASE_CONNECTING,
+				moq_connection_phase_data {
+					connecting: moq_connection_offline { failure: code(failure) },
+				},
+			),
+			Stage::Connected { version } => (
+				moq_connection_phase::MOQ_CONNECTION_PHASE_CONNECTED,
+				moq_connection_phase_data {
+					connected: moq_connection_connected { version: name(version) },
+				},
+			),
+			Stage::Disconnected { failure } => (
+				moq_connection_phase::MOQ_CONNECTION_PHASE_DISCONNECTED,
+				moq_connection_phase_data {
+					disconnected: moq_connection_offline { failure: code(failure) },
+				},
+			),
+			Stage::Migrating { version, failure } => (
+				moq_connection_phase::MOQ_CONNECTION_PHASE_MIGRATING,
+				moq_connection_phase_data {
+					migrating: moq_connection_migrating {
+						version: name(version),
+						failure: code(failure),
+					},
+				},
+			),
+			Stage::Closed { failure } => (
+				moq_connection_phase::MOQ_CONNECTION_PHASE_CLOSED,
+				moq_connection_phase_data {
+					closed: moq_connection_offline { failure: code(failure) },
+				},
+			),
+		};
+		moq_connection_state {
+			phase,
+			connects: self.connects,
+			data,
+		}
+	}
 }
 
 /// What backs a session handle.
 enum Link {
 	/// A dialed connection: a loop that redials, so it is offline between connections.
 	Dialed {
-		connection: moq_tokio::Connection,
+		/// Boxed so the accepted variant does not carry its size.
+		connection: Box<moq_tokio::Connection>,
 		/// Reads live connection stats, reporting `None` while reconnecting.
 		monitor: moq_tokio::connection::Monitor,
 	},
@@ -31,7 +148,6 @@ enum Link {
 
 struct Accepted {
 	session: moq_net::Session,
-	driver: ffi::Background,
 }
 
 /// Everything needed to prepare a session without holding the global state lock.
@@ -40,7 +156,7 @@ pub(crate) struct Connect {
 	pub url: Url,
 	pub publish: Option<crate::origin::Producer>,
 	pub consume: Option<crate::origin::Producer>,
-	pub callback: ffi::OnStatus,
+	pub callback: ffi::OnState,
 }
 
 impl Connect {
@@ -52,6 +168,7 @@ impl Connect {
 			.clone()
 			.init(self.config.quic.clone())
 			.map_err(|err| Error::InvalidConfig(err.to_string()))?;
+		client = client.with_reconnect(!self.config.once);
 		if let Some(publish) = &self.publish {
 			client = client.with_publisher(&publish.producer);
 		}
@@ -75,13 +192,13 @@ pub(crate) struct PreparedConnect {
 	url: Url,
 	publish: Option<crate::origin::Producer>,
 	consume: Option<crate::origin::Producer>,
-	callback: ffi::OnStatus,
+	callback: ffi::OnState,
 }
 
 #[derive(Default)]
 pub struct Session {
 	/// Session tasks. Close signals shutdown; the task delivers a final callback, then removes itself.
-	task: NonZeroSlab<Option<TaskEntry>>,
+	task: NonZeroSlab<TaskEntry>,
 }
 
 impl Session {
@@ -97,18 +214,14 @@ impl Session {
 		// Build the reconnect loop up front so we can grab a monitor for it
 		// before moving it into the spawned task.
 		let reconnect = client.connect(url);
+		let monitor = reconnect.monitor();
 		let link = Link::Dialed {
-			connection: reconnect.clone(),
-			monitor: reconnect.monitor(),
+			connection: Box::new(reconnect.clone()),
+			monitor: monitor.clone(),
 		};
 
-		let closed = oneshot::channel();
-		let entry = TaskEntry {
-			close: Some(closed.0),
-			callback,
-			link,
-		};
-		let id = self.task.insert(Some(entry))?;
+		let (task, closed) = Task::new(callback);
+		let id = self.task.insert(TaskEntry { task, link })?;
 
 		tokio::spawn(async move {
 			// Keep the origin producers alive for the lifetime of the reconnect loop:
@@ -118,14 +231,16 @@ impl Session {
 			let _publish = publish;
 			let _consume = consume;
 
-			// A panic ends only this session, reported through the terminal callback.
-			let res = ffi::run(publish_driver.watch(consume_driver.watch(async move {
+			// A panic ends only this session, reported through the terminal callback. Boxed so
+			// each wrapper holds a pointer: unoptimized builds otherwise copy the future into
+			// every layer's frame, overflowing the runtime thread's stack.
+			let res = ffi::run(publish_driver.watch(consume_driver.watch(Box::pin(async move {
 				tokio::select! {
 					// close() requested: drain what the session queued, then close it.
-					_ = closed.1 => reconnect.clone().close().await.map_err(map_connect_error),
-					res = Self::report(callback, reconnect.clone()) => res,
+					_ = closed => reconnect.clone().close().await.map_err(map_connect_error),
+					res = Self::report(callback, &reconnect, &monitor) => res,
 				}
-			})))
+			}))))
 			.await;
 			// The terminal callback waits for the close to reach the peer, so a caller that exits
 			// on it doesn't leave the peer to time the connection out.
@@ -137,25 +252,29 @@ impl Session {
 			})
 			.await;
 
-			// Deliver one final terminal callback (0 = closed, < 0 = error), then
-			// drop the entry. Pull it out from under the lock so the callback never
+			// Deliver the terminal snapshot after dropping the entry, so the handle is gone
+			// once the caller sees it. Pulled out from under the lock so the callback never
 			// runs while held.
-			let entry = State::lock().session.task.remove(id).flatten();
+			let entry = State::lock().session.task.remove(id);
 			if let Some(entry) = entry {
-				entry.callback.call(res);
+				let connects = match &entry.link {
+					Link::Dialed { monitor, .. } => monitor.state().connects,
+					Link::Accepted(_) => unreachable!("a dialed entry"),
+				};
+				entry.task.callback.call(&Lifecycle::closed(connects, res));
 			}
 		});
 
 		Ok(id)
 	}
 
-	/// Complete SETUP for an incoming session, reporting `1` once established.
+	/// Complete SETUP for an incoming session, reporting it connected once established.
 	pub fn accept(
 		&mut self,
 		request: moq_tokio::server::Request,
 		publish: Option<crate::origin::Producer>,
 		consume: Option<crate::origin::Producer>,
-		callback: ffi::OnStatus,
+		callback: ffi::OnState,
 	) -> Result<Id, Error> {
 		let mut request = request;
 		if let Some(publish) = &publish {
@@ -165,13 +284,11 @@ impl Session {
 			request = request.with_subscriber(consume.producer.clone());
 		}
 
-		let closed = oneshot::channel();
-		let entry = TaskEntry {
-			close: Some(closed.0),
-			callback,
+		let (task, closed) = Task::new(callback);
+		let id = self.task.insert(TaskEntry {
+			task,
 			link: Link::Accepted(None),
-		};
-		let id = self.task.insert(Some(entry))?;
+		})?;
 
 		tokio::spawn(async move {
 			// Keep the origin producers alive for the lifetime of the session.
@@ -180,29 +297,39 @@ impl Session {
 			let _publish = publish;
 			let _consume = consume;
 
-			// A panic ends only this session, reported through the terminal callback.
-			let mut res = ffi::run(publish_driver.watch(consume_driver.watch(async move {
+			// A panic ends only this session, reported through the terminal callback. Boxed
+			// like the dialed session's.
+			let mut res = ffi::run(publish_driver.watch(consume_driver.watch(Box::pin(async move {
 				tokio::select! {
-					_ = closed.1 => Ok(()),
+					_ = closed => Ok(()),
 					res = Self::serve(id, callback, request) => res,
 				}
-			})))
+			}))))
 			.await;
 
-			let entry = State::lock().session.task.remove(id).flatten();
+			let entry = State::lock().session.task.remove(id);
 			if let Some(entry) = entry {
+				let connects = match &entry.link {
+					Link::Accepted(accepted) => u64::from(accepted.is_some()),
+					Link::Dialed { .. } => unreachable!("an accepted entry"),
+				};
 				// Close the transport now rather than whenever the last clone drops.
 				if let Link::Accepted(Some(accepted)) = &entry.link
 					&& let Err(error) = ffi::run(async {
-						accepted.session.abort(moq_net::Error::Cancel);
-						accepted.driver.finished().await
+						if res.is_ok() {
+							accepted.session.clone().close().await?;
+						} else {
+							accepted.session.abort(moq_net::Error::Cancel);
+							let _ = accepted.session.closed().await;
+						}
+						Ok(())
 					})
 					.await
 				{
 					res = Err(error);
 				}
 				let res = publish_driver.check().and_then(|()| consume_driver.check()).and(res);
-				entry.callback.call(res);
+				entry.task.callback.call(&Lifecycle::closed(connects, res));
 			}
 		});
 
@@ -210,46 +337,68 @@ impl Session {
 	}
 
 	/// Establish an accepted session, publish it to the entry, and wait for it to close.
-	async fn serve(id: Id, callback: ffi::OnStatus, request: moq_tokio::server::Request) -> Result<(), Error> {
-		let (session, driver) = request.ok().await.map_err(map_connect_error)?;
-		let driver = ffi::Background::new(async move {
-			match driver.await {
-				Ok(result) => result.map_err(map_connect_error),
-				Err(error) if error.is_panic() => Err(Error::Panic),
-				Err(_) => Err(moq_net::Error::Cancel.into()),
-			}
-		});
+	async fn serve(id: Id, callback: ffi::OnState, request: moq_tokio::server::Request) -> Result<(), Error> {
+		let session = request.ok().await.map_err(map_connect_error)?;
 
-		if let Some(entry) = State::lock().session.task.get_mut(id).and_then(|entry| entry.as_mut()) {
+		if let Some(entry) = State::lock().session.task.get_mut(id) {
 			entry.link = Link::Accepted(Some(Accepted {
 				session: session.clone(),
-				driver: driver.clone(),
 			}));
 		}
 
 		// A server-accepted session is a single transport, so it only ever connects once.
-		callback.call(1);
-		driver.finished().await?;
+		callback.call(&Lifecycle {
+			connects: 1,
+			phase: Stage::Connected {
+				version: session.version(),
+			},
+		});
 		Err(session.closed().await.into())
 	}
 
 	fn link(&self, id: Id) -> Result<&Link, Error> {
-		Ok(&self
-			.task
-			.get(id)
-			.and_then(|entry| entry.as_ref())
-			.ok_or(Error::SessionNotFound)?
-			.link)
+		Ok(&self.task.get(id).ok_or(Error::SessionNotFound)?.link)
 	}
 
 	/// The session's bandwidth allocator. Every handle shares one reservation registry,
 	/// which the session probes for.
 	///
 	/// Errors with [`Error::Offline`] for an accepted session still in SETUP.
-	pub fn bandwidth(&self, id: Id) -> Result<moq_net::bandwidth::Allocator, Error> {
+	pub fn allocator(&self, id: Id) -> Result<moq_net::bandwidth::Allocator, Error> {
 		match self.link(id)? {
-			Link::Dialed { connection, .. } => Ok(connection.bandwidth()),
-			Link::Accepted(accepted) => Ok(accepted.as_ref().ok_or(Error::Offline)?.session.bandwidth()),
+			Link::Dialed { connection, .. } => Ok(connection.allocator()),
+			Link::Accepted(accepted) => Ok(accepted.as_ref().ok_or(Error::Offline)?.session.allocator()),
+		}
+	}
+
+	/// The session's viewers, whose summed ceilings it sends as its PROBE target. A dialed
+	/// session's survive reconnects, reading no estimate while offline.
+	///
+	/// Errors with [`Error::Offline`] for an accepted session still in SETUP.
+	pub fn viewers(&self, id: Id) -> Result<moq_net::bandwidth::Viewers, Error> {
+		match self.link(id)? {
+			Link::Dialed { connection, .. } => Ok(connection.viewers()),
+			Link::Accepted(accepted) => Ok(accepted.as_ref().ok_or(Error::Offline)?.session.viewers()),
+		}
+	}
+
+	/// The grants the session's peer gave it. A dialed session's survive reconnects.
+	///
+	/// Errors with [`Error::Offline`] for an accepted session still in SETUP.
+	pub fn auth(&self, id: Id) -> Result<moq_net::auth::Handle, Error> {
+		match self.link(id)? {
+			Link::Dialed { connection, .. } => Ok(connection.auth()),
+			Link::Accepted(accepted) => Ok(accepted.as_ref().ok_or(Error::Offline)?.session.auth()),
+		}
+	}
+
+	/// The tokens a dialed session presents. An accepted session presents none.
+	pub fn tokens(&self, id: Id) -> Result<moq_net::auth::Tokens, Error> {
+		match self.link(id)? {
+			Link::Dialed { connection, .. } => Ok(connection.tokens()),
+			Link::Accepted(_) => Err(Error::Unsupported(
+				"a server-accepted session presents no tokens".into(),
+			)),
 		}
 	}
 
@@ -286,47 +435,41 @@ impl Session {
 		}
 	}
 
-	/// Why a dialed session is reconnecting, or `None` while nothing has failed since the
-	/// last connect. A server-accepted session never reconnects, so it is always `None`.
+	/// Deliver each lifecycle change until the connection stops, then return its result.
 	///
-	/// Errors with [`Error::SessionNotFound`] if the handle is unknown.
-	pub fn failure(&self, id: Id) -> Result<Option<Error>, Error> {
-		Ok(match self.link(id)? {
-			Link::Dialed { monitor, .. } => monitor.failure().map(map_connect_error),
-			Link::Accepted(_) => None,
-		})
-	}
-
-	/// Forward connect counts to the status callback until the reconnect loop stops.
-	///
-	/// Returns the terminal error via `?`. Disconnects aren't reported: status 0 is reserved for a
-	/// clean close (delivered as the terminal callback once the task ends).
-	async fn report(callback: ffi::OnStatus, mut reconnect: moq_tokio::Connection) -> Result<(), Error> {
-		let mut connects: u64 = 0;
-		loop {
-			if let moq_tokio::Status::Connected = reconnect.status().await.map_err(map_connect_error)? {
-				connects += 1;
-				// Positive status carries the connect count, so callers can tell a
-				// reconnect (>1) from the first connect (1). No lock is held, so the C
-				// callback is free to re-enter moq-c.
-				let code = i32::try_from(connects)
-					.context("connect count exceeded i32::MAX")
-					.map_err(|err| Error::Connect(Arc::new(err)))?;
-				callback.call(code);
+	/// Changes coalesce: a snapshot is the state when the callback runs, not every step
+	/// between. No lock is held, so the C callback is free to re-enter moq-c.
+	async fn report(
+		callback: ffi::OnState,
+		connection: &moq_tokio::Connection,
+		monitor: &moq_tokio::connection::Monitor,
+	) -> Result<(), Error> {
+		// The loop may have moved before we got here; the untouched initial state says nothing.
+		let mut state = monitor.state();
+		let initial = matches!(state.phase, Phase::Connecting { failure: None }) && state.connects == 0;
+		let closed = |state: &moq_tokio::connection::Observation| matches!(state.phase, Phase::Closed { .. });
+		if !initial && !closed(&state) {
+			callback.call(&Lifecycle::observed(state.clone()));
+		}
+		while !closed(&state) {
+			let Ok(next) = monitor.state_changed(state.revision).await else {
+				break;
+			};
+			state = next;
+			if !closed(&state) {
+				callback.call(&Lifecycle::observed(state.clone()));
 			}
 		}
+		connection.closed().await.map_err(map_connect_error)
 	}
 
 	pub fn close(&mut self, id: Id) -> Result<(), Error> {
 		// Signal shutdown; the task delivers a final callback and removes itself.
 		self.task
 			.get_mut(id)
-			.and_then(|entry| entry.as_mut())
 			.ok_or(Error::SessionNotFound)?
-			.close
-			.take()
-			.ok_or(Error::SessionNotFound)?;
-		Ok(())
+			.task
+			.close(Error::SessionNotFound)
 	}
 }
 

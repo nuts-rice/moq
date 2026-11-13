@@ -85,11 +85,30 @@ impl Addr {
 	pub fn addresses(&self) -> Option<&[net::SocketAddr]> {
 		self.resolved.as_deref()
 	}
+
+	/// The same peer and addresses, requested at `url`.
+	#[cfg(any(feature = "quic", feature = "websocket", feature = "tcp", feature = "uds"))]
+	pub(crate) fn with_url(&self, url: Url) -> Self {
+		Self {
+			url,
+			resolved: self.resolved.clone(),
+		}
+	}
 }
 
 impl From<Url> for Addr {
 	fn from(url: Url) -> Self {
 		Self::new(url)
+	}
+}
+
+impl moq_net::reconnect::Target for Addr {
+	fn url(&self) -> &Url {
+		&self.url
+	}
+
+	fn fixed(&self) -> bool {
+		self.resolved.is_some()
 	}
 }
 
@@ -206,14 +225,8 @@ pub(crate) struct Legacy {
 			"moq-lite-05",
 			"moq-lite-06",
 			"moq-lite-07-wip",
-			"moq-transport-14",
-			"moq-transport-15",
-			"moq-transport-16",
-			"moq-transport-17",
 			"moq-transport-18",
-			"moq-transport-19",
 			"moq-transport-20",
-			"moq-transport-21",
 			"moq-transport-22"
 		),
 		hide = true
@@ -261,14 +274,11 @@ impl Legacy {
 			);
 		}
 		if self.reconnect.is_some() {
-			// Named as a change rather than a rename: the replacement means the
-			// opposite, so a bare mapping would have someone carry the value across
-			// unchanged and get the behavior they were trying to keep, inverted.
 			found.changed(
 				"--client-reconnect",
 				Some("MOQ_CLIENT_RECONNECT"),
-				"--connect-once / MOQ_CONNECT_ONCE",
-				"inverted: --client-reconnect=false is --connect-once=true",
+				"Client::with_reconnect(bool)",
+				"native API only; CLI clients always reconnect",
 			);
 		}
 		if !self.version.is_empty() {
@@ -367,7 +377,7 @@ mod tests {
 	fn extensions_default_on_and_parse_off() {
 		let config: Config = toml::from_str("[extensions]\nsolicit = false\n").expect("parse");
 		assert!(!config.extensions.solicit);
-		assert!(config.extensions.auth);
+		assert!(!config.extensions.ietf);
 		assert!(toml::to_string(&config).expect("serialize").contains("solicit = false"));
 		assert!(
 			!toml::to_string(&Config::default())
@@ -488,7 +498,7 @@ pub(crate) fn all_extensions(extensions: &moq_net::setup::Extensions) -> bool {
 ///
 /// Derives [`usage_rs::Args`], so flatten it into a binary's own parser with
 /// `#[usage(flatten)]`. The accept side is [`crate::listen::Config`].
-#[derive(Clone, Debug, usage_rs::Args, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, usage_rs::Args, serde::Serialize, serde::Deserialize)]
 #[usage(unknown_flags = "error", args_override_self = false)]
 #[serde(deny_unknown_fields, default)]
 #[non_exhaustive]
@@ -496,13 +506,30 @@ pub struct Config {
 	/// The URL to dial.
 	///
 	/// Supports WebTransport (`https`/`http`), WebSocket (`ws`/`wss`), raw QUIC
-	/// (`moqt`/`moql`), qmux over `tcp`/`unix`, and `iroh`. The URL path is the
+	/// (`moqt`/`moql`), and qmux over `tcp`/`unix`. The URL path is the
 	/// request/auth path (e.g. `/anon` for a public relay) and `?jwt=` supplies a
 	/// token. `http://` first fetches `/certificate.sha256` for the (insecure)
-	/// self-signed fingerprint; `https://` connects directly.
+	/// self-signed fingerprint; `https://` connects directly. With a client
+	/// certificate set, dialing `http`, `ws`, `tcp`, or `unix` fails: none can present it.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	#[usage(name = "connect", long = "connect", env = "MOQ_CONNECT", setting = "connect.url")]
 	pub url: Option<Url>,
+
+	/// Credentials to present on every dial, kept apart from the URL.
+	///
+	/// The first is the connection credential: it rides SETUP, and the URL query too
+	/// while an offered version can't carry it in SETUP (lite before 07). Each other
+	/// token rides its own AUTH stream, widening the session's grant. A URL that
+	/// already has a `?jwt=` keeps it as the connection credential, and then every
+	/// token rides AUTH. Replace a connection's through `Connection::tokens`.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	#[usage(
+		name = "connect-token",
+		long = "connect-token",
+		env = "MOQ_CONNECT_TOKEN",
+		setting = "connect.tokens"
+	)]
+	pub tokens: Vec<moq_net::auth::Token>,
 
 	/// The released `connect` key, kept so [`deprecated`](Self::deprecated) can name [`url`](Self::url).
 	#[serde(default, skip_serializing)]
@@ -510,6 +537,11 @@ pub struct Config {
 	pub(crate) connect: Option<Url>,
 
 	/// Send from this local UDP address. Defaults to an ephemeral dual-stack port.
+	///
+	/// With port 0, two consecutive failed dial rounds give the reconnecting connection
+	/// a fresh port. Established sessions keep their sockets; a nonzero port never changes.
+	/// The [retry window](Backoff::timeout) must allow that third round: with the default
+	/// window, a black-holed dial ends the connection after its first round instead.
 	///
 	/// Kept optional because the compatibility fold must distinguish an explicit
 	/// wildcard bind from an unset bind.
@@ -529,26 +561,17 @@ pub struct Config {
 	/// it fails), and the first connection to complete wins. `0s` dials every
 	/// address at once. Defaults to 250ms. Applies to the QUIC, `tcp://`, and `tls://` dials.
 	///
-	/// This staggers the attempts within one [`crate::Client::connect`]; [`Self::timeout`]
-	/// bounds that call as a whole.
-	/// `None` uses the default; an explicit command-line flag or environment variable wins.
-	#[usage(skip)]
-	#[serde(
-		default,
-		with = "crate::cli::duration::serde_duration::option",
-		skip_serializing_if = "Option::is_none"
-	)]
-	pub race: Option<std::time::Duration>,
-
-	/// Delay before also dialing the next resolved address. Defaults to 250ms; 0s dials every address at once.
+	/// This staggers the attempts within one connect; `--connect-timeout` bounds that
+	/// call as a whole.
+	/// `None` uses the default; zero disables this duration.
 	#[usage(
 		name = "connect-race",
 		long = "connect-race",
 		env = "MOQ_CONNECT_RACE",
 		setting = "connect.race"
 	)]
-	#[serde(default, rename = "__cli_race", skip_serializing_if = "Option::is_none")]
-	pub(crate) race_arg: Option<crate::cli::Duration>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub race: Option<crate::cli::Duration>,
 
 	/// The released `failover_delay` key, kept so [`deprecated`](Self::deprecated) can name [`race`](Self::race).
 	#[serde(default, skip_serializing)]
@@ -562,56 +585,39 @@ pub struct Config {
 	/// The full answer is authoritative, including which family to try first, so
 	/// this is how long the IPv4-only one waits for it before going ahead alone.
 	/// Defaults to 50ms; `0s` dials as soon as any address resolves.
-	/// `None` uses the default; an explicit command-line flag or environment variable wins.
-	#[usage(skip)]
-	#[serde(
-		default,
-		with = "crate::cli::duration::serde_duration::option",
-		skip_serializing_if = "Option::is_none"
-	)]
-	pub resolution_delay: Option<std::time::Duration>,
-
-	/// Delay before dialing IPv4 while the full DNS answer is outstanding. Defaults to 50ms.
+	/// `None` uses the default; zero disables this duration.
 	#[usage(
 		name = "connect-resolution-delay",
 		long = "connect-resolution-delay",
 		env = "MOQ_CONNECT_RESOLUTION_DELAY",
 		setting = "connect.resolution_delay"
 	)]
-	#[serde(default, rename = "__cli_resolution_delay", skip_serializing_if = "Option::is_none")]
-	pub(crate) resolution_delay_arg: Option<crate::cli::Duration>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub resolution_delay: Option<crate::cli::Duration>,
 
-	/// Maximum time for one [`crate::Client::connect`], covering the dial and the MoQ
+	/// Maximum time for one connect, covering the dial and the MoQ
 	/// handshake. Defaults to 30 seconds; set to 0 to wait forever.
 	///
 	/// This has to live above the transports rather than inside one: QUIC bounds its
 	/// own dial, but the WebSocket fallback and the handshake that follows either
 	/// transport have no deadline of their own, so a peer that accepts TCP and then
-	/// never speaks would hang the whole connect. [`crate::Connection`] only re-arms
+	/// never speaks would hang the whole connect. The reconnect loop only re-arms
 	/// its backoff between attempts, so an attempt that never returns stalls the
 	/// retry loop indefinitely.
-	/// `None` uses the default; an explicit command-line flag or environment variable wins.
-	#[usage(skip)]
-	#[serde(
-		default,
-		with = "crate::cli::duration::serde_duration::option",
-		skip_serializing_if = "Option::is_none"
-	)]
-	pub timeout: Option<std::time::Duration>,
-
-	/// Maximum time for one connect, covering the dial and the MoQ handshake. Defaults to 30s; 0s waits forever.
+	/// `None` uses the default; zero disables this duration.
 	#[usage(
 		name = "connect-timeout",
 		long = "connect-timeout",
 		env = "MOQ_CONNECT_TIMEOUT",
 		setting = "connect.timeout"
 	)]
-	#[serde(default, rename = "__cli_timeout", skip_serializing_if = "Option::is_none")]
-	pub(crate) timeout_arg: Option<crate::cli::Duration>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub timeout: Option<crate::cli::Duration>,
 
 	/// Restrict the client to specific MoQ protocol version(s).
 	///
-	/// By default, the client offers all supported versions and lets the server choose.
+	/// By default, the client offers every supported version except the opt-in `moq-lite-07-wip`
+	/// and lets the server choose.
 	/// Use this to force a specific version, e.g. `--connect-version moq-lite-02`.
 	/// Can be specified multiple times to offer a subset of versions.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -628,14 +634,8 @@ pub struct Config {
 			"moq-lite-05",
 			"moq-lite-06",
 			"moq-lite-07-wip",
-			"moq-transport-14",
-			"moq-transport-15",
-			"moq-transport-16",
-			"moq-transport-17",
 			"moq-transport-18",
-			"moq-transport-19",
 			"moq-transport-20",
-			"moq-transport-21",
 			"moq-transport-22"
 		)
 	)]
@@ -646,43 +646,32 @@ pub struct Config {
 	#[usage(skip)]
 	pub extensions: moq_net::setup::Extensions,
 
+	/// The implementation to advertise in SETUP, as space-separated `name/version`
+	/// product tokens. `None` advertises [`moq_net::IMPLEMENTATION`]; empty advertises
+	/// nothing. Set by the embedding binary, not configured.
+	#[usage(skip)]
+	#[serde(skip)]
+	pub implementation: Option<String>,
+
 	/// TLS trust and client-certificate settings (`--connect-tls-*`).
 	#[usage(flatten)]
 	#[serde(default)]
 	pub tls: crate::tls::Connect,
 
-	/// Dial once instead of redialing (with backoff) whenever the session drops.
+	/// The released reconnect key, parsed only to explain its removal.
 	///
-	/// A [`crate::Connection`] reconnects by default. With this set, the session's
-	/// close surfaces through [`crate::Connection::closed`] instead.
-	#[serde(skip_serializing_if = "Option::is_none")]
-	#[usage(
-		name = "connect-once",
-		long = "connect-once",
-		env = "MOQ_CONNECT_ONCE",
-		setting = "connect.once",
-		default_missing = "true",
-		num_args = 0..=1,
-		require_equals = true,
-	)]
-	pub once: Option<bool>,
-
-	/// The released `reconnect` key, which said the same thing the other way around.
-	///
-	/// Parsed only so [`deprecated`](Self::deprecated) can name [`once`](Self::once)
-	/// and the inversion; `deny_unknown_fields` would otherwise reject the file with
-	/// nothing to migrate to. TOML-only: the `--client-reconnect` flag lives on
-	/// [`Legacy`] with the rest.
+	/// Native callers set [`crate::Client::with_reconnect`] on each client clone.
+	/// TOML-only: the `--client-reconnect` flag lives on [`Legacy`] with the rest.
 	#[serde(default, skip_serializing)]
 	#[usage(skip)]
 	pub(crate) reconnect: Option<bool>,
 
-	/// Retry pacing for [`crate::Client::connect`] (`--backoff-*`).
+	/// Retry pacing for [`crate::Client::connect`] (`--connect-backoff-*`).
 	#[usage(flatten)]
 	#[serde(default)]
 	pub backoff: Backoff,
 
-	/// How [`crate::Client::connect`] reacts to a peer's GOAWAY (`--goaway-*`).
+	/// How [`crate::Client::connect`] reacts to a peer's GOAWAY (`--connect-goaway-*`).
 	#[usage(flatten)]
 	#[serde(default)]
 	pub goaway: Goaway,
@@ -707,35 +696,7 @@ pub struct Config {
 	/// Parsed only so [`deprecated`](Self::deprecated) can name the replacement.
 	#[usage(skip)]
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub quic: Option<crate::quic::Config>,
-}
-
-impl Default for Config {
-	fn default() -> Self {
-		Self {
-			url: None,
-			connect: None,
-			bind: None,
-			race: Some(DEFAULT_RACE),
-			race_arg: None,
-			failover_delay: None,
-			resolution_delay: Some(DEFAULT_RESOLUTION_DELAY),
-			resolution_delay_arg: None,
-			timeout: Some(DEFAULT_TIMEOUT),
-			timeout_arg: None,
-			version: Vec::new(),
-			extensions: Default::default(),
-			tls: Default::default(),
-			once: None,
-			reconnect: None,
-			backoff: Default::default(),
-			goaway: Default::default(),
-			#[cfg(feature = "websocket")]
-			websocket: Default::default(),
-			legacy: Default::default(),
-			quic: None,
-		}
-	}
+	pub(crate) quic: Option<crate::quic::Config>,
 }
 
 impl Config {
@@ -748,6 +709,8 @@ impl Config {
 	/// skipped the check can't reach a dial that quietly ignored half of it.
 	pub fn deprecated(&self) -> crate::cli::Deprecated {
 		let mut found = self.legacy.deprecated();
+		found.extend(self.backoff.deprecated());
+		found.extend(self.goaway.deprecated());
 		if self.connect.is_some() {
 			found.toml("connect", "url", None);
 		}
@@ -755,7 +718,11 @@ impl Config {
 			found.toml("failover_delay", "race", None);
 		}
 		if self.reconnect.is_some() {
-			found.toml("reconnect", "once", Some("inverted: reconnect = false is once = true"));
+			found.toml(
+				"reconnect",
+				"Client::with_reconnect(bool)",
+				Some("native API only; CLI clients always reconnect"),
+			);
 		}
 		if self.quic.is_some() {
 			found.toml("[client.quic]", "[quic]", Some("now applies to both directions"));
@@ -793,17 +760,13 @@ impl Config {
 	pub fn resolve(&self) -> Resolved {
 		Resolved {
 			bind: self.bind.unwrap_or_else(default_bind),
-			race: self.race_arg.map(Into::into).or(self.race).unwrap_or(DEFAULT_RACE),
+			race: self.race.map(Into::into).unwrap_or(DEFAULT_RACE),
 			resolution_delay: self
-				.resolution_delay_arg
+				.resolution_delay
 				.map(Into::into)
-				.or(self.resolution_delay)
 				.unwrap_or(DEFAULT_RESOLUTION_DELAY),
-			timeout: self
-				.timeout_arg
-				.map(Into::into)
-				.or(self.timeout)
-				.unwrap_or(DEFAULT_TIMEOUT),
+			// A configured zero turns the deadline off.
+			timeout: Some(self.timeout.map(Into::into).unwrap_or(DEFAULT_TIMEOUT)).filter(|timeout| !timeout.is_zero()),
 		}
 	}
 }
@@ -821,8 +784,8 @@ pub struct Resolved {
 	pub race: std::time::Duration,
 	/// How long the IPv4-only lookup waits for the full DNS answer.
 	pub resolution_delay: std::time::Duration,
-	/// The deadline one connection attempt gets, dial and handshake together.
-	pub timeout: std::time::Duration,
+	/// The deadline one connection attempt gets, dial and handshake together, or `None` for none.
+	pub timeout: Option<std::time::Duration>,
 }
 
 #[cfg(test)]
@@ -832,7 +795,7 @@ mod addr_tests {
 	#[test]
 	fn fixed_addresses_require_a_supported_nonempty_target() {
 		let peer: net::SocketAddr = "127.0.0.1:443".parse().unwrap();
-		for scheme in ["http", "ws", "tcp", "unix", "iroh"] {
+		for scheme in ["http", "ws", "tcp", "unix"] {
 			let url = format!("{scheme}://relay.example/path").parse().unwrap();
 			assert_eq!(Addr::pinned(url, [peer]), Err(Error::UnsupportedScheme(scheme.into())));
 		}
@@ -874,6 +837,6 @@ mod duration_tests {
 		timeout,
 		"--connect-timeout",
 		|c: &Config| c.resolve().timeout,
-		|d| d
+		|d: std::time::Duration| Some(d).filter(|d| !d.is_zero())
 	);
 }

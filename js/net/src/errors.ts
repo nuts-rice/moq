@@ -4,13 +4,14 @@
  * @module
  */
 export {
+	ConnectTimeout,
 	FrameTooLarge,
 	GroupTooLarge,
-	NoStreamCredit,
 	NotFound,
 	ProtocolViolation,
 	RefusedRedirect,
 	Session,
+	Skipped,
 	Stream,
 	type StreamOptions,
 	TimestampMismatch,

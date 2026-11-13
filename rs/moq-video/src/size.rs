@@ -1,4 +1,4 @@
-use crate::{Error, Rate};
+use crate::{Error, FrameRate};
 
 /// A frame resolution in pixels.
 ///
@@ -28,7 +28,7 @@ impl Size {
 		usize::try_from(self.pixels())
 			.ok()
 			.and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
-			.ok_or_else(|| Error::Codec(anyhow::anyhow!("{what} {self}: byte length is too large to represent")))
+			.ok_or_else(|| Error::codec(anyhow::anyhow!("{what} {self}: byte length is too large to represent")))
 	}
 
 	/// Reject anything the I420 pipeline can't represent.
@@ -39,7 +39,7 @@ impl Size {
 	pub(crate) fn validate(&self, what: &str) -> Result<(), Error> {
 		self.validate_nonzero(what)?;
 		if !self.width.is_multiple_of(2) || !self.height.is_multiple_of(2) {
-			return Err(Error::Codec(anyhow::anyhow!("{what} {self}: dimensions must be even")));
+			return Err(Error::codec(anyhow::anyhow!("{what} {self}: dimensions must be even")));
 		}
 		Ok(())
 	}
@@ -55,7 +55,7 @@ impl Size {
 	///
 	/// This is arithmetic, not policy: it rejects only what cannot be represented,
 	/// leaving "no encoder handles a frame that large" to the backend.
-	pub(crate) fn validate_encodable(&self, what: &str, framerate: Rate) -> Result<(), Error> {
+	pub(crate) fn validate_encodable(&self, what: &str, framerate: FrameRate) -> Result<(), Error> {
 		let pixels = self.pixels();
 		let representable = u128::from(pixels)
 			.checked_mul(u128::from(framerate.numerator()))
@@ -63,7 +63,7 @@ impl Size {
 			&& usize::try_from(pixels).is_ok_and(|pixels| pixels.checked_mul(4).is_some());
 
 		if !representable {
-			return Err(Error::Codec(anyhow::anyhow!(
+			return Err(Error::codec(anyhow::anyhow!(
 				"{what} {self} at {framerate}fps: dimensions too large to represent"
 			)));
 		}
@@ -75,7 +75,7 @@ impl Size {
 	/// window).
 	pub(crate) fn validate_nonzero(&self, what: &str) -> Result<(), Error> {
 		if self.width == 0 || self.height == 0 {
-			return Err(Error::Codec(anyhow::anyhow!(
+			return Err(Error::codec(anyhow::anyhow!(
 				"{what} {self}: dimensions must be non-zero"
 			)));
 		}
@@ -115,7 +115,7 @@ mod tests {
 	fn validate_encodable_rejects_unrepresentable_sizes() {
 		// A frame nobody can encode, but whose arithmetic still fits: the backend
 		// decides, not us.
-		let rate = Rate::new(30, 1).unwrap();
+		let rate = FrameRate::new(30, 1).unwrap();
 		assert!(Size::new(65534, 65534).validate_encodable("frame", rate).is_ok());
 
 		// pixels x framerate overflows u64.
@@ -126,7 +126,7 @@ mod tests {
 		);
 		// ...and it is the product that matters, not either side alone.
 		assert!(Size::new(u32::MAX - 1, 2).validate_encodable("frame", rate).is_ok());
-		let extreme = Rate::new(crate::rate::MAX_FRAMES_PER_SECOND, 1).unwrap();
+		let extreme = FrameRate::new(crate::frame_rate::MAX_FRAMES_PER_SECOND, 1).unwrap();
 		assert!(
 			Size::new(u32::MAX - 1, u32::MAX - 1)
 				.validate_encodable("frame", extreme)

@@ -13,28 +13,45 @@ let
   # Helper function to get crate info from Cargo.toml
   crateInfo = cargoTomlPath: craneLib.crateNameFromCargoToml { cargoToml = cargoTomlPath; };
 
-  # moq-video embeds a vendored PTX kernel at compile time, so every package
-  # source that may pull it in must preserve PTX alongside Cargo's sources.
+  # moq-video embeds PTX and moq-webrtc embeds crypto validation data at compile
+  # time, so packages must preserve these alongside Cargo's sources.
   filterCargoSources =
-    path: type: (final.lib.hasSuffix ".ptx" path) || (craneLib.filterCargoSources path type);
+    path: type:
+    (final.lib.hasSuffix ".ptx" path)
+    || (
+      (final.lib.hasInfix "/rs/moq-webrtc/src/vendor/dimpl/crypto/validation/" path)
+      && ((final.lib.hasSuffix ".der" path) || (final.lib.hasSuffix ".bin" path))
+    )
+    || (craneLib.filterCargoSources path type);
   cleanCargoSource = final.lib.cleanSourceWith {
     src = ../.;
     name = "source";
     filter = filterCargoSources;
   };
 
-  # rs/kio on its own, so the dependency layer below only rebuilds when kio does.
-  kioSource = final.lib.cleanSourceWith {
-    src = ../rs/kio;
-    name = "kio-source";
-    filter = filterCargoSources;
-  };
+  # Keep the patched registry dependency and its macro implementation together.
+  dependencySources =
+    final.lib.mapAttrs
+      (
+        path: src:
+        final.lib.cleanSourceWith {
+          inherit src;
+          name = "${baseNameOf path}-source";
+          filter = filterCargoSources;
+        }
+      )
+      {
+        "rs/kio" = ../rs/kio/src;
+        "rs/kio/macros" = ../rs/kio/macros/src;
+      };
 
   # `[patch.crates-io] kio = { path = "rs/kio" }` in the root Cargo.toml points
-  # registry crates (web-transport-iroh) at the workspace
+  # registry crates (the moq-auth 0.2.1 fixture) at the workspace
   # member. crane's dependency-only stage stubs every workspace crate down to an
   # empty lib.rs, so those registry crates no longer find kio's API and fail to
-  # compile. Put kio's real source back into the dummy tree.
+  # compile. Put kio and its macro crate back into the dummy tree, but keep crane's
+  # cleaned manifest: the real one inherits `workspace.lints`, which the dummy
+  # root manifest drops.
   #
   # Skip crane's check phase: `cargo test` runs a binary's tests as threads of
   # one process, so tests that pass CI's nextest (a process per test) can
@@ -45,11 +62,13 @@ let
       args
       // {
         doCheck = false;
-        extraDummyScript = ''
-          rm -rf $out/rs/kio
-          cp -r ${kioSource} --no-target-directory $out/rs/kio
-          chmod -R +w $out/rs/kio
-        '';
+        extraDummyScript = final.lib.concatStringsSep "\n" (
+          final.lib.mapAttrsToList (path: source: ''
+            rm -rf "$out/${path}/src"
+            cp -r ${source} --no-target-directory "$out/${path}/src"
+            chmod -R +w "$out/${path}/src"
+          '') dependencySources
+        );
       }
     );
 
@@ -129,11 +148,6 @@ let
     cargoExtraArgs = "-p moq-c --features openh264";
     nativeBuildInputs = with final; [
       pkg-config
-      # moq-c is the only nix-built package that pulls moq-video, and its `vaapi`
-      # feature brings moq-vaapi, whose build.rs runs bindgen over its vendored
-      # libva headers. Sets LIBCLANG_PATH + BINDGEN_EXTRA_CLANG_ARGS so it finds
-      # libclang and the libc headers, same as the devShell in flake.nix.
-      rustPlatform.bindgenHook
     ];
 
     # moq-c is a staticlib; crane's default install phase only handles
@@ -166,7 +180,7 @@ let
       # Resolve the paths the way a consumer's pkg-config will, so a template
       # whose libdir or includedir misses what this prefix ships fails here.
       for check in libdir:libmoq.a includedir:moq.h; do
-        dir=$(PKG_CONFIG_PATH=$out/lib/pkgconfig pkg-config --variable="''${check%%:*}" moq-c)
+        dir=$(pkg-config --variable="''${check%%:*}" "$pc")
         if [ ! -f "$dir/''${check#*:}" ]; then
           echo "moq-c.pc ''${check%%:*} $dir has no ''${check#*:}" >&2
           exit 1

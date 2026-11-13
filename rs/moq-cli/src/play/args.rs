@@ -7,25 +7,12 @@ use std::time::Duration;
 
 use moq_mux::catalog::CatalogFormat;
 
-use crate::subscribe::{CatalogFormatArg, SelectArgs};
+use crate::subscribe::{CatalogFormatArg, Mode, SelectArgs};
 
-/// The longest delay the speaker can hold, which is what bounds `--delay`.
-///
-/// Duplicated from `moq_audio::playback::Input::LATENCY_MAX` because this module
-/// compiles without the `play` feature, and so without that crate. The test
-/// below pins the two together in a build that has both.
-const DELAY_MAX: Duration = Duration::from_secs(10);
+use moq_mux::container::DELAY_MAX;
 
-/// How long `auto` waits on a stalled group before skipping it.
-///
-/// The estimate only sees what the container hands over, and a skipped group is
-/// never handed over, so a budget under the estimate's ceiling would cap the
-/// target at the budget it was cut to. Two seconds is that ceiling, the most
-/// lateness the estimate can represent.
-const AUTO_MAX_DELAY: Duration = Duration::from_secs(2);
-
-/// How far video alone trails the live edge under `auto`. The estimate is
-/// audio's; video follows the speaker whenever there is one.
+/// How far playback trails the live edge under `auto` while audio holds no
+/// estimate, as when there is none: video has no estimator of its own.
 const AUTO_VIDEO_DELAY: Duration = Duration::from_millis(100);
 
 /// How far playback trails the live edge.
@@ -77,6 +64,17 @@ pub struct Args {
 	#[usage(long, default = "auto")]
 	pub delay: Delay,
 
+	/// How far audio may trail the clock before it skips ahead, or `0` to turn the time stretch off.
+	///
+	/// After a stall, audio slows down and falls behind the clock rather than dropping what
+	/// arrives late, then speeds up until it is back on it; only what trails by more than this
+	/// is skipped. Every subscription waits on a stalled group for the delay plus this, so the
+	/// late audio still arrives. Zero plays received audio unaltered: late audio is skipped, an
+	/// underrun is silence, and drift against the publisher's clock is corrected by a small
+	/// skip or pad. Video stays on the clock either way.
+	#[usage(long, default = "2s")]
+	pub stretch: moq_tokio::cli::Duration,
+
 	/// Rendition selection by track name or codec.
 	#[usage(flatten)]
 	pub select: SelectArgs,
@@ -84,11 +82,24 @@ pub struct Args {
 	/// Write what the speaker played to this file, one JSON sample per line every 250ms.
 	///
 	/// Each line has the playhead, the playout target, the render quanta the speaker played
-	/// and how many were quiet, and the gaps and stalls since the line before, in the metric
-	/// schema of `test/audio-quality`, whose analyzer reduces it to underruns, skips, and
-	/// silence. Audio only, so it needs `--no-video`.
-	#[usage(long, requires = "--no-video", value_name = "PATH", value_hint = usage_rs::ValueHint::FilePath, extensions("ndjson"))]
+	/// and how many were quiet, the received audio trimmed and accelerated away, and the gaps
+	/// and stalls since the line before, in the metric schema of `test/audio-quality`, whose
+	/// analyzer reduces it to underruns, trims, and silence. Audio only, so it needs
+	/// `--video off`.
+	#[usage(long, value_name = "PATH", value_hint = usage_rs::ValueHint::FilePath, extensions("ndjson"))]
 	pub metrics: Option<PathBuf>,
+
+	/// The VA-API render node, such as `/dev/dri/renderD129`. Defaults to the
+	/// first that encodes, decodes, and scales.
+	#[cfg(all(target_os = "linux", feature = "vaapi"))]
+	#[usage(long, env = "MOQ_VAAPI_DEVICE", value_hint = usage_rs::ValueHint::FilePath)]
+	pub vaapi_device: Option<std::path::PathBuf>,
+
+	/// The V4L2 M2M decoder node, such as `/dev/video10`. Defaults to the first
+	/// that decodes H.264.
+	#[cfg(all(target_os = "linux", feature = "v4l2"))]
+	#[usage(long, env = "MOQ_V4L2_DECODER", value_hint = usage_rs::ValueHint::FilePath)]
+	pub v4l2_decoder: Option<std::path::PathBuf>,
 }
 
 impl Args {
@@ -107,23 +118,31 @@ impl Args {
 		}
 	}
 
-	/// How long a stalled group is waited on before it is skipped.
+	/// How long a stalled audio group is waited on before it is skipped, while
+	/// the shared delay is still the configured one: the delay plus the stretch.
+	/// A shared delay past it grows the budget by the excess.
 	pub(super) fn max_delay(&self) -> Duration {
-		self.fixed_delay().unwrap_or(AUTO_MAX_DELAY)
+		self.fixed_delay().unwrap_or_default() + self.stretch()
 	}
 
-	/// How far video trails the live edge while no speaker is setting the pace.
+	/// How far audio may trail the clock before it skips ahead; zero turns the time stretch off.
+	pub(super) fn stretch(&self) -> Duration {
+		self.stretch.into()
+	}
+
+	/// How far playback trails the live edge while no audio estimate sets it.
 	pub(super) fn video_delay(&self) -> Duration {
 		self.fixed_delay().unwrap_or(AUTO_VIDEO_DELAY)
 	}
 
-	/// How long a stalled video group is waited on, given the catalog's audio.
+	/// How long a stalled video group is waited on, given the catalog's audio:
+	/// video's delay plus the stretch, as audio's.
 	///
 	/// With no enabled speaker to follow, the playhead is video's own, so waiting
-	/// on the audio estimate's budget would only freeze the picture.
+	/// on audio's budget would only freeze the picture.
 	pub(super) fn video_max_delay(&self, audio: &hang::catalog::Audio) -> Duration {
 		match audio.enabled().next() {
-			Some(_) => self.max_delay(),
+			Some(_) => self.video_delay() + self.stretch(),
 			None => self.video_delay(),
 		}
 	}
@@ -136,6 +155,12 @@ impl Args {
 	/// decode, leaving a blank window rather than an error.
 	pub fn validate(&self) -> anyhow::Result<()> {
 		use crate::subscribe::VideoCodecArg;
+
+		self.select.validate()?;
+		anyhow::ensure!(
+			self.metrics.is_none() || self.select.video == Some(Mode::Off),
+			"--metrics needs audio-only playback: pass --video off"
+		);
 
 		anyhow::ensure!(
 			cfg!(feature = "vpx") || !matches!(self.select.video_codec, Some(VideoCodecArg::Vp8 | VideoCodecArg::Vp9)),
@@ -189,46 +214,56 @@ mod tests {
 	/// Playback can leave a role out, but not both, and not one it also narrows.
 	#[test]
 	fn a_role_can_be_left_out() {
-		let selection = parse(&["--no-video"]).select.selection(None);
+		let selection = parse(&["--video", "off"]).select.selection(None);
 		assert!(!selection.has_video());
 		assert!(selection.has_audio());
 
 		for refused in [
-			["--no-video", "--no-audio"].as_slice(),
-			&["--no-video", "--video-codec", "h264"],
-			&["--no-audio", "--audio-name", "stereo"],
+			["--video", "off", "--audio", "off"].as_slice(),
+			&["--video", "off", "--video-codec", "h264"],
+			&["--audio", "off", "--audio-name", "stereo"],
 		] {
-			let argv: Vec<&std::ffi::OsStr> = refused.iter().map(std::ffi::OsStr::new).collect();
-			assert!(Cli::parse_from(&argv).is_err(), "{refused:?} parsed");
+			assert!(parse(refused).validate().is_err(), "{refused:?} must be refused");
 		}
 	}
 
 	/// The metrics count the speaker alone, so they need audio-only playback.
 	#[test]
 	fn metrics_need_audio_only_playback() {
-		let args = parse(&["--no-video", "--metrics", "play.ndjson"]);
+		let args = parse(&["--video", "off", "--metrics", "play.ndjson"]);
 		assert_eq!(args.metrics, Some(PathBuf::from("play.ndjson")));
-		let argv: Vec<&std::ffi::OsStr> = ["--metrics", "play.ndjson"].iter().map(std::ffi::OsStr::new).collect();
-		assert!(Cli::parse_from(&argv).is_err(), "--metrics parsed without --no-video");
+		args.validate().unwrap();
+		for flags in [
+			["--metrics", "play.ndjson"].as_slice(),
+			&["--video", "on", "--metrics", "play.ndjson"],
+			&["--video", "off", "--audio", "off", "--metrics", "play.ndjson"],
+		] {
+			assert!(parse(flags).validate().is_err(), "{flags:?}");
+		}
 	}
 
-	/// A fixed delay is the playout offset and the staleness budget at once.
+	/// A fixed delay is the playout offset, and with the stretch the staleness budget.
 	#[test]
 	fn a_fixed_delay_sets_the_staleness_budget() {
 		let args = parse(&["--delay", "500ms"]);
 		assert_eq!(args.fixed_delay(), Some(Duration::from_millis(500)));
-		assert_eq!(args.max_delay(), Duration::from_millis(500));
+		assert_eq!(args.max_delay(), Duration::from_millis(2500));
 		assert_eq!(args.video_delay(), Duration::from_millis(500));
+
+		let args = parse(&["--delay", "500ms", "--stretch", "0"]);
+		assert_eq!(args.max_delay(), Duration::from_millis(500));
+		let args = parse(&["--delay", "500ms", "--stretch", "200ms"]);
+		assert_eq!(args.max_delay(), Duration::from_millis(700));
 	}
 
-	/// The default measures the delay, and waits on a stalled group as long as the
-	/// estimate can see, so the budget never caps what it measures.
+	/// The default measures the delay, and waits on a stalled group for the stretch past it.
 	#[test]
 	fn the_delay_defaults_to_the_estimate() {
 		let args = parse(&[]);
 		assert_eq!(args.delay, Delay::Auto);
 		assert_eq!(args.fixed_delay(), None);
-		assert_eq!(args.max_delay(), AUTO_MAX_DELAY);
+		assert_eq!(args.stretch(), Duration::from_secs(2));
+		assert_eq!(args.max_delay(), Duration::from_secs(2));
 		assert_eq!(parse(&["--delay", "auto"]).delay, Delay::Auto);
 		assert_eq!(Delay::Auto.to_string(), "auto");
 		assert_eq!(Delay::Fixed(Duration::from_millis(250)).to_string(), "250ms");
@@ -243,7 +278,7 @@ mod tests {
 
 		let config = hang::catalog::AudioConfig::new(hang::catalog::AudioCodec::Opus, 48_000, 2);
 		audio.renditions.insert("audio".into(), config);
-		assert_eq!(args.video_max_delay(&audio), AUTO_MAX_DELAY);
+		assert_eq!(args.video_max_delay(&audio), AUTO_VIDEO_DELAY + args.stretch());
 
 		audio.renditions.get_mut("audio").unwrap().enabled = false;
 		assert_eq!(args.video_max_delay(&audio), AUTO_VIDEO_DELAY);
@@ -267,11 +302,6 @@ mod tests {
 		assert!(err.contains("--delay must be at most"), "{err}");
 		parse(&["--delay", "10s"]).validate().unwrap();
 		parse(&["--delay", "auto"]).validate().unwrap();
-
-		// The bound has to be the sink's own, which only a build carrying the sink
-		// can say.
-		#[cfg(feature = "play")]
-		assert_eq!(DELAY_MAX, moq_audio::playback::Input::LATENCY_MAX);
 	}
 
 	/// The suffix picks the format, and the flag overrides it.
@@ -281,8 +311,8 @@ mod tests {
 		assert_eq!(parse(&[]).catalog_format("room.msf"), CatalogFormat::Msf);
 		assert_eq!(parse(&[]).catalog_format("room"), CatalogFormat::DEFAULT);
 		assert_eq!(
-			parse(&["--catalog-format", "hangz"]).catalog_format("room.msf"),
-			CatalogFormat::HangZ
+			parse(&["--catalog-format", "hang"]).catalog_format("room.msf"),
+			CatalogFormat::Hang
 		);
 	}
 }

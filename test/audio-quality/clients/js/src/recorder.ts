@@ -2,7 +2,7 @@
  * The recorder page: subscribes to a broadcast's audio and stamps each frame as it comes off its
  * group's stream, which is where the player's container consumer receives it.
  *
- * Built only on the public `@moq/net` and `@moq/hang` surface, so it records the path a viewer's
+ * Built on the same transport, container and codec-duration readers, so it records the path a viewer's
  * player takes (a WebTransport session in Chromium, every group on its own stream) without a debug
  * hook in the player. It reads groups the way `Container.Consumer` does, concurrently and decoded
  * with the same format, but stamps them before the consumer's in-order delivery: a group the
@@ -16,14 +16,14 @@
  * @module
  */
 
-import { Milli } from "@moq/clock";
+import { Duration } from "@moq/clock";
 import * as Catalog from "@moq/hang/catalog";
 import * as Moq from "@moq/net";
 import { format, arrivals as readArrivals } from "./capture.ts";
 import type { Arrival } from "./schema.ts";
 
 /** How far back the relay may serve a group. Long, so a late group is recorded rather than dropped. */
-const MAX_DELAY = Milli(10_000);
+const MAX_DELAY = Duration.millis(10_000);
 
 /** What the recorder has, until the driver drains it. */
 export type Recorder = {
@@ -66,7 +66,9 @@ async function record(): Promise<void> {
 
 	let rtt: number | null = null;
 	connection.probe.subscribe((probe) => {
-		if (probe.rtt !== undefined) rtt = rtt === null ? probe.rtt : Math.min(rtt, probe.rtt);
+		if (probe.rtt === undefined) return;
+		const sample = probe.rtt.asMillis();
+		rtt = rtt === null ? sample : Math.min(rtt, sample);
 	});
 
 	const request = origin.request(Moq.Path.from(required("broadcast")));
@@ -88,7 +90,7 @@ async function record(): Promise<void> {
 	if (!name || !config) throw new Error("the catalog ended without an audio rendition");
 
 	const decoder = format(config);
-	const track = broadcast.track(name).subscribe({ priority: Catalog.PRIORITY.audio, maxDelay: MAX_DELAY });
+	const track = broadcast.track(name).subscribe({ priority: Catalog.PRIORITY.audio, delay: { max: MAX_DELAY } });
 	info = {
 		transport: connection.transport,
 		get rtt() {
@@ -101,7 +103,7 @@ async function record(): Promise<void> {
 		const group = await track.recvGroup();
 		if (!group) throw new Error("the track ended");
 		(async () => {
-			for await (const arrival of readArrivals(group, decoder)) arrivals.push(arrival);
+			for await (const arrival of readArrivals(group, { decoder, config })) arrivals.push(arrival);
 		})().catch(fail);
 	}
 }

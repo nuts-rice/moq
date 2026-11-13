@@ -1,3 +1,4 @@
+use moq_net::track::Delay;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::task::Poll;
 use std::time::Duration;
@@ -8,10 +9,10 @@ use mp4_atom::DecodeMaybe;
 
 use crate::Result;
 use crate::catalog::Stream;
-use crate::container::ExportSource;
 use crate::container::Frame;
 use crate::container::consumer::Event;
 use crate::container::fmp4::Error;
+use crate::container::{ExportSource, Resume};
 use moq_net::Timestamp;
 
 /// How much media a track may queue while another track waits for its codec configuration.
@@ -32,10 +33,10 @@ const INIT_QUEUE: Duration = Duration::from_secs(30);
 /// (un)subscribes per-rendition tracks as the catalog changes, decodes both Legacy and
 /// CMAF tracks via a per-track source, and re-encodes everything as a merged init
 /// segment + moof+mdat fragments, each track in presentation-timestamp order (see
-/// [`next`](Self::next) for how far that holds across tracks). This is what an fMP4
+/// [`poll_next`](Self::poll_next) for how far that holds across tracks). This is what an fMP4
 /// player (e.g. ffplay, MSE) expects.
 ///
-/// Use [`next`](Self::next) to pull byte chunks: the first call returns the merged
+/// Use [`poll_next`](Self::poll_next) to pull byte chunks: the first call returns the merged
 /// init segment (ftyp + multi-track moov), subsequent calls return moof+mdat
 /// fragments. By default a fragment is a group, emitted when the group closes. A video
 /// keyframe also rolls the fragment within a group; audio follows publisher cuts. [`with_fragment_duration`](Self::with_fragment_duration) caps the
@@ -50,10 +51,12 @@ const INIT_QUEUE: Duration = Duration::from_secs(30);
 /// (`enabled: false`) does, is unsubscribed and idles. On its return it is resubscribed after
 /// the last group read, under the track it was declared as, when its sample entry is
 /// unchanged. That comparison covers the catalog-derived record, so an Annex-B encoder that
-/// restarts with a new parameter set can return. A new rendition, a changed sample entry, or
-/// a return that replays media already written fails the export.
+/// restarts with a new parameter set can return. A rendition the catalog moves to another
+/// track (a new `track` or `broadcast`) continues under its declared track the same way, from
+/// the new track's first sync sample past what was read. A new rendition, a changed sample
+/// entry, or a return that replays media already written fails the export.
 ///
-/// [`next_chunk`](Self::next_chunk) returns the same bytes as a [`Chunk`], which
+/// [`poll_next_chunk`](Self::poll_next_chunk) returns the same bytes as a [`Chunk`], which
 /// separates the init segment from a [`Fragment`] carrying whether it begins at a
 /// sync sample and how long it lasts. A segmenting consumer (e.g. an HLS/LL-HLS
 /// packager) needs that to map fragments onto segments and parts; narrow the catalog
@@ -61,20 +64,24 @@ const INIT_QUEUE: Duration = Duration::from_secs(30);
 /// fragments belong to one track.
 pub struct Export<S: Stream> {
 	source: crate::Source,
-	catalog: Option<S>,
-	max_delay: Duration,
+	catalog: Feed<S>,
+	delay: Delay,
 	fragment_duration: Option<Duration>,
 
-	/// Every track by rendition name. Before the init a rendition that leaves the catalog
-	/// is dropped; after it, the track stays so a returning rendition reuses its id.
+	/// The tracks being read, by rendition name. Before the init a rendition that leaves the
+	/// catalog is dropped; after it, the track moves to `departed` once written out.
 	tracks: HashMap<String, Fmp4Track>,
 
-	/// Fragments cut before the init segment, written right after it in the order they
-	/// were cut.
-	queued: VecDeque<(String, Fragment)>,
+	/// Renditions that left the catalog after the init, kept out of the polled set so one
+	/// returning reuses its track. A late rendition that wrote nothing is dropped instead,
+	/// so a publisher cycling names holds only what it recorded.
+	departed: HashMap<String, Fmp4Track>,
 
-	/// Set after the init segment has been emitted, which fixes the track set.
-	init_emitted: bool,
+	init: Init,
+
+	/// Keep a rendition that joins after the init segment instead of failing, for a writer
+	/// that declares it elsewhere. Its fragments carry a track id the init never declared.
+	late: bool,
 
 	/// The `tkhd.track_id` the next new rendition gets.
 	next_track_id: u32,
@@ -87,6 +94,50 @@ pub struct Export<S: Stream> {
 	/// fragment. Each track's own numbers still ascend within the shared sequence, which
 	/// is what CMAF asks for.
 	sequence_number: u32,
+}
+
+/// Where the catalog subscription stands.
+enum Feed<S> {
+	Live(S),
+	/// The publisher ended the catalog.
+	Ended,
+	/// [`Export::stop`] dropped it, so media no track could be described for is discarded.
+	Stopped,
+}
+
+impl<S> Feed<S> {
+	fn live(&self) -> bool {
+		matches!(self, Feed::Live(_))
+	}
+}
+
+/// Whether the init segment went out, which fixes the track set.
+enum Init {
+	/// Fragments cut before the init segment, written right after it in the order they were cut.
+	Waiting(VecDeque<(String, Fragment)>),
+	/// `first_late` is the first track id the init does not declare, and `queued` the
+	/// fragments cut while it waited, still to go out.
+	Written {
+		first_late: u32,
+		queued: VecDeque<Fragment>,
+	},
+}
+
+impl Init {
+	fn written(&self) -> bool {
+		matches!(self, Init::Written { .. })
+	}
+
+	/// The init segment went out, declaring every track id below `first_late`.
+	fn write(&mut self, first_late: u32) {
+		if let Init::Waiting(queued) = self {
+			let queued = std::mem::take(queued)
+				.into_iter()
+				.map(|(_, fragment)| fragment)
+				.collect();
+			*self = Init::Written { first_late, queued };
+		}
+	}
 }
 
 /// One emitted CMAF chunk: the init segment, then media fragments.
@@ -153,23 +204,45 @@ pub struct Fragment {
 }
 
 /// A rendition's latest catalog entry.
-// One per rendition, so the variant sizes never add up to an allocation's worth.
-#[allow(clippy::large_enum_variant)]
+#[allow(
+	clippy::large_enum_variant,
+	reason = "one per rendition, so the variant sizes never add up to an allocation's worth; only large when extra features grow the video config"
+)]
 enum Rendition {
 	Video(VideoConfig),
 	Audio(AudioConfig),
 }
 
 impl Rendition {
-	fn subscribe(&self, source: &crate::Source, name: &str, max_delay: Duration) -> Result<Option<ExportSource>> {
+	fn subscribe(&self, source: &crate::Source, name: &str, delay: Delay) -> Result<Option<ExportSource>> {
 		match self {
-			Rendition::Video(config) => ExportSource::for_fmp4_video(source, name, config, max_delay),
-			Rendition::Audio(config) => ExportSource::for_audio(source, name, config, max_delay),
+			Rendition::Video(config) => ExportSource::for_fmp4_video(source, name, config, delay),
+			Rendition::Audio(config) => ExportSource::for_audio(source, name, config, delay),
+		}
+	}
+
+	/// Whether `export` still reads the track this entry names.
+	fn read_by(&self, export: &ExportSource, source: &crate::Source, name: &str) -> bool {
+		match self {
+			Rendition::Video(config) => export.reads(source, name, config),
+			Rendition::Audio(config) => export.reads(source, name, config),
 		}
 	}
 
 	fn is_video(&self) -> bool {
 		matches!(self, Rendition::Video(_))
+	}
+
+	/// Whether frames may present out of decode order: what the catalog's `reorder` declares,
+	/// else whatever the codec allows.
+	fn may_reorder(&self) -> bool {
+		match self {
+			Rendition::Video(config) => match config.reorder {
+				Some(depth) => depth > 0,
+				None => crate::codec::video::max_reorder(config) > 0,
+			},
+			Rendition::Audio(_) => false,
+		}
 	}
 
 	/// Fallback duration for a trailing frame that carries no per-sample duration.
@@ -194,9 +267,107 @@ struct Declaration {
 	provisional: bool,
 }
 
+/// Where a track's subscription stands.
+enum Phase {
+	/// Reading the rendition's subscription.
+	Reading(Subscription),
+	/// The subscription ended while the rendition stays in the catalog.
+	Ended(Subscription),
+	/// The rendition left the catalog after the init. One that returns resumes here.
+	Departed(Resume),
+	/// [`Export::stop`] ended the read.
+	Stopped,
+}
+
+/// A track's subscription to its rendition.
+struct Subscription {
+	source: ExportSource,
+	/// Checked against the track's declaration. Until then its frames are dropped: they
+	/// come before the codec configuration they need.
+	described: bool,
+}
+
+/// A run of frames that becomes one fragment.
+struct Batch {
+	frames: Vec<Frame>,
+	/// The first frame was a keyframe, so the fragment can start an HLS segment.
+	/// Meaningless for audio.
+	independent: bool,
+}
+
+/// The frames a track accumulates for its next moof+mdat, flushed when the next frame
+/// opens a group or on the duration cap.
+#[derive(Default)]
+enum Buffer {
+	#[default]
+	Empty,
+	Open(Batch),
+	/// The source group closed, so the fragment can be emitted.
+	Closed(Batch),
+}
+
+impl Buffer {
+	fn batch(&self) -> Option<&Batch> {
+		match self {
+			Buffer::Empty => None,
+			Buffer::Open(batch) | Buffer::Closed(batch) => Some(batch),
+		}
+	}
+
+	fn is_empty(&self) -> bool {
+		self.batch().is_none()
+	}
+
+	fn is_closed(&self) -> bool {
+		matches!(self, Buffer::Closed(_))
+	}
+
+	fn first(&self) -> Option<&Frame> {
+		self.batch()?.frames.first()
+	}
+
+	fn last(&self) -> Option<&Frame> {
+		self.batch()?.frames.last()
+	}
+
+	fn last_mut(&mut self) -> Option<&mut Frame> {
+		match self {
+			Buffer::Empty => None,
+			Buffer::Open(batch) | Buffer::Closed(batch) => batch.frames.last_mut(),
+		}
+	}
+
+	/// Append to the open run, or open one with `frame`.
+	fn push(&mut self, frame: Frame) {
+		match self {
+			Buffer::Open(batch) => batch.frames.push(frame),
+			_ => {
+				*self = Buffer::Open(Batch {
+					independent: frame.keyframe,
+					frames: vec![frame],
+				})
+			}
+		}
+	}
+
+	/// End the open run, so its fragment can go out.
+	fn close(&mut self) {
+		*self = match std::mem::take(self) {
+			Buffer::Open(batch) => Buffer::Closed(batch),
+			buffer => buffer,
+		};
+	}
+
+	fn take(&mut self) -> Option<Batch> {
+		match std::mem::take(self) {
+			Buffer::Empty => None,
+			Buffer::Open(batch) | Buffer::Closed(batch) => Some(batch),
+		}
+	}
+}
+
 struct Fmp4Track {
-	/// The subscription while the rendition is in the catalog.
-	source: Option<ExportSource>,
+	phase: Phase,
 
 	config: Rendition,
 
@@ -204,20 +375,10 @@ struct Fmp4Track {
 	/// must keep its sample entry, except to settle a provisional one.
 	declaration: Option<Declaration>,
 
-	/// The current subscription has been checked against `declaration`. Until then its
-	/// frames are dropped: they come before the codec configuration they need.
-	described: bool,
-
 	/// The next decoded frame from the source, used for cross-track timestamp ordering.
 	pending: Option<Frame>,
 
-	/// Frames accumulated for the current fragment. Flushed as a single
-	/// moof+mdat when the next frame opens a group, or on the duration cap.
-	buffer: Vec<Frame>,
-
-	/// Whether the first frame of the current `buffer` was a keyframe, i.e. the
-	/// fragment it produces can start an HLS segment. Meaningless for audio.
-	buffer_independent: bool,
+	buffer: Buffer,
 
 	/// True if this track is video. Its samples are independently decodable only
 	/// at a keyframe; audio samples always are.
@@ -230,16 +391,17 @@ struct Fmp4Track {
 	/// (Legacy / LOC sources). Derived from the catalog framerate / sample rate.
 	default_frame: Duration,
 
-	/// Whether the source has signalled end-of-track, or the rendition left the catalog.
-	finished: bool,
-	/// The group of the last frame read, where a resubscription resumes after.
-	group: Option<u64>,
-	/// The source group closed, so its buffered fragment can be emitted.
-	group_finished: bool,
-
 	/// The latest presentation time written, so a resubscription that replays it fails
 	/// instead of writing the track's history twice.
 	written: Option<Duration>,
+
+	/// Where the last written fragment's decode timeline ended, in ticks at `timescale`.
+	///
+	/// A fragment cut inside a GOP continues from here rather than anchoring at its first
+	/// frame's presentation time: with reordered video that frame is often a reference
+	/// presented after the B-frames decoded next, so its presentation time would put the
+	/// fragment's `tfdt` ahead of the one that follows.
+	decode_end: Option<u64>,
 
 	/// The first presentation time read before the init segment, which bounds how much
 	/// media queues behind it.
@@ -258,20 +420,19 @@ impl Fmp4Track {
 			Rendition::Audio(config) => catalog_timescale_audio(config)?,
 		};
 		Ok(Self {
-			source: Some(source),
+			phase: Phase::Reading(Subscription {
+				source,
+				described: false,
+			}),
 			is_video: config.is_video(),
 			opus: matches!(&config, Rendition::Audio(config) if matches!(config.codec, AudioCodec::Opus)),
 			default_frame: config.default_frame(),
 			config,
 			declaration: None,
-			described: false,
 			pending: None,
-			buffer: Vec::new(),
-			buffer_independent: false,
-			finished: false,
-			group: None,
-			group_finished: false,
+			buffer: Buffer::Empty,
 			written: None,
+			decode_end: None,
 			backlog: None,
 			track_id,
 			timescale,
@@ -291,13 +452,54 @@ impl Fmp4Track {
 			.map(|frame| Duration::from(frame.timestamp))
 	}
 
+	/// The subscription, while the rendition is in the catalog.
+	fn subscription(&self) -> Option<&Subscription> {
+		match &self.phase {
+			Phase::Reading(subscription) | Phase::Ended(subscription) => Some(subscription),
+			Phase::Departed(_) | Phase::Stopped => None,
+		}
+	}
+
+	fn subscription_mut(&mut self) -> Option<&mut Subscription> {
+		match &mut self.phase {
+			Phase::Reading(subscription) | Phase::Ended(subscription) => Some(subscription),
+			Phase::Departed(_) | Phase::Stopped => None,
+		}
+	}
+
+	/// Nothing more will be read: the subscription ended, or the rendition left.
+	fn finished(&self) -> bool {
+		!matches!(self.phase, Phase::Reading(_))
+	}
+
+	fn described(&self) -> bool {
+		self.subscription().is_some_and(|subscription| subscription.described)
+	}
+
+	/// The source signalled end-of-track.
+	fn end(&mut self) {
+		self.phase = match std::mem::replace(&mut self.phase, Phase::Stopped) {
+			Phase::Reading(subscription) => Phase::Ended(subscription),
+			phase => phase,
+		};
+	}
+
+	/// The rendition left the catalog after the init: end the subscription, keeping where
+	/// it stopped for a return. What was already read still goes out.
+	fn depart(&mut self) {
+		self.phase = match std::mem::replace(&mut self.phase, Phase::Stopped) {
+			Phase::Reading(subscription) | Phase::Ended(subscription) => Phase::Departed(subscription.source.resume()),
+			phase => phase,
+		};
+	}
+
 	/// Apply a newer catalog entry for the same rendition.
 	fn reconfigure(&mut self, name: &str, config: Rendition) -> Result<()> {
 		if config.is_video() != self.is_video {
 			return Err(Error::TrackChanged(name.to_string()).into());
 		}
-		if let (Rendition::Video(video), Some(source)) = (&config, self.source.as_mut())
-			&& !source.note_catalog(video)
+		if let (Rendition::Video(video), Some(subscription)) = (&config, self.subscription_mut())
+			&& !subscription.source.note_catalog(video)
 		{
 			return Err(Error::TrackChanged(name.to_string()).into());
 		}
@@ -306,11 +508,20 @@ impl Fmp4Track {
 		self.describe(name)
 	}
 
-	/// Resubscribe a rendition that left the catalog after the init and came back.
+	/// End what the rendition read from the track it moved off: the frame read ahead is
+	/// dropped, and the buffered run goes out as a fragment of its own, before the new track's.
+	fn moved(&mut self) {
+		self.pending = None;
+		self.buffer.close();
+	}
+
+	/// Resubscribe a rendition that left the catalog after the init and came back, or moved
+	/// to another track.
 	fn rejoin(&mut self, name: &str, config: Rendition, source: ExportSource) -> Result<()> {
-		self.source = Some(source);
-		self.finished = false;
-		self.described = false;
+		self.phase = Phase::Reading(Subscription {
+			source,
+			described: false,
+		});
 		self.reconfigure(name, config)
 	}
 
@@ -335,7 +546,9 @@ impl Fmp4Track {
 			}
 			None => self.declaration = Some(declaration),
 		}
-		self.described = true;
+		if let Some(subscription) = self.subscription_mut() {
+			subscription.described = true;
+		}
 		Ok(())
 	}
 
@@ -349,7 +562,7 @@ impl Fmp4Track {
 			Rendition::Video(config) => match &config.container {
 				Container::Cmaf { init, .. } => init,
 				Container::Legacy | Container::Loc => {
-					let Some(source) = self.source.as_ref() else {
+					let Some(Subscription { source, .. }) = self.subscription() else {
 						return Ok(None);
 					};
 					if !source.header_ready() || !source.video_geometry_ready(config) {
@@ -456,24 +669,25 @@ impl<S: Stream> Export<S> {
 	pub fn new(source: crate::Source, catalog: S) -> Self {
 		Self {
 			source,
-			catalog: Some(catalog),
-			max_delay: Duration::ZERO,
+			catalog: Feed::Live(catalog),
+			delay: Delay::default(),
 			fragment_duration: None,
 			tracks: HashMap::new(),
-			queued: VecDeque::new(),
-			init_emitted: false,
+			departed: HashMap::new(),
+			init: Init::Waiting(VecDeque::new()),
+			late: false,
 			next_track_id: 1,
 			sequence_number: 1,
 		}
 	}
 
-	/// Set the max delay for each per-track source.
+	/// Set how far behind the live edge each per-track source plays: [`Delay::min`] is where it
+	/// starts, and [`Delay::max`] how late a group may fall before it is skipped.
 	///
-	/// See [`Consumer`](crate::container::Consumer) for the per-track skip behavior.
-	/// Defaults to
-	/// [`Duration::ZERO`] (skip aggressively).
-	pub fn with_max_delay(mut self, max_delay: Duration) -> Self {
-		self.max_delay = max_delay;
+	/// See [`Consumer`](crate::container::Consumer) for the per-track start and skip behavior.
+	/// Defaults to zero for both (start at the live edge, skip aggressively).
+	pub fn with_delay(mut self, delay: Delay) -> Self {
+		self.delay = delay;
 		self
 	}
 
@@ -488,11 +702,50 @@ impl<S: Stream> Export<S> {
 	/// marker; audio and samples with explicit durations remain immediate. Otherwise
 	/// the cap applies in addition to the group boundary.
 	///
+	/// A fragment cut inside a GOP continues the decode timeline where the previous one
+	/// ended, so B-frame video keeps increasing decode times. Such a fragment cannot see
+	/// the reordering around it, so unless the catalog declares `reorder: 0` (or the codec
+	/// never reorders), a video sample with unknown duration lasts no longer than the
+	/// catalog frame rate's cadence.
+	///
 	/// Accepts either `Duration` or `Option<Duration>` (where `None` restores
 	/// the per-group default).
 	pub fn with_fragment_duration(mut self, duration: impl Into<Option<Duration>>) -> Self {
 		self.fragment_duration = duration.into();
 		self
+	}
+
+	/// Keep renditions that join after the init segment, whose fragments then carry track
+	/// ids the init does not declare. See [`declaration`](Self::declaration).
+	pub(crate) fn with_late_tracks(mut self) -> Self {
+		self.late = true;
+		self
+	}
+
+	/// Stop reading the broadcast. The export still writes out the media it read, the
+	/// fragment each track was buffering included, then ends.
+	///
+	/// Stopping before the init segment could be written ends the export without writing.
+	pub(crate) fn stop(&mut self) {
+		self.catalog = Feed::Stopped;
+		for track in self.tracks.values_mut() {
+			track.phase = Phase::Stopped;
+		}
+	}
+
+	/// The `trak` and `trex` declaring `track_id`, once the track could be described.
+	pub(crate) fn declaration(&self, track_id: u32) -> Option<(&mp4_atom::Trak, &mp4_atom::Trex)> {
+		self.declarations()
+			.find(|(id, _, _)| *id == track_id)
+			.map(|(_, trak, trex)| (trak, trex))
+	}
+
+	/// Every track id with its `trak` and `trex`, the tracks being read first.
+	pub(crate) fn declarations(&self) -> impl Iterator<Item = (u32, &mp4_atom::Trak, &mp4_atom::Trex)> {
+		self.tracks.values().chain(self.departed.values()).filter_map(|track| {
+			let declaration = track.declaration.as_ref()?;
+			Some((track.track_id, &declaration.trak, &declaration.trex))
+		})
 	}
 
 	/// Get the next byte chunk.
@@ -510,24 +763,16 @@ impl<S: Stream> Export<S> {
 	/// needs: a demuxer indexes by track and reads `tfdt`. Narrow the catalog to a
 	/// single rendition with [`Stream::select`](crate::catalog::Stream::select) where
 	/// the order matters.
-	pub async fn next(&mut self) -> Result<Option<Bytes>> {
-		Ok(self.next_chunk().await?.map(Chunk::into_data))
-	}
-
-	/// Poll-based variant of [`Self::next`].
+	#[cfg_attr(feature = "async", kio::wrapper)]
 	pub fn poll_next(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Bytes>>> {
 		Poll::Ready(Ok(
 			std::task::ready!(self.poll_next_chunk(waiter)?).map(Chunk::into_data)
 		))
 	}
 
-	/// Like [`next`](Self::next) but returns a [`Chunk`], which tells the init segment
+	/// Like [`poll_next`](Self::poll_next) but gets a [`Chunk`], which tells the init segment
 	/// apart from a [`Fragment`] and carries that fragment's segmenting metadata.
-	pub async fn next_chunk(&mut self) -> Result<Option<Chunk>> {
-		kio::wait(|waiter| self.poll_next_chunk(waiter)).await
-	}
-
-	/// Poll-based variant of [`Self::next_chunk`].
+	#[cfg_attr(feature = "async", kio::wrapper)]
 	pub fn poll_next_chunk(&mut self, waiter: &kio::Waiter) -> Poll<Result<Option<Chunk>>> {
 		// Appending a frame to a track's buffer restarts the search for work by
 		// going around this loop again, never by re-entering the function: a
@@ -535,11 +780,11 @@ impl<S: Stream> Export<S> {
 		// samples that is.
 		loop {
 			// 1. Drain catalog updates and (un)subscribe tracks accordingly.
-			while let Some(catalog) = self.catalog.as_mut() {
+			while let Feed::Live(catalog) = &mut self.catalog {
 				match catalog.poll_next(waiter)? {
-					Poll::Ready(Some(snapshot)) => self.update_catalog(&snapshot.media())?,
+					Poll::Ready(Some(snapshot)) => self.update_catalog(&snapshot.without_ext())?,
 					Poll::Ready(None) => {
-						self.catalog = None;
+						self.catalog = Feed::Ended;
 						break;
 					}
 					Poll::Pending => break,
@@ -553,17 +798,16 @@ impl<S: Stream> Export<S> {
 			// A track that can't be described yet drops its frames, so the source keeps
 			// polling for the SPS/PPS-bearing keyframe instead of parking.
 			for (name, track) in &mut self.tracks {
-				if track.pending.is_some() || track.finished || track.group_finished {
+				if track.pending.is_some() || track.buffer.is_closed() {
 					continue;
 				}
-				while let Some(source) = track.source.as_mut() {
-					match source.poll_event(waiter)? {
+				while let Phase::Reading(subscription) = &mut track.phase {
+					match subscription.source.poll_event(waiter)? {
 						Poll::Ready(Some(Event::Frame { frame, .. })) => {
-							track.group = source.group();
 							// A keyframe may carry new parameter sets, so check it still matches.
-							if !track.described || frame.keyframe {
+							if !track.described() || frame.keyframe {
 								track.describe(name)?;
-								if !track.described {
+								if !track.described() {
 									continue;
 								}
 							}
@@ -583,16 +827,16 @@ impl<S: Stream> Export<S> {
 							}
 						}
 						// The fragment ends at the gap the next group reads.
-						Poll::Ready(Some(Event::Cut)) => {}
+						Poll::Ready(Some(Event::Cut { .. })) => {}
 						Poll::Ready(Some(Event::GroupEnd)) => {
 							if track.buffer.is_empty() {
 								continue;
 							}
-							track.group_finished = true;
+							track.buffer.close();
 							break;
 						}
 						Poll::Ready(None) => {
-							track.finished = true;
+							track.end();
 							break;
 						}
 						Poll::Pending => break,
@@ -602,20 +846,22 @@ impl<S: Stream> Export<S> {
 
 			// 3. Emit the init segment once every track can be described, then the
 			// fragments queued while it waited.
-			if !self.init_emitted {
+			if let Init::Waiting(queued) = &self.init {
 				if self.init_ready() {
 					let init = self.build_init()?;
-					self.init_emitted = true;
+					self.init.write(self.next_track_id);
 					return Poll::Ready(Ok(Some(Chunk::Init(init))));
 				}
-				if self.catalog.is_none() && self.tracks.values().all(|t| t.finished) {
+				if !self.catalog.live() && self.tracks.values().all(Fmp4Track::finished) {
 					// Media was read but can't be written without every track's description.
-					if !self.queued.is_empty() {
+					if !queued.is_empty() && !matches!(self.catalog, Feed::Stopped) {
 						return Poll::Ready(Err(Error::TrackUndescribed(self.undescribed()).into()));
 					}
 					return Poll::Ready(Ok(None));
 				}
-			} else if let Some((_, fragment)) = self.queued.pop_front() {
+			} else if let Init::Written { queued, .. } = &mut self.init
+				&& let Some(fragment) = queued.pop_front()
+			{
 				return Poll::Ready(Ok(Some(Chunk::Fragment(fragment))));
 			}
 
@@ -623,9 +869,8 @@ impl<S: Stream> Export<S> {
 			// (or an ended track's tail) once no other track holds earlier content.
 			if let Some(name) = self.completed_fragment() {
 				let track = self.tracks.get_mut(&name).unwrap();
-				track.group_finished = false;
-				let frames = std::mem::take(&mut track.buffer);
-				let fragment = emit_fragment(&name, track, &mut self.sequence_number, frames, None)?;
+				let batch = track.buffer.take().unwrap();
+				let fragment = emit_fragment(&name, track, &mut self.sequence_number, batch, None)?;
 				if let Some(chunk) = self.deliver(name, fragment) {
 					return Poll::Ready(Ok(Some(chunk)));
 				}
@@ -651,7 +896,7 @@ impl<S: Stream> Export<S> {
 				let track = self.tracks.get_mut(&name).unwrap();
 				let frame = track.pending.take().unwrap();
 				// Everything a track reads before the init is queued or buffered behind it.
-				if !self.init_emitted {
+				if !self.init.written() {
 					let start = *track.backlog.get_or_insert(frame.timestamp.into());
 					if Duration::from(frame.timestamp).saturating_sub(start) > INIT_QUEUE {
 						return Poll::Ready(Err(Error::TrackUndescribed(self.undescribed()).into()));
@@ -660,32 +905,29 @@ impl<S: Stream> Export<S> {
 				// A zero cap emits one sample at a time. Unknown video duration still
 				// needs a successor timestamp or endpoint before it can be encoded.
 				let fragment = if frag == Some(Duration::ZERO) {
-					if !track.buffer.is_empty() {
+					if let Some(batch) = track.buffer.take() {
 						// A catalog change can leave buffered frames behind. Drain them
 						// first and retry this frame on the next poll.
-						let frames = std::mem::take(&mut track.buffer);
-						let fragment = emit_fragment(&name, track, &mut self.sequence_number, frames, Some(&frame))?;
+						let fragment = emit_fragment(&name, track, &mut self.sequence_number, batch, Some(&frame))?;
 						track.pending = Some(frame);
 						fragment
+					} else if track.is_video && frame.duration.is_none() {
+						track.buffer.push(frame);
+						continue;
 					} else {
-						track.buffer_independent = frame.keyframe;
-						if track.is_video && frame.duration.is_none() {
-							track.buffer.push(frame);
-							continue;
-						}
-						emit_fragment(&name, track, &mut self.sequence_number, vec![frame], None)?
+						let batch = Batch {
+							independent: frame.keyframe,
+							frames: vec![frame],
+						};
+						emit_fragment(&name, track, &mut self.sequence_number, batch, None)?
 					}
-				} else if should_flush(track, &frame, frag) {
-					let frames = std::mem::take(&mut track.buffer);
-					let fragment = emit_fragment(&name, track, &mut self.sequence_number, frames, Some(&frame))?;
+				} else if should_flush(&track.buffer, &frame, frag) {
+					let batch = track.buffer.take().unwrap();
+					let fragment = emit_fragment(&name, track, &mut self.sequence_number, batch, Some(&frame))?;
 					// The flushed run is done; the incoming frame opens the next buffer.
-					track.buffer_independent = frame.keyframe;
 					track.buffer.push(frame);
 					fragment
 				} else {
-					if track.buffer.is_empty() {
-						track.buffer_independent = frame.keyframe;
-					}
 					track.buffer.push(frame);
 					// Frame appended to buffer; go round again to look for more work or a flush.
 					continue;
@@ -704,20 +946,17 @@ impl<S: Stream> Export<S> {
 				.tracks
 				.iter()
 				.filter_map(|(name, t)| {
-					if (t.finished || t.group_finished) && !t.buffer.is_empty() {
-						Some((Duration::from(t.buffer[0].timestamp), !t.is_video, name.clone()))
-					} else {
-						None
-					}
+					let first = t.buffer.first()?;
+					(t.finished() || t.buffer.is_closed())
+						.then(|| (Duration::from(first.timestamp), !t.is_video, name.clone()))
 				})
 				.min()
 				.map(|(_, _, name)| name);
 
 			if let Some(name) = flushable {
 				let track = self.tracks.get_mut(&name).unwrap();
-				track.group_finished = false;
-				let frames = std::mem::take(&mut track.buffer);
-				let fragment = emit_fragment(&name, track, &mut self.sequence_number, frames, None)?;
+				let batch = track.buffer.take().unwrap();
+				let fragment = emit_fragment(&name, track, &mut self.sequence_number, batch, None)?;
 				if let Some(chunk) = self.deliver(name, fragment) {
 					return Poll::Ready(Ok(Some(chunk)));
 				}
@@ -725,9 +964,9 @@ impl<S: Stream> Export<S> {
 			}
 
 			// 7. If catalog is closed and every track is finished and drained, we're done.
-			if self.init_emitted
-				&& self.catalog.is_none()
-				&& self.tracks.values().all(|t| t.finished && t.buffer.is_empty())
+			if self.init.written()
+				&& !self.catalog.live()
+				&& self.tracks.values().all(|t| t.finished() && t.buffer.is_empty())
 			{
 				return Poll::Ready(Ok(None));
 			}
@@ -739,11 +978,13 @@ impl<S: Stream> Export<S> {
 	/// Hand a fragment to the caller, or queue it behind the init segment that has yet
 	/// to go out.
 	fn deliver(&mut self, name: String, fragment: Fragment) -> Option<Chunk> {
-		if self.init_emitted {
-			return Some(Chunk::Fragment(fragment));
+		match &mut self.init {
+			Init::Written { .. } => Some(Chunk::Fragment(fragment)),
+			Init::Waiting(queued) => {
+				queued.push_back((name, fragment));
+				None
+			}
 		}
-		self.queued.push_back((name, fragment));
-		None
 	}
 
 	/// The renditions holding up the init segment, by name.
@@ -751,7 +992,7 @@ impl<S: Stream> Export<S> {
 		let mut names: Vec<String> = self
 			.tracks
 			.iter()
-			.filter(|(_, track)| !track.described)
+			.filter(|(_, track)| !track.described())
 			.map(|(name, _)| name.clone())
 			.collect();
 		names.sort();
@@ -763,14 +1004,15 @@ impl<S: Stream> Export<S> {
 		let earliest = self.tracks.values().filter_map(Fmp4Track::next_start).min()?;
 		self.tracks
 			.iter()
-			.filter(|(_, track)| {
-				!track.buffer.is_empty()
-					&& (track.finished
-						|| track.group_finished
-						|| (self.fragment_duration == Some(Duration::ZERO)
-							&& track.buffer.last().is_some_and(|frame| frame.duration.is_some())))
+			.filter_map(|(name, track)| {
+				let first = track.buffer.first()?;
+				// A stopped track's pending frame joins its buffer first.
+				let complete = (track.finished() && track.pending.is_none())
+					|| track.buffer.is_closed()
+					|| (self.fragment_duration == Some(Duration::ZERO)
+						&& track.buffer.last().is_some_and(|frame| frame.duration.is_some()));
+				complete.then(|| (Duration::from(first.timestamp), !track.is_video, name))
 			})
-			.map(|(name, track)| (Duration::from(track.buffer[0].timestamp), !track.is_video, name))
 			.filter(|(start, _, _)| *start <= earliest)
 			.min()
 			.map(|(_, _, name)| name.clone())
@@ -807,26 +1049,47 @@ impl<S: Stream> Export<S> {
 			if active.contains(&name) {
 				continue;
 			}
+			if !self.tracks.contains_key(&name)
+				&& let Some(track) = self.departed.remove(&name)
+			{
+				self.tracks.insert(name.clone(), track);
+			}
+			let moved = self
+				.tracks
+				.get(&name)
+				.and_then(Fmp4Track::subscription)
+				.is_some_and(|subscription| !config.read_by(&subscription.source, &self.source, &name));
+			// Before the init nothing of a moved rendition went out, so it starts over as a new one.
+			if moved && let Init::Waiting(queued) = &mut self.init {
+				self.tracks.remove(&name);
+				queued.retain(|(queued, _)| *queued != name);
+			}
 			match self.tracks.get_mut(&name) {
-				Some(track) if track.source.is_some() => track.reconfigure(&name, config)?,
+				Some(track) if track.subscription().is_some() && !moved => track.reconfigure(&name, config)?,
 				Some(track) => {
-					let Some(mut source) = config.subscribe(&self.source, &name, self.max_delay)? else {
+					let Some(source) = config.subscribe(&self.source, &name, self.delay)? else {
 						continue;
 					};
-					// The publisher still caches the group the rendition left on, which a
-					// fresh subscription would start at, so resume after the last group read.
-					if let Some(group) = track.group {
-						source = source.after(group);
-					}
+					// The publisher still caches the group the rendition left on, which a fresh
+					// subscription would start at, so resume after what was read. A move is new
+					// content, which continues past what was read under the declared track.
+					let source = match std::mem::replace(&mut track.phase, Phase::Stopped) {
+						Phase::Reading(previous) | Phase::Ended(previous) => {
+							track.moved();
+							source.continuing(&previous.source)
+						}
+						Phase::Departed(resume) => source.resuming(&resume),
+						Phase::Stopped => source,
+					};
 					track.rejoin(&name, config, source)?;
 				}
 				None => {
 					// Subscribe via ExportSource, which applies any per-codec transform
 					// (Annex-B → length-prefixed) at pull time.
-					let Some(source) = config.subscribe(&self.source, &name, self.max_delay)? else {
+					let Some(source) = config.subscribe(&self.source, &name, self.delay)? else {
 						continue;
 					};
-					if self.init_emitted {
+					if self.init.written() && !self.late {
 						return Err(Error::TrackAdded(name).into());
 					}
 					let mut track = Fmp4Track::new(source, config, self.next_track_id)?;
@@ -838,18 +1101,29 @@ impl<S: Stream> Export<S> {
 			active.insert(name);
 		}
 
-		if self.init_emitted {
-			// The init declared these tracks, so keep them for a rendition that returns.
-			// Ending the subscription writes out what was already read.
-			for (name, track) in &mut self.tracks {
-				if !active.contains(name) && track.source.take().is_some() {
-					track.finished = true;
-					track.described = false;
+		match &mut self.init {
+			Init::Written { first_late, .. } => {
+				// The init declared these tracks, so keep them for a rendition that returns.
+				// Ending the subscription writes out what was already read.
+				for (name, track) in &mut self.tracks {
+					if !active.contains(name) {
+						track.depart();
+					}
+				}
+				// A departed track still holding media waits for the next catalog to move.
+				let drained = self.tracks.extract_if(|_, track| {
+					track.subscription().is_none() && track.pending.is_none() && track.buffer.is_empty()
+				});
+				for (name, track) in drained {
+					if track.written.is_some() || track.track_id < *first_late {
+						self.departed.insert(name, track);
+					}
 				}
 			}
-		} else {
-			self.tracks.retain(|name, _| active.contains(name));
-			self.queued.retain(|(name, _)| active.contains(name));
+			Init::Waiting(queued) => {
+				self.tracks.retain(|name, _| active.contains(name));
+				queued.retain(|(name, _)| active.contains(name));
+			}
 		}
 
 		Ok(())
@@ -857,7 +1131,7 @@ impl<S: Stream> Export<S> {
 
 	/// True once every track can be described, so the merged init segment can be built.
 	fn init_ready(&self) -> bool {
-		!self.tracks.is_empty() && self.tracks.values().all(|t| t.described)
+		!self.tracks.is_empty() && self.tracks.values().all(Fmp4Track::described)
 	}
 
 	/// Build the merged ftyp + multi-track moov init segment, video first, each kind in
@@ -898,7 +1172,7 @@ pub(crate) fn extract_init(
 	trexs: &mut Vec<mp4_atom::Trex>,
 ) -> Result<()> {
 	let mut cursor = std::io::Cursor::new(init.as_ref());
-	while let Some(atom) = mp4_atom::Any::decode_maybe(&mut cursor)? {
+	while let Some(atom) = mp4_atom::Any::decode_maybe(&mut cursor).map_err(crate::Error::mp4)? {
 		match atom {
 			mp4_atom::Any::Ftyp(f) if ftyp_data.is_none() => {
 				*ftyp_data = Some(f);
@@ -906,10 +1180,9 @@ pub(crate) fn extract_init(
 			mp4_atom::Any::Moov(moov) => {
 				for mut trak in moov.trak {
 					trak.tkhd.track_id = track_id;
-					// Drop the source edit list. CMAF carries timing via tfdt +
-					// composition offsets, so an edit list is redundant here, and a
-					// browser applying an empty-edit media_time would shift the track
-					// off the others (a black screen in Media Source Extensions).
+					// Import already applied the source edit to Hang timestamps. Drop
+					// it here; encode_init restores only Opus priming's inverse mapping
+					// after the output track timescales have been settled.
 					trak.edts = None;
 					// tkhd.duration is in the *movie* timescale, and the merged moov
 					// picks its own (the first trak's media scale), so whatever the
@@ -932,17 +1205,19 @@ pub(crate) fn extract_init(
 	Ok(())
 }
 
-/// Should we flush `track.buffer` before appending the incoming `frame`?
+/// Should we flush `buffer` before appending the incoming `frame`?
 ///
 /// Triggers when `frame` opens a group, or on the duration cap. The keyframe bit is the
 /// group boundary on every track: a video keyframe closes a GOP, and an audio frame
 /// carries it only where the publisher cut a group, which is the boundary the file
 /// should keep rather than one invented here. Per-frame output is handled before
 /// this check.
-fn should_flush(track: &Fmp4Track, frame: &Frame, fragment_duration: Option<Duration>) -> bool {
-	if track.buffer.is_empty() {
-		return false;
-	}
+fn should_flush(buffer: &Buffer, frame: &Frame, fragment_duration: Option<Duration>) -> bool {
+	let batch = match buffer {
+		Buffer::Empty => return false,
+		Buffer::Closed(_) => return true,
+		Buffer::Open(batch) => batch,
+	};
 	if frame.keyframe {
 		return true;
 	}
@@ -953,7 +1228,7 @@ fn should_flush(track: &Fmp4Track, frame: &Frame, fragment_duration: Option<Dura
 	// PTS, so the span of the buffer is min..max of all PTS.
 	let mut min = Duration::from(frame.timestamp);
 	let mut max = min;
-	for f in &track.buffer {
+	for f in &batch.frames {
 		let pts = Duration::from(f.timestamp);
 		min = min.min(pts);
 		max = max.max(pts);
@@ -963,24 +1238,39 @@ fn should_flush(track: &Fmp4Track, frame: &Frame, fragment_duration: Option<Dura
 
 /// Encode a buffered run of samples as a single CMAF moof+mdat fragment,
 /// consuming the next `mfhd` sequence number of the file.
-fn encode_fragment(track: &Fmp4Track, sequence_number: &mut u32, frames: Vec<Frame>) -> Result<Bytes> {
-	if frames.is_empty() {
+///
+/// A run that opens a GOP (and every audio run) anchors its `tfdt` at its first frame's
+/// presentation time, which re-syncs the decode timeline after a gap the durations did not
+/// cover. A run cut inside a GOP continues the timeline where the track's previous fragment
+/// ended, so decode times never step back however the GOP is reordered.
+fn encode_fragment(
+	track: &mut Fmp4Track,
+	sequence_number: &mut u32,
+	frames: Vec<Frame>,
+	opens_gop: bool,
+) -> Result<Bytes> {
+	let Some(first) = frames.first() else {
 		return Err(Error::NoFrames.into());
-	}
-	let seq = *sequence_number;
-	*sequence_number += 1;
+	};
 	let timescale = moq_net::Timescale::new(track.timescale)?;
+	let base_dts = match track.decode_end {
+		Some(end) if !opens_gop => end,
+		_ => super::base_ticks(first, timescale)?,
+	};
 	let info = crate::container::fmp4::FragmentInfo {
 		track_id: track.track_id,
 		timescale,
-		sequence_number: seq,
+		sequence_number: *sequence_number,
 		kind: if track.is_video {
 			super::Kind::Video
 		} else {
 			super::Kind::Audio
 		},
 	};
-	Ok(crate::container::fmp4::encode_fragment(info, &frames)?)
+	let (data, decode_end) = super::encode_at(info, base_dts, &frames)?;
+	*sequence_number += 1;
+	track.decode_end = Some(decode_end);
+	Ok(data)
 }
 
 /// Encode a buffered run and wrap it with the metadata a segmenting consumer needs.
@@ -992,13 +1282,19 @@ fn emit_fragment(
 	name: &str,
 	track: &mut Fmp4Track,
 	sequence_number: &mut u32,
-	mut frames: Vec<Frame>,
+	batch: Batch,
 	successor: Option<&Frame>,
 ) -> Result<Fragment> {
+	let Batch {
+		mut frames,
+		independent,
+	} = batch;
 	apply_codec_durations(&mut frames, track.opus);
+	// A run that starts or ends inside a GOP sees only part of its reordering.
+	let partial = !independent || successor.is_some_and(|next| !next.keyframe);
 	// Every audio sample is independently decodable, so every audio fragment is
 	// independent; video is only when its buffer opened on a keyframe (a GOP boundary).
-	let independent = !track.is_video || track.buffer_independent;
+	let independent = !track.is_video || independent;
 	if let (Some(first), Some(written)) = (frames.first(), track.written) {
 		let start = Duration::from(first.timestamp);
 		if independent && start <= written {
@@ -1013,9 +1309,14 @@ fn emit_fragment(
 	let latest = frames.iter().map(|frame| Duration::from(frame.timestamp)).max();
 	track.written = track.written.max(latest);
 	let timescale = moq_net::Timescale::new(track.timescale)?;
-	infer_missing_durations(&mut frames, successor, track.default_frame, timescale)?;
+	let run = if partial && track.config.may_reorder() {
+		Run::PartialGop
+	} else {
+		Run::Whole
+	};
+	infer_missing_durations(&mut frames, successor, track.default_frame, timescale, run)?;
 	let duration = fragment_duration(&frames, track.default_frame, timescale)?;
-	let data = encode_fragment(track, sequence_number, frames)?;
+	let data = encode_fragment(track, sequence_number, frames, independent)?;
 	Ok(Fragment {
 		data,
 		independent,
@@ -1094,23 +1395,51 @@ pub(crate) fn apply_codec_durations(frames: &mut [Frame], opus: bool) {
 /// The publisher is the one that actually knows where its group's content ends, and
 /// [`Producer::cut`](crate::container::Producer::cut) is how it says so: the durations it
 /// writes arrive already set and are left alone here.
+///
+/// Frames arrive in decode order, so a gap is a decode duration only when presentation order
+/// matches it. A run whose timestamps go backwards is reordered video, and every frame takes
+/// the catalog cadence. A [`Run::PartialGop`] cannot rule reordering out from its own frames,
+/// since the B-frames that would reveal it may sit in a neighbouring run, so no gap there may
+/// exceed the cadence: in reordered video the gap to the next frame decoded spans the frames
+/// decoded after it, and a longer duration would push the decode timeline past the next GOP.
 pub(crate) fn infer_missing_durations(
 	frames: &mut [Frame],
 	successor: Option<&Frame>,
 	default_frame: Duration,
 	timescale: moq_net::Timescale,
+	run: Run,
 ) -> Result<()> {
 	let infer_from_pts = pts_monotonic(frames, successor);
+	let cadence = fallback_duration(default_frame, timescale);
 
 	for i in 0..frames.len() {
 		let successor = infer_from_pts
 			.then(|| duration_bound(frames, successor, i))
 			.flatten()
 			.cloned();
+		let stated = frames[i].duration.is_some_and(|duration| !duration.is_zero());
 		infer_missing_duration(&mut frames[i], successor.as_ref(), default_frame, timescale)?;
+		if run == Run::PartialGop
+			&& !stated
+			&& let (Some(inferred), Some(cadence)) = (frames[i].duration, cadence)
+			&& Duration::from(inferred) > Duration::from(cadence)
+		{
+			frames[i].duration = Some(cadence);
+		}
 	}
 
 	Ok(())
+}
+
+/// How much of its reordering a run of frames passed to [`infer_missing_durations`] shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Run {
+	/// Whole GOPs, or media that presents in decode order, so its own timestamps show
+	/// whether it is reordered.
+	Whole,
+	/// Video that may reorder, cut inside a GOP, whose reordering may only show in a
+	/// neighbouring run.
+	PartialGop,
 }
 
 /// Infer one frame's duration from a known same-group successor, else the catalog cadence.
@@ -1148,32 +1477,20 @@ fn fallback_duration(default_frame: Duration, timescale: moq_net::Timescale) -> 
 /// Quantizing endpoints instead of each gap independently carries fractional ticks forward:
 /// a microsecond clock alternating 33,333 and 33,334 microsecond steps at 30 kHz produces
 /// consecutive 1,000-tick samples instead of either drifting or failing as inexact.
+///
+/// `None` when `end` does not land on a later tick: a backwards gap, or two instants this
+/// scale cannot tell apart, which time nothing just as a repeated timestamp does.
 pub(super) fn timestamp_gap(
 	start: Timestamp,
 	end: Timestamp,
 	timescale: moq_net::Timescale,
 ) -> Result<Option<Timestamp>> {
-	let start_scale = u128::from(start.scale().as_u64());
-	let end_scale = u128::from(end.scale().as_u64());
-	let end_numerator = u128::from(end.value()) * start_scale;
-	let start_numerator = u128::from(start.value()) * end_scale;
-	let Some(numerator) = end_numerator.checked_sub(start_numerator) else {
-		return Ok(None);
-	};
-	if numerator == 0 {
-		return Ok(None);
-	}
-
 	let start_ticks = super::timestamp_ticks(start, timescale)?;
 	let end_ticks = super::timestamp_ticks(end, timescale)?;
-	let Some(ticks) = end_ticks.checked_sub(start_ticks) else {
-		return Ok(None);
-	};
-	if ticks == 0 {
-		return Err(Error::SampleDurationTooSmall(timescale.as_u64()).into());
+	match end_ticks.checked_sub(start_ticks) {
+		Some(ticks) if ticks > 0 => Ok(Some(Timestamp::new(ticks, timescale)?)),
+		_ => Ok(None),
 	}
-
-	Ok(Some(Timestamp::new(ticks, timescale)?))
 }
 
 fn pts_monotonic(frames: &[Frame], successor: Option<&Frame>) -> bool {
@@ -1219,7 +1536,7 @@ pub(crate) fn catalog_timescale_audio(config: &hang::catalog::AudioConfig) -> Re
 
 fn parse_timescale_from_init(init: &[u8]) -> Result<u64> {
 	let mut cursor = std::io::Cursor::new(init);
-	while let Some(atom) = mp4_atom::Any::decode_maybe(&mut cursor)? {
+	while let Some(atom) = mp4_atom::Any::decode_maybe(&mut cursor).map_err(crate::Error::mp4)? {
 		if let mp4_atom::Any::Moov(moov) = atom {
 			let trak = moov.trak.first().ok_or(Error::NoTracks)?;
 			return Ok(trak.mdia.mdhd.timescale as u64);
@@ -1251,6 +1568,17 @@ mod tests {
 		}
 	}
 
+	// A rendition moving off a track whose group already closed keeps that fragment.
+	#[test]
+	fn closing_a_closed_buffer_keeps_its_frames() {
+		let mut buffer = Buffer::Empty;
+		buffer.push(group_start(0));
+		buffer.close();
+		buffer.close();
+		assert!(buffer.is_closed());
+		assert_eq!(buffer.take().map(|batch| batch.frames.len()), Some(1));
+	}
+
 	/// A frame that opens a group. Every group starts with a keyframe, so this is what
 	/// the far side of a group boundary looks like to `infer_missing_durations`.
 	fn group_start(timestamp_us: u64) -> Frame {
@@ -1263,7 +1591,14 @@ mod tests {
 	#[test]
 	fn infer_missing_durations_uses_default_for_trailing_sample() {
 		let mut frames = vec![frame(0, Some(0)), frame(41_667, None), frame(83_334, None)];
-		infer_missing_durations(&mut frames, None, Duration::from_millis(33), moq_net::Timescale::MICRO).unwrap();
+		infer_missing_durations(
+			&mut frames,
+			None,
+			Duration::from_millis(33),
+			moq_net::Timescale::MICRO,
+			Run::Whole,
+		)
+		.unwrap();
 
 		assert_eq!(frames[0].duration, Some(ts(41_667)));
 		assert_eq!(frames[1].duration, Some(ts(41_667)));
@@ -1277,7 +1612,14 @@ mod tests {
 	#[test]
 	fn infer_missing_duration_uses_default_for_single_frame() {
 		let mut frames = vec![frame(83_333, Some(0))];
-		infer_missing_durations(&mut frames, None, Duration::from_millis(40), moq_net::Timescale::MICRO).unwrap();
+		infer_missing_durations(
+			&mut frames,
+			None,
+			Duration::from_millis(40),
+			moq_net::Timescale::MICRO,
+			Run::Whole,
+		)
+		.unwrap();
 
 		assert_eq!(frames[0].duration, Some(ts(40_000)));
 		assert_eq!(
@@ -1287,7 +1629,8 @@ mod tests {
 	}
 
 	/// The duration cap splits a GOP across fragments, so the successor is a delta frame
-	/// in the SAME group. That one is a real bound and is still used.
+	/// in the SAME group. In video that presents in decode order that one is a real bound
+	/// and is still used.
 	#[test]
 	fn infer_trailing_duration_from_successor_frame() {
 		let successor = frame(83_334, None);
@@ -1297,6 +1640,7 @@ mod tests {
 			Some(&successor),
 			Duration::from_millis(33),
 			moq_net::Timescale::MICRO,
+			Run::Whole,
 		)
 		.unwrap();
 
@@ -1307,11 +1651,46 @@ mod tests {
 		);
 	}
 
+	/// Video that may reorder, cut inside a GOP, cannot tell a reference frame's gap to the
+	/// B-frames decoded after it from a duration, so no inferred duration there exceeds the
+	/// cadence. A shorter gap still times its frame, and a stated duration is kept.
+	#[test]
+	fn a_partial_gop_caps_inferred_durations_at_the_cadence() {
+		let successor = frame(100_000, None);
+		let mut frames = vec![frame(0, Some(50_000)), frame(10_000, None), frame(20_000, None)];
+		infer_missing_durations(
+			&mut frames,
+			Some(&successor),
+			Duration::from_millis(33),
+			moq_net::Timescale::MICRO,
+			Run::PartialGop,
+		)
+		.unwrap();
+
+		let durations: Vec<_> = frames.iter().map(duration_micros).collect();
+		assert_eq!(durations, vec![50_000, 10_000, 33_000]);
+	}
+
+	/// The last frame lands 11 us after its predecessor, the one-tick 90 kHz bump ffmpeg gives
+	/// a repeated DTS. Both quantize to one output tick, so the earlier frame falls back to
+	/// the cadence, as it does for a repeated timestamp.
 	#[test]
 	fn inferred_microsecond_clock_carries_fractional_ticks_forward() {
 		let timescale = moq_net::Timescale::new(30_000).unwrap();
-		let mut frames = vec![frame(0, None), frame(33_333, None), frame(66_667, None)];
-		infer_missing_durations(&mut frames, None, Duration::from_nanos(33_333_333), timescale).unwrap();
+		let mut frames = vec![
+			frame(0, None),
+			frame(33_333, None),
+			frame(66_667, None),
+			frame(66_678, None),
+		];
+		infer_missing_durations(
+			&mut frames,
+			None,
+			Duration::from_nanos(33_333_333),
+			timescale,
+			Run::Whole,
+		)
+		.unwrap();
 
 		let durations: Vec<_> = frames
 			.iter()
@@ -1320,7 +1699,7 @@ mod tests {
 				(duration.value(), duration.scale())
 			})
 			.collect();
-		assert_eq!(durations, vec![(1_000, timescale); 3]);
+		assert_eq!(durations, vec![(1_000, timescale); 4]);
 	}
 
 	/// The regression for the stalled HLS player: a subscriber that got a stale cached group
@@ -1336,6 +1715,7 @@ mod tests {
 			Some(&next_group),
 			Duration::from_millis(33),
 			moq_net::Timescale::MICRO,
+			Run::Whole,
 		)
 		.unwrap();
 
@@ -1352,7 +1732,14 @@ mod tests {
 	#[test]
 	fn infer_stops_at_an_interior_group_boundary() {
 		let mut frames = vec![frame(0, None), frame(21_333, None), group_start(600_000_000)];
-		infer_missing_durations(&mut frames, None, Duration::from_millis(21), moq_net::Timescale::MICRO).unwrap();
+		infer_missing_durations(
+			&mut frames,
+			None,
+			Duration::from_millis(21),
+			moq_net::Timescale::MICRO,
+			Run::Whole,
+		)
+		.unwrap();
 
 		assert_eq!(frames[0].duration, Some(ts(21_333)), "same group, real delta");
 		assert_eq!(duration_micros(&frames[1]), 21_000, "bounded by the next group");
@@ -1380,6 +1767,7 @@ mod tests {
 			None,
 			Duration::from_micros(21_333),
 			moq_net::Timescale::MICRO,
+			Run::Whole,
 		)
 		.unwrap();
 
@@ -1403,6 +1791,7 @@ mod tests {
 			Some(&next_group),
 			Duration::from_millis(50),
 			moq_net::Timescale::MICRO,
+			Run::Whole,
 		)
 		.unwrap();
 
@@ -1423,6 +1812,7 @@ mod tests {
 			Some(&successor),
 			Duration::from_millis(33),
 			moq_net::Timescale::MICRO,
+			Run::Whole,
 		)
 		.unwrap();
 
@@ -1435,9 +1825,8 @@ mod tests {
 		);
 	}
 
-	// A source init whose trak carries an edit list must come out of extract_init with
-	// the edit list dropped: CMAF carries timing via tfdt + composition offsets, and a
-	// browser applying an edit list shifts the track off the others (a black screen).
+	// Import already applied the source edit to Hang timestamps. Export must discard it
+	// before encode_init rebuilds any codec-specific presentation shift.
 	#[test]
 	fn extract_init_strips_edit_lists() {
 		use mp4_atom::Encode;
@@ -1463,7 +1852,7 @@ mod tests {
 		extract_init(&Bytes::from(init), 1, &mut ftyp, &mut traks, &mut trexs).unwrap();
 
 		assert_eq!(traks.len(), 1);
-		assert!(traks[0].edts.is_none(), "CMAF init must not carry an edit list");
+		assert!(traks[0].edts.is_none(), "the source edit must not be applied twice");
 	}
 
 	// tkhd.duration is in the movie timescale, which the merged moov replaces with its own. A

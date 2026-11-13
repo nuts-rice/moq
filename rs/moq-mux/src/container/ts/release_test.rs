@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::time::Instant;
+use kio::clock::Instant;
 
 use super::oracle::{Admitted, Loss, Object};
 use super::{Passthrough, Release, fixture};
@@ -27,7 +27,7 @@ const TOLERANCE: Duration = Duration::from_millis(1);
 
 /// A capture imported whole, with what keeps its broadcast up.
 struct Imported {
-	_passthrough: Passthrough,
+	_passthrough: crate::container::ts::passthrough::Finished,
 	_catalog: crate::catalog::Producer,
 	_broadcast: moq_net::broadcast::Producer,
 	consumer: moq_net::broadcast::Consumer,
@@ -41,16 +41,18 @@ async fn import(data: &[u8]) -> Imported {
 	let mut passthrough = Passthrough::new(broadcast.clone(), catalog.reserve()).unwrap();
 	let name = passthrough.track().to_string();
 	passthrough.decode(data).unwrap();
-	passthrough.finish().unwrap();
+	let passthrough = passthrough.finish().unwrap();
 
 	let mut track = consumer
 		.track(&name)
 		.unwrap()
-		.subscribe(moq_net::track::Subscription::default().with_max_delay(RECORDING))
+		.subscribe(
+			moq_net::track::Subscription::default().with_delay(moq_net::track::Delay::default().with_max(RECORDING)),
+		)
 		.await
 		.unwrap();
 	let mut objects = Vec::new();
-	while let Some(mut group) = tokio::time::timeout(Duration::from_secs(1), track.recv_group())
+	while let Some(mut group) = kio::clock::timeout(Duration::from_secs(1), track.recv_group())
 		.await
 		.unwrap()
 		.unwrap()
@@ -114,7 +116,7 @@ fn republish_cut(
 		let mut due = Duration::ZERO;
 		for (i, object) in objects.into_iter().enumerate() {
 			due = due.max(at(i, &object));
-			tokio::time::sleep_until(start + due).await;
+			kio::clock::sleep_until(start.saturating_add(due)).await;
 			if group.as_ref().map(|(sequence, _)| *sequence) != Some(object.group) {
 				if let Some((sequence, group)) = group.take() {
 					end(sequence, group, &cut);
@@ -137,17 +139,19 @@ fn republish_cut(
 		if let Some((sequence, group)) = group {
 			end(sequence, group, &cut);
 		}
-		track.finish().unwrap();
+		let _track = track.finish().unwrap();
 		std::future::pending::<()>().await;
 	});
 	Republished { consumer, task }
 }
 
 /// Finish `group`, or abort it as evicted if it is one of the `cut`.
-fn end(sequence: u64, mut group: moq_net::group::Producer, cut: &[u64]) {
+fn end(sequence: u64, group: moq_net::group::Producer, cut: &[u64]) {
 	match cut.contains(&sequence) {
 		true => group.abort(moq_net::Error::Old).unwrap(),
-		false => group.finish().unwrap(),
+		false => {
+			group.finish().unwrap();
+		}
 	}
 }
 
@@ -165,7 +169,7 @@ impl Drop for Republished {
 /// Every object `release` writes, and when, until it ends or stalls.
 async fn drain(mut release: Release) -> (Vec<(Instant, Frame)>, Release) {
 	let mut released = Vec::new();
-	while let Ok(next) = tokio::time::timeout(STALL, release.next()).await {
+	while let Ok(next) = kio::clock::timeout(STALL, release.next()).await {
 		let Some(frame) = next.expect("release error") else {
 			break;
 		};
@@ -180,8 +184,10 @@ fn spawn_release(republished: &Republished) -> tokio::task::JoinHandle<(Vec<(Ins
 	let consumer = republished.consumer.clone();
 	tokio::spawn(async move {
 		let source = crate::source::announced(&consumer).await;
-		let release = Release::new(source, CatalogFormat::Hang).await.unwrap();
-		drain(release.with_delay(Duration::from_millis(500))).await
+		let release = Release::new(source, CatalogFormat::Hang, Duration::from_millis(500))
+			.await
+			.unwrap();
+		drain(release).await
 	})
 }
 
@@ -202,10 +208,9 @@ async fn a_capture_is_released_byte_identical_on_its_own_pcr() {
 	for data in [KYRION, KYRION_H264] {
 		let imported = import(data).await;
 		let source = crate::source::announced(&imported.consumer).await;
-		let release = Release::new(source, CatalogFormat::Hang)
+		let release = Release::new(source, CatalogFormat::Hang, RECORDING)
 			.await
 			.unwrap()
-			.with_delay(RECORDING)
 			.with_replay();
 		let (released, release) = drain(release).await;
 
@@ -248,9 +253,11 @@ async fn a_flagged_jump_crosses_without_holding_the_output() {
 	}
 	let republished = republish(objects.clone(), move |i, _| arrivals[i]);
 	let source = crate::source::announced(&republished.consumer).await;
-	let release = Release::new(source, CatalogFormat::Hang).await.unwrap();
+	let release = Release::new(source, CatalogFormat::Hang, Duration::from_millis(500))
+		.await
+		.unwrap();
 	let delay = Duration::from_millis(500);
-	let (released, release) = drain(release.with_delay(delay)).await;
+	let (released, release) = drain(release).await;
 
 	let out = bytes(released.iter().map(|(_, frame)| &frame.payload));
 	assert!(
@@ -465,7 +472,7 @@ fn pids(data: &[u8]) -> std::collections::BTreeSet<u16> {
 async fn an_msf_catalog_is_refused() {
 	let imported = import(KYRION).await;
 	let source = crate::source::announced(&imported.consumer).await;
-	let Err(err) = Release::new(source, CatalogFormat::Msf).await else {
+	let Err(err) = Release::new(source, CatalogFormat::Msf, std::time::Duration::ZERO).await else {
 		panic!("a release reading the MSF catalog must fail");
 	};
 	assert!(err.to_string().contains("MSF"), "{err}");
@@ -486,10 +493,7 @@ async fn a_backlog_stays_in_the_source_until_due() {
 			Duration::from_micros(object.micros - origin)
 		});
 		let source = crate::source::announced(&republished.consumer).await;
-		let mut release = Release::new(source, CatalogFormat::Hang)
-			.await
-			.unwrap()
-			.with_delay(delay);
+		let mut release = Release::new(source, CatalogFormat::Hang, delay).await.unwrap();
 		let first = release.next().await.unwrap().unwrap();
 		let first = objects
 			.iter()
@@ -499,9 +503,9 @@ async fn a_backlog_stays_in_the_source_until_due() {
 
 		// The publisher keeps its capture pace while the sink stops polling. Sleeping
 		// on the paused clock lets each publication wake at its own scheduled instant.
-		tokio::time::sleep(RECORDING).await;
+		kio::clock::sleep(RECORDING).await;
 		for (index, object) in objects.iter().enumerate().skip(first + 1) {
-			let output = tokio::time::timeout(STALL, release.next())
+			let output = kio::clock::timeout(STALL, release.next())
 				.await
 				.expect("every arrived object is released")
 				.unwrap()

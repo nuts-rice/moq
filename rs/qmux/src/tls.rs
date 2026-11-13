@@ -1,10 +1,12 @@
 use std::sync::Arc;
+
+use rustls::pki_types::CertificateDer;
 use tokio::net::{TcpStream, ToSocketAddrs};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 
 use crate::transport::Stream;
-use crate::{Config, Error, Session, Version, alpn};
+use crate::{Config, Driver, Error, Session, Version, alpn};
 
 /// A QMux client over TLS that advertises `(alpn, versions)` entries.
 ///
@@ -66,11 +68,16 @@ impl Client {
 
 	/// Connect to `addr` and start a client session. `server_name` is used for
 	/// SNI and certificate verification.
-	pub async fn connect(&self, addr: impl ToSocketAddrs, server_name: &str) -> Result<Session, Error> {
+	pub async fn connect(
+		&self,
+		addr: impl ToSocketAddrs,
+		server_name: &str,
+	) -> Result<(Session, Driver<Stream<tokio_rustls::client::TlsStream<TcpStream>>>), Error> {
+		moq_crypto::cpu::check()?;
 		let stream = TcpStream::connect(&addr).await?;
-		// Read the socket's stats handle before TLS takes ownership; the kernel's
-		// view of the TCP connection is the same either side of the encryption.
-		let socket_stats = socket_stats(&stream);
+		// Adopt the socket before TLS takes ownership; the kernel's view of the TCP
+		// connection is the same either side of the encryption.
+		let socket_stats = crate::tcp::adopt(&stream)?;
 
 		let server_name = rustls::pki_types::ServerName::try_from(server_name)
 			.map_err(|_| Error::InvalidServerName)?
@@ -101,12 +108,14 @@ impl Client {
 		}
 
 		let session_config = self.session.clone().with_negotiated(version, protocol);
-		let mut transport = Stream::new(tls_stream, version, session_config.max_record_size);
+		let handshake = Handshake::new(tls_stream.get_ref().1.peer_certificates(), None);
+		let mut transport = Stream::new(tls_stream);
 		if let Some(stats) = socket_stats {
 			transport = transport.with_socket_stats(stats);
 		}
 		// `connect` awaits the peer's transport parameters so `protocol()` is resolved.
-		Session::connect(transport, session_config).await
+		let (session, driver) = Session::connect(transport, session_config).await?;
+		Ok((session.with_tls(handshake), driver))
 	}
 }
 
@@ -139,46 +148,97 @@ impl Server {
 		self
 	}
 
-	/// Accept a TLS connection over an established TCP stream.
+	/// Accept a TLS connection over an established TCP stream, disabling Nagle on it.
 	///
 	/// This awaits both the TLS handshake and the QMux handshake (the peer's
 	/// transport parameters, bounded by the session's
-	/// [`handshake_timeout`](crate::Config::handshake_timeout)). Drive each
-	/// connection with `tokio::spawn` so a slow or non-cooperative peer can't
-	/// stall your `listener.accept()` loop.
-	pub async fn accept(&self, stream: TcpStream) -> Result<Session, Error> {
-		let socket_stats = socket_stats(&stream);
+	/// [`handshake_timeout`](crate::Config::handshake_timeout)). Run each accept
+	/// on its own task so a slow or non-cooperative peer can't stall your
+	/// `listener.accept()` loop.
+	///
+	/// The returned session reports the client's certificate chain, when the
+	/// `rustls::ServerConfig` asked for one and the client presented it, and the
+	/// SNI it sent (see [`Session::peer_certificates`] and [`Session::server_name`]).
+	pub async fn accept(
+		&self,
+		stream: TcpStream,
+	) -> Result<(Session, Driver<Stream<tokio_rustls::server::TlsStream<TcpStream>>>), Error> {
+		let socket_stats = crate::tcp::adopt(&stream)?;
 		let acceptor = TlsAcceptor::from(self.config.clone());
 		let tls_stream = acceptor.accept(stream).await?;
+		self.accept_established(tls_stream, socket_stats).await
+	}
 
-		let negotiated = tls_stream.get_ref().1.alpn_protocol();
-		let negotiated_str = negotiated.and_then(|a| std::str::from_utf8(a).ok());
-		tracing::debug!(?negotiated_str, "TLS accepted, negotiated ALPN");
-
-		let (version, protocol) = alpn::parse(negotiated_str)?;
+	/// Accept a session over a TLS stream whose handshake the caller already ran,
+	/// such as a listener that reads the ClientHello to pick a config for its port.
+	///
+	/// The ALPN that handshake negotiated names the wire-format version, and the
+	/// session reports the client's certificate chain and SNI as an
+	/// [`accept`](Self::accept)ed one does. `socket_stats` reports on the TCP
+	/// connection underneath; take it before TLS wraps the socket, as
+	/// [`accept`](Self::accept) does.
+	pub async fn accept_established<T>(
+		&self,
+		stream: tokio_rustls::server::TlsStream<T>,
+		socket_stats: Option<crate::SharedSocketStats>,
+	) -> Result<(Session, Driver<Stream<tokio_rustls::server::TlsStream<T>>>), Error>
+	where
+		T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+	{
+		let conn = stream.get_ref().1;
+		let negotiated = conn.alpn_protocol().and_then(|a| std::str::from_utf8(a).ok());
+		tracing::debug!(?negotiated, "TLS accepted, negotiated ALPN");
+		let (version, protocol) = alpn::parse(negotiated)?;
 		tracing::debug!(?version, ?protocol, "parsed ALPN");
 
 		let session_config = self.session.clone().with_negotiated(version, protocol);
-		let mut transport = Stream::new(tls_stream, version, session_config.max_record_size);
+		let handshake = Handshake::new(conn.peer_certificates(), conn.server_name());
+		let mut transport = Stream::new(stream);
 		if let Some(stats) = socket_stats {
 			transport = transport.with_socket_stats(stats);
 		}
 		// `accept` awaits the peer's transport parameters so `protocol()` is resolved.
-		Session::accept(transport, session_config).await
+		let (session, driver) = Session::accept(transport, session_config).await?;
+		Ok((session.with_tls(handshake), driver))
 	}
 }
 
-/// The kernel's view of `stream`, when this platform exposes one.
-fn socket_stats(stream: &TcpStream) -> Option<crate::SharedSocketStats> {
-	#[cfg(unix)]
-	{
-		crate::TcpStats::new(stream)
-			.ok()
-			.map(|s| std::sync::Arc::new(s) as crate::SharedSocketStats)
+/// What a session's TLS handshake learned about the peer, captured before the
+/// stream is handed to the session.
+#[derive(Debug)]
+pub(crate) struct Handshake {
+	peer_certificates: Option<Vec<CertificateDer<'static>>>,
+	server_name: Option<String>,
+}
+
+impl Handshake {
+	fn new(peer_certificates: Option<&[CertificateDer<'static>]>, server_name: Option<&str>) -> Arc<Self> {
+		Arc::new(Self {
+			peer_certificates: peer_certificates.map(<[_]>::to_vec),
+			server_name: server_name.map(str::to_owned),
+		})
 	}
-	#[cfg(not(unix))]
-	{
-		let _ = stream;
-		None
+}
+
+impl Session {
+	fn with_tls(mut self, handshake: Arc<Handshake>) -> Self {
+		self.tls = Some(handshake);
+		self
+	}
+
+	/// The certificate chain the peer presented in the TLS handshake, leaf first.
+	///
+	/// On a [`Client`] session this is the server's chain. On a [`Server`] session
+	/// it is the client's, and only when the `rustls::ServerConfig` asked for one
+	/// and the client sent it; its client-certificate verifier has already
+	/// accepted the chain. `None` on a session not carried by TLS.
+	pub fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]> {
+		self.tls.as_ref()?.peer_certificates.as_deref()
+	}
+
+	/// The SNI the client sent, on a session a [`Server`] accepted. `None` when the
+	/// client sent none, on a [`Client`] session, or off TLS.
+	pub fn server_name(&self) -> Option<&str> {
+		self.tls.as_ref()?.server_name.as_deref()
 	}
 }

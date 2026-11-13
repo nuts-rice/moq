@@ -9,15 +9,19 @@
 //!
 //! The crate root holds the transport-independent session API: [`Session`] and its
 //! [`SendStream`] / [`RecvStream`] halves, which implement
-//! [`moq_net::transport::poll`], plus the [`Config`], [`Version`], and [`Error`] types they
-//! share.
+//! [`moq_net::transport::poll`], the [`Driver`] that runs a session over the transport it
+//! owns, plus the [`Config`], [`Version`], and [`Error`] types they share.
+//!
+//! Every constructor returns a `(Session, Driver)` pair. The driver is one future that reads
+//! and writes the transport and runs the session's timers; spawn it on whatever executor
+//! owns the socket. qmux spawns nothing itself and needs no tokio runtime.
 //!
 //! Everything tied to a specific transport lives in that transport's module:
 //!
 //! | Module | Entry point | Feature |
 //! | --- | --- | --- |
-//! | `tcp` | `tcp::Config` | `tcp` |
-//! | `uds` | `uds::Config` | `uds` (Unix only) |
+//! | `tcp` | `tcp::connect`, `tcp::accept` | `tcp` |
+//! | `uds` | `uds::connect`, `uds::accept` | `uds` (Unix only) |
 //! | `tls` | `tls::Client`, `tls::Server` | `tls` |
 //! | `ws` | `ws::Client`, `ws::Server`, `ws::Upgraded` | `ws` |
 //! | [`transport`] | [`transport::Transport`] | |
@@ -31,6 +35,7 @@
 #[cfg(any(feature = "tls", feature = "ws"))]
 mod alpn;
 mod config;
+mod driver;
 mod error;
 mod protocol;
 mod session;
@@ -56,18 +61,17 @@ pub mod tls;
 pub mod ws;
 
 pub use config::{Config, Protocol};
+pub use driver::Driver;
 pub use error::Error;
-pub use moq_quic::mux::Version;
+#[cfg(feature = "ws")]
+pub use error::WebSocketError;
+pub use moq_quic::connection::mux::Version;
+pub use moq_quic::{Limits, LimitsError};
 pub use session::{RecvStream, SendGroup, SendStream, Session};
-#[cfg(unix)]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use socket::TcpStats;
 pub use socket::{SharedSocketStats, SocketStats};
 
-/// Every supported version's bare ALPN, newest first
-///
-/// Use this when configuring TLS to advertise QMux support. For one version's ALPN, use
-/// [`Version::alpn()`].
-pub const ALPNS: &[&str] = &["qmux-02", "qmux-01", "qmux-00"];
-
 /// The largest frame draft-00 accepts, header included
+#[cfg(any(feature = "tcp", all(unix, feature = "uds"), feature = "ws"))]
 const MAX_FRAME_SIZE: usize = 16384;

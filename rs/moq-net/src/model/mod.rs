@@ -1,8 +1,10 @@
 pub mod bandwidth;
 pub mod broadcast;
 pub mod cache;
+pub mod datagram;
 pub mod frame;
 pub mod group;
+pub mod socket;
 pub mod track;
 
 // The origin + announce subsystem shares one implementation (a route table).
@@ -10,6 +12,8 @@ pub mod track;
 // modules so neither leaks the other's plumbing.
 #[path = "origin.rs"]
 mod origin_impl;
+// The app-level announcement listing over a route stream.
+mod announced;
 // Reduces the routes covering one path to the one serving it.
 mod follow;
 // The failover state machine origin fronts run; pure, so its transitions are
@@ -19,75 +23,89 @@ mod front;
 mod aborts;
 mod bytes;
 mod clock;
-// private: passthrough
-pub(crate) mod datagram;
 mod delivered;
 mod expiry;
+// The early exit a read nothing woke takes.
+mod idle;
+pub(crate) mod record;
+mod skipped;
+// How far a group's writer reads ahead of its fastest reader.
+pub(crate) mod pace;
 // The DEFLATE codec behind compressed tracks.
 mod flate;
-// private: passthrough
 pub(crate) mod object;
-mod requests;
+mod request_queue;
 mod resume;
+// Resume checked against a model of one logical track.
+#[cfg(all(test, feature = "async"))]
+mod resume_model;
 mod subscription;
 mod time;
 mod timed;
 mod weak_cache;
 
-#[cfg(test)]
-mod test_tracing;
-
-use requests::Requests;
+use request_queue::RequestQueue;
 use weak_cache::{WeakCache, WeakEntry};
 
 pub use bytes::*;
-// pending: /quest/m1/public-model/serve.md
-pub(crate) use subscription::Cap;
-// Datagram stays flat at the crate root (a small track-adjacent wire type),
-// not under a role module.
-pub use datagram::*;
 pub use time::*;
 pub use timed::Timed;
 
-/// Publishing broadcasts, announcing routes, and consuming both through an origin.
+/// Routing broadcasts into an origin, and consuming them through it.
 pub mod origin {
-	pub use super::follow::AnnouncedBroadcast;
+	pub use super::follow::Following;
+	#[cfg(all(feature = "async", any(test, feature = "fuzz")))]
+	pub(crate) use super::origin_impl::Footprint;
+	pub(crate) use super::origin_impl::HiddenWithheld;
+	#[cfg(feature = "async")]
+	pub(crate) use super::origin_impl::HiddenWithholding;
+	#[cfg(feature = "async")]
+	// private: capability gap
+	pub(crate) use super::origin_impl::Lookup;
+	#[cfg(feature = "async")]
+	pub(crate) use super::origin_impl::Mounted;
+	#[cfg(feature = "async")]
+	pub(crate) use super::origin_impl::NodeFilter;
 	pub use super::origin_impl::{
-		Config, Consumer, Cost, DEFAULT_UPDATE_HOLD, Driver, Dynamic, Preference, Prepared, Producer, Request,
-		Requesting, Route, Routing, Source,
+		Claim, Config, Consumer, Cost, Driver, Link, Preference, Producer, Request, Requesting, Route, RouteInfo,
+		RouteOptions, Source,
 	};
+	pub use crate::route::RouteKey;
+
+	// Relay-level: every route change, for forwarding and stats. Apps read
+	// `announce` and `follow` instead.
+	pub use super::origin_impl::{RouteEvent, RouteKind, Routes};
 }
 
-/// Subscribing to route (un)announcements from an origin.
+/// Listing the paths announced on an origin.
 pub mod announce {
-	pub use super::follow::Follow;
-	pub use super::origin_impl::{Announce, AnnounceConsumer as Consumer, AnnounceEvent as Event};
+	pub use super::announced::{AnnounceConsumer as Consumer, AnnounceEvent as Event};
+	pub use super::origin_impl::Announce;
 }
 
-// Hop identity and the `Consume` conversion trait aren't part of a role
-// module; keep them flat at the crate root.
-pub use origin_impl::{Consume, Hop, Hops, InvalidHop};
+// The `Consume` conversion trait isn't part of a role module; keep it flat at the
+// crate root.
+pub use origin_impl::Consume;
+
+// Hop chains are transit facts the origin and sessions fill in; applications see
+// plain ids.
+pub(crate) use origin_impl::{Hop, Hops, InvalidHop};
 
 // The announce-interest prefixes a scope needs on a prefix-shaped wire.
 #[cfg(feature = "async")]
-// pending: /quest/m1/public-model/answer.md
 pub(crate) use origin_impl::interest_prefixes;
 
 // Held by a session while its peer's initial announcements arrive.
 #[cfg(feature = "async")]
-// pending: /quest/m1/public-model/answer.md
 pub(crate) use origin_impl::Snapshot;
 
 // What a client session asks its peer to announce, as the origin's readers change.
 #[cfg(feature = "async")]
-// pending: /quest/m1/public-model/answer.md
 pub(crate) use origin_impl::{InterestChange, Interests};
 
 // The advertise-only route guard, for tests shaping the route table.
 #[cfg(all(test, feature = "async"))]
-// private: test
 pub(crate) use origin_impl::AnnounceProducer;
 
 #[cfg(all(test, feature = "async"))]
-// private: test
-pub(crate) use origin_impl::ProduceTest;
+pub(crate) use origin_impl::{ProduceTest, TestSelection};

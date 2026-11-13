@@ -14,7 +14,10 @@
 //! a record derived from the codec string, or an avcC/hvcC synthesized from
 //! in-band parameter sets.
 
+use std::ops::Bound;
 use std::task::{Poll, ready};
+
+use std::time::Duration;
 
 use bytes::Bytes;
 use hang::catalog::{AudioConfig, Container, Reference, VideoCodec, VideoConfig};
@@ -55,30 +58,103 @@ impl VideoTransform {
 /// A subscription that resolves on first poll, then the live consumer.
 enum SourceState {
 	/// Waiting for the target broadcast (the catalog broadcast, or a cross-broadcast
-	/// reference) to resolve; the track (by name) is subscribed once it does.
-	Requesting(crate::Binding, String),
+	/// reference) to resolve; [`Target::track`] is subscribed once it does.
+	Requesting { binding: crate::Binding, start: Start },
 	/// Waiting for the subscription to resolve (blocks on the publisher's SUBSCRIBE_OK).
-	Subscribing(kio::Pending<moq_net::track::Subscribing>),
+	Subscribing {
+		pending: Box<kio::Pending<moq_net::track::Subscribing>>,
+		media: HangContainer,
+		live: bool,
+		instance: Option<moq_net::broadcast::Consumer>,
+	},
 	/// The resolved consumer, reading frames. Boxed because it's much larger than
-	/// the `Subscribing` variant (clippy `large_enum_variant`).
-	Active(Box<Consumer<HangContainer>>),
+	/// the other variants (clippy `large_enum_variant`).
+	Active(Box<Active>),
+	/// The track ended, the sibling instance it read went, or the source was stopped.
+	Ended,
+}
+
+/// How a source subscribes, fixed before its first poll.
+struct Start {
+	/// Wire format the consumer decodes.
+	media: HangContainer,
+	/// Start at the newest group, rather than the oldest the max delay still reaches.
+	live: bool,
+	/// Read only groups after this one, so a resubscription skips groups already read.
+	after: Option<u64>,
+}
+
+/// A resolved subscription.
+struct Active {
+	consumer: Consumer<HangContainer>,
+	/// Keeps the subscription's priority registered while it reads.
+	_priority: crate::source::Priority,
+	/// The sibling broadcast the rendition reads: its end ends the rendition.
+	instance: Option<moq_net::broadcast::Consumer>,
+}
+
+/// The track a source reads: its broadcast's path, the instance that broadcast must have, and
+/// the track's name there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Target {
+	path: moq_net::Path,
+	instance: Option<moq_net::Instance>,
+	track: String,
+}
+
+impl Target {
+	/// Where rendition `name` reads, or `None` when its reference escapes the root.
+	fn of(source: &crate::Source, name: &str, config: &impl Reference) -> Option<Self> {
+		Some(Self {
+			path: source.resolve_reference(config.broadcast())?,
+			instance: config.instance().cloned(),
+			track: config.track(name).to_string(),
+		})
+	}
+
+	fn request(&self, source: &crate::Source, media: HangContainer) -> SourceState {
+		SourceState::Requesting {
+			binding: source.request_path(&self.path, self.instance.as_ref()),
+			start: Start {
+				media,
+				live: false,
+				after: None,
+			},
+		}
+	}
+}
+
+/// Where a rendition's source stopped reading ([`ExportSource::resume`]).
+pub(crate) struct Resume {
+	target: Target,
+	/// The group of the last frame delivered.
+	group: Option<u64>,
+	/// The latest presentation time delivered.
+	latest: Option<Duration>,
+}
+
+/// What a source continuing another rendition's track skips: media up to what that track delivered.
+struct Splice {
+	/// The latest presentation time the previous track delivered.
+	read: Duration,
+	/// The group of the first frame read, the only one that may overlap `read`.
+	group: Option<u64>,
 }
 
 /// A per-rendition source that normalizes frame shape (Annex-B →
 /// length-prefixed for H.264/H.265) and exposes the resolved codec config
 /// record alongside the frame stream.
 pub(crate) struct ExportSource {
+	/// The rendition's ID in the catalog.
+	name: String,
+	source: crate::Source,
+	target: Target,
 	state: SourceState,
-	/// Wire format, consumed when the subscription resolves into a consumer.
-	media: Option<HangContainer>,
-	max_delay: std::time::Duration,
-	/// Start at the newest group, rather than the oldest the max delay still reaches.
-	live: bool,
-	/// The first group to read, so a resubscription skips groups already read.
-	start: Option<u64>,
+	/// Where the subscription starts behind the live edge, and how late a group may fall.
+	delay: moq_net::track::Delay,
 	transform: Option<VideoTransform>,
 	/// Resolved codec configuration record (avcC / hvcC / AudioSpecificConfig /
-	/// OpusHead). Some once the codec config is available — from the catalog
+	/// OpusHead). Some once the codec config is available - from the catalog
 	/// `description`, or synthesized by the transform.
 	description: Option<Bytes>,
 	/// Video codec used to derive geometry from its configuration or keyframes.
@@ -97,6 +173,12 @@ pub(crate) struct ExportSource {
 	ends: Option<(u64, u64)>,
 	/// The counters the export source reports for this rendition, as received, before any transform.
 	received: std::sync::Arc<crate::stats::Received>,
+	/// The latest presentation time delivered, here or by the source this one resumes.
+	latest: Option<Duration>,
+	/// The group of the last frame delivered.
+	delivered: Option<u64>,
+	/// Set while continuing another source, until the first sync frame past what it delivered.
+	splice: Option<Splice>,
 }
 
 impl ExportSource {
@@ -110,9 +192,9 @@ impl ExportSource {
 		source: &crate::Source,
 		name: &str,
 		config: &VideoConfig,
-		max_delay: std::time::Duration,
+		delay: moq_net::track::Delay,
 	) -> Result<Option<Self>, crate::Error> {
-		Self::video(source, name, config, max_delay, build_video_transform(config))
+		Self::video(source, name, config, delay, build_video_transform(config))
 	}
 
 	/// Subscribe to a video rendition for fMP4 export.
@@ -124,7 +206,7 @@ impl ExportSource {
 		source: &crate::Source,
 		name: &str,
 		config: &VideoConfig,
-		max_delay: std::time::Duration,
+		delay: moq_net::track::Delay,
 	) -> Result<Option<Self>, crate::Error> {
 		let record = annexb_catalog_record(config);
 		let transform = match (&config.codec, record.is_some()) {
@@ -132,7 +214,7 @@ impl ExportSource {
 			(VideoCodec::H265(_), true) => Some(VideoTransform::InBand(InBand::new(InBandCodec::H265))),
 			_ => build_video_transform(config),
 		};
-		let mut source = Self::video(source, name, config, max_delay, transform)?;
+		let mut source = Self::video(source, name, config, delay, transform)?;
 		if let (Some(source), Some(record)) = (source.as_mut(), record) {
 			source.description = Some(record);
 		}
@@ -149,44 +231,30 @@ impl ExportSource {
 		source: &crate::Source,
 		name: &str,
 		config: &VideoConfig,
-		max_delay: std::time::Duration,
+		delay: moq_net::track::Delay,
 	) -> Result<Option<Self>, crate::Error> {
-		Self::video(source, name, config, max_delay, None)
+		Self::video(source, name, config, delay, None)
 	}
 
 	fn video(
 		source: &crate::Source,
 		name: &str,
 		config: &VideoConfig,
-		max_delay: std::time::Duration,
+		delay: moq_net::track::Delay,
 		transform: Option<VideoTransform>,
 	) -> Result<Option<Self>, crate::Error> {
 		let media: HangContainer = config.try_into()?;
-		let description = config.description.as_ref().filter(|b| !b.is_empty()).cloned();
-		let Some(request) = source.try_request(config) else {
+		let Some(target) = Target::of(source, name, config) else {
 			return Ok(None);
 		};
 
-		let mut source = Self {
-			state: SourceState::Requesting(request, config.track(name).to_string()),
-			media: Some(media),
-			max_delay,
-			live: false,
-			start: None,
-			transform,
-			description,
-			video_codec: Some(config.codec.clone()),
-			video_dimensions: catalog_dimensions(config),
-			absorbed_keyframe: false,
-			skips: 0,
-			markers: 0,
-			open: false,
-			cuts: 0,
-			ends: None,
-			received: source.received(name),
-		};
-		source.resolve_video_dimensions(&[])?;
-		Ok(Some(source))
+		let mut export = Self::new(source, name, target, media, delay);
+		export.transform = transform;
+		export.description = config.description.as_ref().filter(|b| !b.is_empty()).cloned();
+		export.video_codec = Some(config.codec.clone());
+		export.video_dimensions = catalog_dimensions(config);
+		export.resolve_video_dimensions(&[])?;
+		Ok(Some(export))
 	}
 
 	/// Subscribe to an audio rendition. Audio has no codec-shape transform;
@@ -197,32 +265,16 @@ impl ExportSource {
 		source: &crate::Source,
 		name: &str,
 		config: &AudioConfig,
-		max_delay: std::time::Duration,
+		delay: moq_net::track::Delay,
 	) -> Result<Option<Self>, crate::Error> {
 		let media: HangContainer = config.try_into()?;
-		let description = config.description.as_ref().filter(|b| !b.is_empty()).cloned();
-		let Some(request) = source.try_request(config) else {
+		let Some(target) = Target::of(source, name, config) else {
 			return Ok(None);
 		};
 
-		Ok(Some(Self {
-			state: SourceState::Requesting(request, config.track(name).to_string()),
-			media: Some(media),
-			max_delay,
-			live: false,
-			start: None,
-			transform: None,
-			description,
-			video_codec: None,
-			video_dimensions: None,
-			absorbed_keyframe: false,
-			skips: 0,
-			markers: 0,
-			open: false,
-			cuts: 0,
-			ends: None,
-			received: source.received(name),
-		}))
+		let mut export = Self::new(source, name, target, media, delay);
+		export.description = config.description.as_ref().filter(|b| !b.is_empty()).cloned();
+		Ok(Some(export))
 	}
 
 	/// Subscribe to a verbatim `mpegts` stream rendition (SCTE-35, private PES, ...).
@@ -231,17 +283,30 @@ impl ExportSource {
 	///
 	/// Such a rendition has no catalog `broadcast` field, so it always lives on the
 	/// catalog broadcast and can never carry an escaping reference.
-	pub fn for_stream(
+	pub fn for_stream(source: &crate::Source, name: &str, delay: moq_net::track::Delay) -> Result<Self, crate::Error> {
+		let target = Target {
+			path: source.path().clone(),
+			instance: None,
+			track: name.to_string(),
+		};
+		let media = HangContainer::Legacy(crate::container::Kind::Data);
+		Ok(Self::new(source, name, target, media, delay))
+	}
+
+	/// A source of rendition `name` reading `target`, with no codec configuration yet.
+	fn new(
 		source: &crate::Source,
 		name: &str,
-		max_delay: std::time::Duration,
-	) -> Result<Self, crate::Error> {
-		Ok(Self {
-			state: SourceState::Requesting(source.request_catalog(), name.to_string()),
-			media: Some(HangContainer::Legacy(crate::container::Kind::Data)),
-			max_delay,
-			live: false,
-			start: None,
+		target: Target,
+		media: HangContainer,
+		delay: moq_net::track::Delay,
+	) -> Self {
+		Self {
+			name: name.to_string(),
+			source: source.clone(),
+			state: target.request(source, media),
+			target,
+			delay,
 			transform: None,
 			description: None,
 			video_codec: None,
@@ -253,7 +318,54 @@ impl ExportSource {
 			cuts: 0,
 			ends: None,
 			received: source.received(name),
-		})
+			latest: None,
+			delivered: None,
+			splice: None,
+		}
+	}
+
+	/// Whether this source reads the track `config` names for rendition `name`. A catalog update
+	/// that moves the rendition to another track or broadcast needs a new source.
+	pub(crate) fn reads(&self, source: &crate::Source, name: &str, config: &impl Reference) -> bool {
+		Target::of(source, name, config).is_some_and(|target| target == self.target)
+	}
+
+	/// Carry on from `previous`, the source this rendition read before the catalog moved it to
+	/// this source's track, as [`Self::resuming`] does. Its counters run on, the move counting as
+	/// a skip that cuts the group `previous` was reading, if any.
+	pub(crate) fn continuing(mut self, previous: &ExportSource) -> Self {
+		let ends = previous.ends.map_or(0, |(_, count)| count);
+		self.skips = previous.skips + ends + 1;
+		self.markers = previous.markers + ends;
+		self.cuts = previous.cuts + u64::from(previous.open);
+		self.resuming(&previous.resume())
+	}
+
+	/// Where this source stopped reading, for a later source of the same rendition.
+	pub(crate) fn resume(&self) -> Resume {
+		Resume {
+			target: self.target.clone(),
+			group: self.delivered,
+			latest: self.latest,
+		}
+	}
+
+	/// Pick up where an earlier source of this rendition stopped.
+	///
+	/// On the same track, start after the last group it delivered, so the publisher's cached
+	/// group is not replayed. Another track is new content, read from its live edge, and the
+	/// rendition never goes back in time: frames are dropped until a sync frame past the latest
+	/// one delivered. On a shared clock the first group read may overlap that, but a later group
+	/// that still does fails with [`Error::RenditionRewound`](crate::Error::RenditionRewound).
+	pub(crate) fn resuming(mut self, resume: &Resume) -> Self {
+		if resume.target == self.target {
+			self.start().after = resume.group;
+		} else {
+			self.start().live = true;
+			self.splice = resume.latest.map(|read| Splice { read, group: None });
+		}
+		self.latest = resume.latest;
+		self
 	}
 
 	/// Start at the newest group, the live edge, rather than the oldest one the max delay still
@@ -261,22 +373,24 @@ impl ExportSource {
 	/// hop drops each group a newer one supersedes, and raising it later cannot recover the
 	/// groups that follow the edge.
 	pub fn live(mut self) -> Self {
-		self.live = true;
+		self.start().live = true;
 		self
 	}
 
-	/// Start after `group`, so a resubscription never replays a group already read, such as
-	/// the one the publisher still caches from before the rendition left.
-	pub(crate) fn after(mut self, group: u64) -> Self {
-		self.start = Some(group + 1);
-		self
+	/// The subscription options a builder sets. Each builder consumes a source no poll has
+	/// moved out of [`SourceState::Requesting`], since only the constructors hand one out.
+	fn start(&mut self) -> &mut Start {
+		match &mut self.state {
+			SourceState::Requesting { start, .. } => start,
+			_ => unreachable!("configured after polling"),
+		}
 	}
 
 	/// The group sequence of the last frame read, or None until the subscription resolves.
 	/// Meaningful only once a frame was read.
 	pub(crate) fn group(&self) -> Option<u64> {
 		match &self.state {
-			SourceState::Active(consumer) => Some(consumer.group()),
+			SourceState::Active(active) => Some(active.consumer.group()),
 			_ => None,
 		}
 	}
@@ -356,58 +470,155 @@ impl ExportSource {
 		loop {
 			match ready!(self.poll_event(waiter))? {
 				Some(Event::Frame { frame, .. }) => return Poll::Ready(Ok(Some(frame))),
-				Some(Event::GroupEnd | Event::FrameEnd { .. } | Event::Cut) => continue,
+				Some(Event::GroupEnd | Event::FrameEnd { .. } | Event::Cut { .. }) => continue,
 				None => return Poll::Ready(Ok(None)),
 			}
 		}
 	}
 
+	/// Receive group handles and wait for all input bytes while frame delivery is backpressured.
+	pub fn poll_received(&mut self, waiter: &kio::Waiter) -> Poll<()> {
+		match &mut self.state {
+			SourceState::Active(active) => active.consumer.poll_received(waiter),
+			SourceState::Ended => Poll::Ready(()),
+			_ => Poll::Pending,
+		}
+	}
+
 	/// Read normalized media or a clean group boundary.
 	pub fn poll_event(&mut self, waiter: &kio::Waiter) -> Poll<crate::Result<Option<Event>>> {
-		// Resolve a cross-broadcast reference into a broadcast before subscribing.
-		if matches!(self.state, SourceState::Requesting(..)) {
-			let (broadcast, name) = {
-				let SourceState::Requesting(pending, name) = &self.state else {
-					unreachable!("just matched Requesting");
-				};
-				(ready!(pending.poll_broadcast(waiter))?, name.clone())
-			};
-			let mut subscription = moq_net::track::Subscription::default().with_max_delay(self.max_delay);
-			if let Some(start) = self.start {
-				subscription = subscription.with_groups(start..);
+		loop {
+			let event = ready!(self.poll_track(waiter))?;
+			match &event {
+				Some(Event::Frame { frame, .. }) => {
+					if !self.spliced(frame)? {
+						continue;
+					}
+					let at = Duration::from(frame.timestamp);
+					self.latest = Some(self.latest.map_or(at, |latest| latest.max(at)));
+					self.delivered = self.group();
+				}
+				// The boundaries of frames the splice dropped.
+				Some(_) if self.splice.is_some() => continue,
+				_ => {}
 			}
-			self.state = SourceState::Subscribing(broadcast.track(&name)?.subscribe(subscription));
+			return Poll::Ready(Ok(event));
+		}
+	}
+
+	/// Whether `frame` goes out, rather than being dropped as media the previous track of a
+	/// [continued](Self::continuing) rendition already covered.
+	fn spliced(&mut self, frame: &Frame) -> crate::Result<bool> {
+		let group = self.group();
+		let sync = frame.keyframe || self.video_codec.is_none();
+		let Some(splice) = self.splice.as_mut() else {
+			return Ok(true);
+		};
+		let at = Duration::from(frame.timestamp);
+		if sync && at > splice.read {
+			self.splice = None;
+			return Ok(true);
+		}
+		let first = *splice.group.get_or_insert_with(|| group.unwrap_or_default());
+		if frame.keyframe && group != Some(first) {
+			return Err(crate::Error::RenditionRewound {
+				rendition: self.name.clone(),
+				start: at,
+				read: splice.read,
+			});
+		}
+		Ok(false)
+	}
+
+	/// Read the track's normalized media or a clean group boundary.
+	fn poll_track(&mut self, waiter: &kio::Waiter) -> Poll<crate::Result<Option<Event>>> {
+		// Resolve a cross-broadcast reference into a broadcast before subscribing.
+		if let SourceState::Requesting { binding, start } = &self.state {
+			let broadcast = ready!(binding.poll_broadcast(waiter))?;
+			let instance = binding.sibling().then(|| broadcast.clone());
+			let mut subscription = moq_net::track::Subscription::default().with_delay(self.delay);
+			if let Some(after) = start.after {
+				subscription = subscription.with_range((Bound::Excluded(after), Bound::Unbounded));
+			}
+			let track = match broadcast.track(&self.target.track) {
+				Ok(track) => track,
+				Err(_) if instance.as_ref().is_some_and(|i| i.poll_closed(waiter).is_ready()) => return self.end(),
+				Err(err) => return Poll::Ready(Err(err.into())),
+			};
+			let pending = Box::new(track.subscribe(self.source.subscription(subscription)));
+			let SourceState::Requesting { start, .. } = std::mem::replace(&mut self.state, SourceState::Ended) else {
+				unreachable!("just matched Requesting");
+			};
+			self.state = SourceState::Subscribing {
+				pending,
+				media: start.media,
+				live: start.live,
+				instance,
+			};
 		}
 
 		// Resolve the subscription before reading any frames.
-		if matches!(self.state, SourceState::Subscribing(_)) {
-			// Scope the `pending` borrow so it ends before we touch `self.media`/`self.state`.
-			let track = {
-				let SourceState::Subscribing(pending) = &self.state else {
-					unreachable!("just matched Subscribing");
-				};
-				ready!(pending.poll_ok(waiter))?
+		if let SourceState::Subscribing { pending, instance, .. } = &self.state {
+			let track = match pending.poll_ok(waiter) {
+				Poll::Ready(Ok(track)) => track,
+				Poll::Ready(Err(_)) | Poll::Pending
+					if instance.as_ref().is_some_and(|i| i.poll_closed(waiter).is_ready()) =>
+				{
+					return self.end();
+				}
+				Poll::Ready(Err(err)) => return Poll::Ready(Err(err.into())),
+				Poll::Pending => return Poll::Pending,
 			};
-			let media = self
-				.media
-				.take()
-				.expect("media present until the subscription resolves");
+			let priority = self.source.control(track.control())?;
+			let SourceState::Subscribing {
+				media, live, instance, ..
+			} = std::mem::replace(&mut self.state, SourceState::Ended)
+			else {
+				unreachable!("just matched Subscribing");
+			};
 			let consumer = Consumer::new(track, media);
-			let consumer = match self.live {
+			let consumer = match live {
 				true => consumer.live(),
 				false => consumer,
 			};
-			self.state = SourceState::Active(Box::new(consumer));
+			self.state = SourceState::Active(Box::new(Active {
+				consumer,
+				_priority: priority,
+				instance,
+			}));
 		}
 
 		loop {
 			// Scope the consumer borrow to the poll so `self.transform` /
 			// `self.refresh_description` can borrow `self` afterwards.
 			let (frame, arrived) = {
-				let SourceState::Active(consumer) = &mut self.state else {
-					unreachable!("subscription resolved into an Active consumer");
+				let SourceState::Active(active) = &mut self.state else {
+					return Poll::Ready(Ok(None));
 				};
-				match ready!(consumer.poll_item(waiter))? {
+				let consumer = &mut active.consumer;
+				let item = match consumer.poll_item(waiter) {
+					Poll::Ready(Ok(item)) => item,
+					// Only an orderly shutdown of the instance is its end: malformed media or a
+					// failed transport still fails the export.
+					Poll::Ready(Err(crate::Error::Moq(
+						moq_net::Error::Cancel
+						| moq_net::Error::Closed
+						| moq_net::Error::GoingAway
+						| moq_net::Error::Stream(moq_net::StreamError::Session(moq_net::SessionError::Cancel))
+						| moq_net::Error::Session(moq_net::SessionError::Cancel),
+					)))
+					| Poll::Pending
+						if active
+							.instance
+							.as_ref()
+							.is_some_and(|instance| instance.poll_closed(waiter).is_ready()) =>
+					{
+						return self.end();
+					}
+					Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+					Poll::Pending => return Poll::Pending,
+				};
+				match item {
 					Some(Item::Frame { group, frame, arrived }) => {
 						if self.ends.is_some_and(|(end_group, _)| end_group != group) {
 							self.finish_ends();
@@ -443,15 +654,12 @@ impl ExportSource {
 						return Poll::Ready(Ok(Some(Event::GroupEnd)));
 					}
 					// The skip is counted with the gap the next group reads.
-					Some(Item::Cut) => {
+					Some(Item::Cut { observed }) => {
 						self.finish_ends();
 						self.cuts += u64::from(std::mem::take(&mut self.open));
-						return Poll::Ready(Ok(Some(Event::Cut)));
+						return Poll::Ready(Ok(Some(Event::Cut { observed })));
 					}
-					None => {
-						self.finish_ends();
-						return Poll::Ready(Ok(None));
-					}
+					None => return self.end(),
 				}
 			};
 
@@ -484,6 +692,32 @@ impl ExportSource {
 				}
 			}
 		}
+	}
+
+	/// Release a replaced instance's subscription while keeping its resolved metadata.
+	pub(crate) fn stop(&mut self) {
+		self.finish_ends();
+		self.state = SourceState::Ended;
+	}
+
+	/// Whether the sibling broadcast this rendition reads has stopped serving.
+	#[cfg(test)]
+	fn instance_ended(&self, waiter: &kio::Waiter) -> bool {
+		let instance = match &self.state {
+			SourceState::Subscribing { instance, .. } => instance.as_ref(),
+			SourceState::Active(active) => active.instance.as_ref(),
+			_ => None,
+		};
+		instance.is_some_and(|instance| instance.poll_closed(waiter).is_ready())
+	}
+
+	/// End the rendition: its track ended, or the sibling instance it read went. Its track
+	/// stalling or failing then is that instance's end, which ends the rendition rather than the
+	/// export once what it delivered is read; following the instance that replaces it is the
+	/// export's own call.
+	fn end(&mut self) -> Poll<crate::Result<Option<Event>>> {
+		self.stop();
+		Poll::Ready(Ok(None))
 	}
 
 	fn finish_ends(&mut self) {
@@ -551,6 +785,40 @@ pub(crate) fn codec_dimensions(
 	Ok(dimensions.filter(|(width, height)| *width > 0 && *height > 0))
 }
 
+/// The picture size the last (for H.265, base-layer) SPS in a length-prefixed sample declares, for an H.264 or H.265 track
+/// that keeps its parameter sets in band beside its config record (avc3, hev1): the record fixes the
+/// NAL length size, while any keyframe may redefine the size. `None` for any other track, or a
+/// sample carrying no SPS.
+pub(crate) fn in_band_dimensions(
+	codec: &VideoCodec,
+	description: &[u8],
+	payload: &[u8],
+) -> crate::Result<Option<(u32, u32)>> {
+	let (h265, length_size) = match codec {
+		VideoCodec::H264(h264) if h264.inline => (false, crate::codec::h264::avcc_params(description)?.0),
+		VideoCodec::H265(h265) if h265.in_band => (true, crate::codec::h265::hvcc_params(description)?.0),
+		_ => return Ok(None),
+	};
+	let is_sps = |nal: &[u8]| match h265 {
+		false => nal[0] & 0x1f == 7,
+		true => (nal[0] >> 1) & 0x3f == 33 && crate::codec::h265::is_base_layer(nal),
+	};
+	let Some(sps) = crate::codec::annexb::length_prefixed_nals(payload, length_size)?
+		.map_while(|nal| nal.ok())
+		.filter(|nal| !nal.is_empty() && is_sps(nal))
+		.last()
+	else {
+		return Ok(None);
+	};
+	let size = match h265 {
+		false => crate::codec::h264::Sps::parse(sps)
+			.ok()
+			.map(|sps| (sps.coded_width, sps.coded_height)),
+		true => crate::codec::h265::sps_size(sps),
+	};
+	Ok(size.filter(|(width, height)| *width > 0 && *height > 0))
+}
+
 /// An avcC or hvcC derived from the catalog codec string, when that string and
 /// the catalog dimensions are everything the fMP4 sample entry needs.
 ///
@@ -606,14 +874,14 @@ mod tests {
 			inline: true,
 		});
 		config.container = Container::Legacy;
-		config.broadcast = broadcast.map(|b| Relative::new(b).into_owned());
+		config.broadcast = broadcast.map(|rel| Relative::new(rel).unwrap());
 		config
 	}
 
 	fn audio(broadcast: Option<&str>) -> AudioConfig {
 		let mut config = AudioConfig::new(AudioCodec::Opus, 48_000, 2);
 		config.container = Container::Legacy;
-		config.broadcast = broadcast.map(|b| Relative::new(b).into_owned());
+		config.broadcast = broadcast.map(|rel| Relative::new(rel).unwrap());
 		config
 	}
 
@@ -624,7 +892,7 @@ mod tests {
 	async fn escaping_reference_skips_the_rendition() {
 		let live = Live::avc3();
 		let source = live.source().await;
-		let max_delay = std::time::Duration::ZERO;
+		let delay = moq_net::track::Delay::default();
 
 		let escaping = |result: Result<Option<ExportSource>, crate::Error>, what: &str| match result {
 			Ok(None) => {}
@@ -636,13 +904,10 @@ mod tests {
 		// single-segment path, so its parent is the root and any `..` walks above it.
 		for reference in ["..", "../source", "../../elsewhere"] {
 			let config = video(Some(reference));
-			escaping(ExportSource::for_video(&source, "video", &config, max_delay), reference);
+			escaping(ExportSource::for_video(&source, "video", &config, delay), reference);
+			escaping(ExportSource::for_video_raw(&source, "video", &config, delay), reference);
 			escaping(
-				ExportSource::for_video_raw(&source, "video", &config, max_delay),
-				reference,
-			);
-			escaping(
-				ExportSource::for_audio(&source, "audio", &audio(Some(reference)), max_delay),
+				ExportSource::for_audio(&source, "audio", &audio(Some(reference)), delay),
 				reference,
 			);
 		}
@@ -654,16 +919,191 @@ mod tests {
 	async fn legal_reference_keeps_the_rendition() {
 		let live = Live::avc3();
 		let source = live.source().await;
-		let max_delay = std::time::Duration::ZERO;
+		let delay = moq_net::track::Delay::default();
 
 		for reference in [None, Some(""), Some("./source"), Some("sub"), Some(".")] {
-			ExportSource::for_video(&source, "video", &video(reference), max_delay)
+			ExportSource::for_video(&source, "video", &video(reference), delay)
 				.unwrap_or_else(|err| panic!("{reference:?} should keep the rendition: {err:?}"))
 				.unwrap_or_else(|| panic!("{reference:?} should keep the rendition"));
-			ExportSource::for_audio(&source, "audio", &audio(reference), max_delay)
+			ExportSource::for_audio(&source, "audio", &audio(reference), delay)
 				.unwrap_or_else(|err| panic!("{reference:?} should keep the rendition: {err:?}"))
 				.unwrap_or_else(|| panic!("{reference:?} should keep the rendition"));
 		}
+	}
+
+	/// A sibling rendition's first announcement starts it, a replacement is never read, and its
+	/// instance going ends the rendition instead of failing the export, both mid-stream and
+	/// before the subscription resolves.
+	#[tokio::test(start_paused = true)]
+	async fn a_sibling_rendition_starts_late_and_ends_with_its_instance() {
+		use std::time::Duration;
+
+		use crate::container::test_util::raw_frame;
+
+		let origin = crate::source::produce_origin();
+		let _catalog = origin.route("a/pub", Default::default()).unwrap();
+		tokio::task::yield_now().await;
+		let source = crate::source::resolved(&origin, "a/pub").await;
+		let config = audio(Some("./source"));
+		let mut export = ExportSource::for_audio(
+			&source,
+			"audio",
+			&config,
+			moq_net::track::Delay::default().with_max(Duration::from_secs(10)),
+		)
+		.unwrap()
+		.unwrap();
+		let mut read = async || {
+			kio::clock::timeout(Duration::from_millis(100), kio::wait(|waiter| export.poll_read(waiter)))
+				.await
+				.ok()
+				.map(|frame| frame.unwrap().map(|frame| frame.timestamp.as_micros()))
+		};
+		let wire = || HangContainer::Legacy(crate::container::Kind::Audio);
+		let info = || hang::container::track_info(hang::catalog::PRIORITY.audio);
+
+		assert_eq!(read().await, None, "nothing announces the sibling yet");
+		let old = origin.route("a/source", Default::default()).unwrap();
+		let mut track = crate::container::Producer::new(old.broadcast().create_track("audio", info()).unwrap(), wire());
+		track.write(raw_frame(0, b"old", true)).unwrap();
+		assert_eq!(read().await, Some(Some(0)), "the late announcement starts it");
+
+		let new = origin.route("a/source", Default::default()).unwrap();
+		let mut replacement =
+			crate::container::Producer::new(new.broadcast().create_track("audio", info()).unwrap(), wire());
+		replacement.write(raw_frame(1_000_000, b"new", true)).unwrap();
+		track.write(raw_frame(24_000, b"old", true)).unwrap();
+		assert_eq!(read().await, Some(Some(24_000)), "the replacement is never read");
+
+		drop(old);
+		assert_eq!(read().await, Some(None), "its end ends the rendition");
+
+		// A rendition still subscribing when its instance goes ends too.
+		let mut late = ExportSource::for_audio(
+			&source,
+			"late",
+			&config,
+			moq_net::track::Delay::default().with_max(Duration::from_secs(10)),
+		)
+		.unwrap()
+		.unwrap();
+		let ended = kio::clock::timeout(Duration::from_secs(1), kio::wait(|waiter| late.poll_read(waiter))).await;
+		assert!(
+			matches!(ended, Ok(Ok(None))),
+			"{:?}",
+			ended.map(|read| read.map(|_| ()))
+		);
+		drop((track, replacement, new));
+	}
+
+	/// A sibling's failure still fails the export when its instance goes, whether its media is
+	/// malformed, its track is aborted with a protocol error, or its producers went away
+	/// unfinished: only an orderly shutdown of the instance is the rendition's end.
+	#[tokio::test(start_paused = true)]
+	async fn a_sibling_failure_outlives_its_instance() {
+		use std::time::Duration;
+
+		for failure in ["malformed", "violation", "dropped"] {
+			let origin = crate::source::produce_origin();
+			let _catalog = origin.route("a/pub", Default::default()).unwrap();
+			tokio::task::yield_now().await;
+			let source = crate::source::resolved(&origin, "a/pub").await;
+			let config = audio(Some("./source"));
+			let mut export = ExportSource::for_audio(
+				&source,
+				"audio",
+				&config,
+				moq_net::track::Delay::default().with_max(Duration::from_secs(10)),
+			)
+			.unwrap()
+			.unwrap();
+
+			let sibling = origin.route("a/source", Default::default()).unwrap();
+			let track = sibling
+				.broadcast()
+				.create_track("audio", hang::container::track_info(hang::catalog::PRIORITY.audio))
+				.unwrap();
+			// Subscribe before anything is written, so the failure and the instance's end arrive
+			// together.
+			let settle = kio::clock::timeout(Duration::from_millis(100), kio::wait(|waiter| export.poll_read(waiter)));
+			assert!(settle.await.is_err(), "nothing is written yet");
+			let mut group = track.append_group().unwrap();
+			let held = match failure {
+				"malformed" => {
+					// An empty Legacy audio frame is malformed.
+					group
+						.write_frame(moq_net::Timestamp::from_micros(0).unwrap(), bytes::Bytes::new())
+						.unwrap();
+					Some((group, track))
+				}
+				"violation" => {
+					track.clone().abort(moq_net::Error::ProtocolViolation).unwrap();
+					Some((group, track))
+				}
+				_ => {
+					drop((group, track));
+					None
+				}
+			};
+			drop(sibling);
+			kio::clock::sleep(Duration::from_millis(10)).await;
+			assert!(export.instance_ended(&kio::Waiter::noop()), "the instance has gone");
+
+			let read = kio::clock::timeout(Duration::from_secs(1), kio::wait(|waiter| export.poll_read(waiter)))
+				.await
+				.expect("the read settles");
+			assert!(
+				read.is_err(),
+				"{failure}: {:?}",
+				read.map(|frame| frame.map(|frame| frame.timestamp))
+			);
+			drop(held);
+		}
+	}
+
+	/// A sibling served over a session ends the rendition cleanly when its publisher goes, which
+	/// the session reports as its own cancellation.
+	#[tokio::test(start_paused = true)]
+	async fn a_remote_sibling_ends_with_its_instance() {
+		use std::time::Duration;
+
+		use crate::container::test_util::{Link, raw_frame};
+
+		let remote = crate::source::produce_origin();
+		let origin = crate::source::produce_origin();
+		let _catalog = origin.route("a/pub", Default::default()).unwrap();
+		tokio::task::yield_now().await;
+		let source = crate::source::resolved(&origin, "a/pub").await;
+		let _link = Link::new(&remote, &origin).await;
+		let sibling = remote.route("a/source", Default::default()).unwrap();
+		let mut track = crate::container::Producer::new(
+			sibling
+				.broadcast()
+				.create_track("audio", hang::container::track_info(hang::catalog::PRIORITY.audio))
+				.unwrap(),
+			HangContainer::Legacy(crate::container::Kind::Audio),
+		);
+		track.write(raw_frame(0, b"x", true)).unwrap();
+		let mut export = ExportSource::for_audio(
+			&source,
+			"audio",
+			&audio(Some("./source")),
+			moq_net::track::Delay::default().with_max(Duration::from_secs(10)),
+		)
+		.unwrap()
+		.unwrap();
+		let mut read = async || {
+			kio::clock::timeout(Duration::from_secs(1), kio::wait(|waiter| export.poll_read(waiter)))
+				.await
+				.expect("the read settles")
+				.unwrap()
+				.map(|frame| frame.timestamp.as_micros())
+		};
+		assert_eq!(read().await, Some(0));
+
+		drop(sibling);
+		assert_eq!(read().await, None, "its end ends the rendition");
+		drop(track);
 	}
 
 	/// The requested budget must be present on the first SUBSCRIBE, a live start's too. Updating
@@ -674,7 +1114,8 @@ mod tests {
 		for live_start in [false, true] {
 			let live = Live::avc3();
 			let max_delay = std::time::Duration::from_secs(10);
-			let export = ExportSource::for_video(&live.source().await, live.track.name(), &video(None), max_delay)
+			let delay = moq_net::track::Delay::default().with_max(max_delay);
+			let export = ExportSource::for_video(&live.source().await, live.track.name(), &video(None), delay)
 				.unwrap()
 				.expect("fixture should produce a video rendition");
 			let mut export = match live_start {
@@ -685,13 +1126,13 @@ mod tests {
 			let observed = kio::wait(|waiter| {
 				let _ = export.poll_read(waiter);
 				match live.track.subscription() {
-					Some(subscription) => Poll::Ready(subscription.max_delay),
+					Some(subscription) => Poll::Ready(subscription.delay.max),
 					None => Poll::Pending,
 				}
 			})
 			.await;
 
-			assert_eq!(observed, max_delay, "live start: {live_start}");
+			assert_eq!(observed, Some(max_delay), "live start: {live_start}");
 		}
 	}
 
@@ -708,7 +1149,7 @@ mod tests {
 			&live.source().await,
 			live.track.name(),
 			&audio(None),
-			std::time::Duration::from_secs(10),
+			moq_net::track::Delay::default().with_max(std::time::Duration::from_secs(10)),
 		)
 		.unwrap()
 		.unwrap()
@@ -734,19 +1175,32 @@ mod tests {
 		let (publisher, subscriber) = (origin(1), origin(2));
 		let _link = Link::new(&publisher, &subscriber).await;
 
-		let broadcast = publisher.create_broadcast("room").unwrap();
+		let broadcast = publisher
+			.route("room", moq_net::origin::RouteOptions::hidden())
+			.unwrap();
 		let track = broadcast
+			.broadcast()
 			.create_track("audio", hang::container::track_info(hang::catalog::PRIORITY.audio))
 			.unwrap();
-		broadcast.announce(Default::default()).unwrap();
+		broadcast.announce().unwrap();
 		let consumer = subscriber.consume();
-		consumer.routed("room").await.unwrap();
-		let remote = consumer.request_broadcast("room", None).await.unwrap();
+		let remote = consumer
+			.follow("room", None)
+			.unwrap()
+			.available()
+			.await
+			.unwrap()
+			.unwrap();
 		let source = crate::Source::new(consumer, remote);
-		let mut export = ExportSource::for_audio(&source, "audio", &audio(None), Duration::from_secs(1))
-			.unwrap()
-			.unwrap()
-			.live();
+		let mut export = ExportSource::for_audio(
+			&source,
+			"audio",
+			&audio(None),
+			moq_net::track::Delay::default().with_max(Duration::from_secs(1)),
+		)
+		.unwrap()
+		.unwrap()
+		.live();
 
 		// One 24 ms frame per group, as the TS import publishes MPEG-1 audio.
 		let wire = HangContainer::Legacy(crate::container::Kind::Audio);
@@ -757,7 +1211,7 @@ mod tests {
 			group.finish().unwrap();
 		};
 		let mut read = async || {
-			tokio::time::timeout(Duration::from_millis(100), kio::wait(|waiter| export.poll_read(waiter)))
+			kio::clock::timeout(Duration::from_millis(100), kio::wait(|waiter| export.poll_read(waiter)))
 				.await
 				.ok()
 				.map(|frame| frame.unwrap().map(|frame| frame.timestamp.as_micros()))
@@ -765,7 +1219,7 @@ mod tests {
 
 		assert_eq!(read().await, None, "subscribed, with nothing published yet");
 		write(0);
-		tokio::time::sleep(Duration::from_millis(10)).await;
+		kio::clock::sleep(Duration::from_millis(10)).await;
 		// A PES carrying several frames publishes them in one pass, before the publisher's
 		// session runs again, and the export reads the first group in the meantime.
 		for sequence in 1..4 {
@@ -778,7 +1232,7 @@ mod tests {
 		for sequence in 4..8 {
 			write(sequence);
 		}
-		track.finish().unwrap();
+		let _track = track.finish().unwrap();
 		while let Some(Some(timestamp)) = read().await {
 			timestamps.push(timestamp);
 		}
@@ -812,14 +1266,22 @@ mod tests {
 				false => (Link::held(&publisher, &subscriber, 2).await, None),
 			};
 
-			let broadcast = publisher.create_broadcast("room").unwrap();
+			let broadcast = publisher
+				.route("room", moq_net::origin::RouteOptions::hidden())
+				.unwrap();
 			let track = broadcast
+				.broadcast()
 				.create_track("audio", hang::container::track_info(hang::catalog::PRIORITY.audio))
 				.unwrap();
-			broadcast.announce(Default::default()).unwrap();
+			broadcast.announce().unwrap();
 			let consumer = subscriber.consume();
-			consumer.routed("room").await.unwrap();
-			let remote = consumer.request_broadcast("room", None).await.unwrap();
+			let remote = consumer
+				.follow("room", None)
+				.unwrap()
+				.available()
+				.await
+				.unwrap()
+				.unwrap();
 			let source = crate::Source::new(consumer, remote);
 
 			// MPEG-1 audio from TS: one 24 ms frame per group, a PES of five written at once.
@@ -835,15 +1297,20 @@ mod tests {
 			// About two seconds of it, so the budget's backlog reaches back about 450 ms.
 			for n in 0..17 {
 				pes(n);
-				tokio::time::sleep(Duration::from_millis(120)).await;
+				kio::clock::sleep(Duration::from_millis(120)).await;
 			}
 
-			let mut export = ExportSource::for_audio(&source, "audio", &audio(None), Duration::from_millis(450))
-				.unwrap()
-				.unwrap()
-				.live();
+			let mut export = ExportSource::for_audio(
+				&source,
+				"audio",
+				&audio(None),
+				moq_net::track::Delay::default().with_max(Duration::from_millis(450)),
+			)
+			.unwrap()
+			.unwrap()
+			.live();
 			let mut read = async || {
-				tokio::time::timeout(Duration::from_millis(100), kio::wait(|waiter| export.poll_read(waiter)))
+				kio::clock::timeout(Duration::from_millis(100), kio::wait(|waiter| export.poll_read(waiter)))
 					.await
 					.ok()
 					.map(|frame| frame.unwrap().map(|frame| frame.timestamp.as_micros()))
@@ -855,13 +1322,13 @@ mod tests {
 			}
 			// The next PES moves the live edge on before the rest of the backlog lands.
 			pes(17);
-			tokio::time::sleep(Duration::from_millis(120)).await;
+			kio::clock::sleep(Duration::from_millis(120)).await;
 			pes(18);
 			held.open();
 			while let Some(Some(timestamp)) = read().await {
 				timestamps.push(timestamp);
 			}
-			track.finish().unwrap();
+			let _track = track.finish().unwrap();
 			while let Some(Some(timestamp)) = read().await {
 				timestamps.push(timestamp);
 			}
@@ -873,6 +1340,58 @@ mod tests {
 		}
 	}
 
+	/// A source continuing a rendition moved off a track that delivered up to `read` starts at
+	/// the first keyframe past it. Only the first group read may overlap: a later group still
+	/// behind it is a track that goes back in time.
+	#[tokio::test(start_paused = true)]
+	async fn a_continued_source_starts_past_what_its_previous_track_delivered() {
+		use crate::container::test_util::{Moving, SPS, marked_frame};
+
+		for (read, first) in [(900, Some(1_000_000)), (1_500, None)] {
+			let mut moving = Moving::new();
+			let source = moving.source().await;
+			let delay = moq_net::track::Delay::default().with_max(Duration::from_secs(10));
+			let mut previous =
+				ExportSource::for_video(&source, Moving::RENDITION, &Moving::config("a", None, SPS), delay)
+					.unwrap()
+					.unwrap();
+			previous.skips = 2;
+			previous.latest = Some(Duration::from_millis(read));
+			let mut next = ExportSource::for_video(&source, Moving::RENDITION, &Moving::config("b", None, SPS), delay)
+				.unwrap()
+				.unwrap()
+				.continuing(&previous);
+			let mut poll = async || {
+				kio::clock::timeout(Duration::from_millis(100), kio::wait(|waiter| next.poll_read(waiter))).await
+			};
+
+			// A keyframe at zero then deltas up to 967 ms, past 900 ms but no place to start.
+			for i in 0..30 {
+				moving.b.write(marked_frame(i, 0xb1)).unwrap();
+			}
+			assert!(poll().await.is_err(), "the first group overlaps: read {read}");
+			for i in 30..60 {
+				moving.b.write(marked_frame(i, 0xb1)).unwrap();
+			}
+			match (poll().await.unwrap(), first) {
+				(Ok(Some(frame)), Some(first)) => assert_eq!(frame.timestamp.as_micros(), first),
+				(
+					Err(crate::Error::RenditionRewound {
+						rendition,
+						start,
+						read: behind,
+					}),
+					None,
+				) => {
+					assert_eq!(rendition, Moving::RENDITION);
+					assert_eq!((start, behind), (Duration::from_secs(1), Duration::from_millis(read)));
+				}
+				(result, _) => panic!("read {read}: {result:?}"),
+			}
+			assert_eq!(next.skips(), 3, "the move counts as a skip");
+		}
+	}
+
 	async fn audio_export() -> (moq_net::track::Producer, ExportSource) {
 		use std::time::Duration;
 		let live = Live::audio(audio(None));
@@ -880,7 +1399,7 @@ mod tests {
 			&live.source().await,
 			live.track.name(),
 			&audio(None),
-			Duration::from_secs(10),
+			moq_net::track::Delay::default().with_max(Duration::from_secs(10)),
 		)
 		.unwrap()
 		.unwrap();
@@ -888,11 +1407,15 @@ mod tests {
 			.produce()
 			.create_track("audio", hang::container::track_info(hang::catalog::PRIORITY.audio))
 			.unwrap();
-		let consumer = Consumer::new(
-			track.subscribe(moq_net::track::Subscription::default().with_max_delay(Duration::from_secs(10))),
-			HangContainer::Legacy(crate::container::Kind::Audio),
+		let subscribed = track.subscribe(
+			moq_net::track::Subscription::default()
+				.with_delay(moq_net::track::Delay::default().with_max(Duration::from_secs(10))),
 		);
-		export.state = SourceState::Active(Box::new(consumer));
+		export.state = SourceState::Active(Box::new(Active {
+			_priority: export.source.control(subscribed.control()).unwrap(),
+			consumer: Consumer::new(subscribed, HangContainer::Legacy(crate::container::Kind::Audio)),
+			instance: None,
+		}));
 		(track, export)
 	}
 
@@ -915,7 +1438,7 @@ mod tests {
 		group(2, 40_000).finish().unwrap();
 		let cut = group(3, 60_000);
 		group(4, 80_000).finish().unwrap();
-		track.finish().unwrap();
+		let _track = track.finish().unwrap();
 
 		let waiter = kio::Waiter::noop();
 		let read = |export: &mut ExportSource| {
@@ -943,7 +1466,7 @@ mod tests {
 			wire.write(&mut group, &[raw_frame(timestamp, payload, true)]).unwrap();
 			group.finish().unwrap();
 		}
-		track.finish().unwrap();
+		let _track = track.finish().unwrap();
 		let waiter = kio::Waiter::noop();
 		assert!(matches!(
 			export.poll_event(&waiter),
@@ -994,7 +1517,7 @@ mod tests {
 			wire.write(&mut group, &frames).unwrap();
 			group.finish().unwrap();
 		}
-		track.finish().unwrap();
+		let _track = track.finish().unwrap();
 		let waiter = kio::Waiter::noop();
 		for (timestamp, generation) in [(0, 0), (40_000, 0), (100_000, 1)] {
 			let Poll::Ready(Ok(Some(frame))) = export.poll_read(&waiter) else {

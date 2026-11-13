@@ -4,12 +4,14 @@
 //! merged flag is declared twice: once on the `Args` structs the binaries parse,
 //! and once here. [`usage_rs::config::Registry::drift`] is the test that the two stay in step.
 
-#![allow(dead_code)]
+#![allow(
+	dead_code,
+	reason = "declares the settings for the usage registry; nothing reads the fields"
+)]
 
 /// Accept-side settings (`[listen]`, `--listen-*`).
 #[derive(usage_rs::Config)]
 #[usage(prefix = "listen")]
-#[doc(hidden)]
 pub struct Listen {
 	#[usage(env = "MOQ_LISTEN", cli("--listen"))]
 	bind: Option<String>,
@@ -26,11 +28,8 @@ pub struct Listen {
 	#[usage(env = "MOQ_LISTEN_PREFERRED_V6", cli("--listen-preferred-v6"))]
 	preferred_v6: Option<String>,
 
-	#[usage(env = "MOQ_LISTEN_QUIC_LB_ID", cli("--listen-quic-lb-id"))]
-	lb_id: Option<String>,
-
-	#[usage(env = "MOQ_LISTEN_QUIC_LB_NONCE", cli("--listen-quic-lb-nonce"))]
-	lb_nonce: Option<u64>,
+	#[usage(flatten)]
+	lb: ListenLb,
 
 	#[usage(flatten)]
 	reset: ListenReset,
@@ -130,10 +129,12 @@ struct ListenUnixAllow {
 /// Dial-side settings (`[connect]`, `--connect-*`).
 #[derive(usage_rs::Config)]
 #[usage(prefix = "connect")]
-#[doc(hidden)]
 pub struct Connect {
 	#[usage(env = "MOQ_CONNECT", cli("--connect"))]
 	url: Option<String>,
+
+	#[usage(env = "MOQ_CONNECT_TOKEN", cli("--connect-token"), parse = "list_by_comma")]
+	tokens: Option<Vec<String>>,
 
 	#[usage(env = "MOQ_CONNECT_BIND", cli("--connect-bind"))]
 	bind: Option<String>,
@@ -149,9 +150,6 @@ pub struct Connect {
 
 	#[usage(env = "MOQ_CONNECT_VERSION", cli("--connect-version"), parse = "list_by_comma")]
 	version: Option<Vec<String>>,
-
-	#[usage(env = "MOQ_CONNECT_ONCE", cli("--connect-once"))]
-	once: Option<bool>,
 
 	#[usage(flatten)]
 	tls: ConnectTls,
@@ -197,31 +195,31 @@ struct ConnectTls {
 	host_name: Option<String>,
 }
 
-/// `[connect.backoff]` / `--backoff-*`.
+/// `[connect.backoff]` / `--connect-backoff-*`.
 #[derive(usage_rs::Config)]
 #[usage(prefix = "connect.backoff")]
 struct ConnectBackoff {
-	#[usage(env = "MOQ_BACKOFF_INITIAL", cli("--backoff-initial"))]
+	#[usage(env = "MOQ_CONNECT_BACKOFF_INITIAL", cli("--connect-backoff-initial"))]
 	initial: Option<String>,
 
-	#[usage(env = "MOQ_BACKOFF_MULTIPLIER", cli("--backoff-multiplier"))]
+	#[usage(env = "MOQ_CONNECT_BACKOFF_MULTIPLIER", cli("--connect-backoff-multiplier"))]
 	multiplier: Option<u32>,
 
-	#[usage(env = "MOQ_BACKOFF_MAX", cli("--backoff-max"))]
+	#[usage(env = "MOQ_CONNECT_BACKOFF_MAX", cli("--connect-backoff-max"))]
 	max: Option<String>,
 
-	#[usage(env = "MOQ_BACKOFF_TIMEOUT", cli("--backoff-timeout"))]
+	#[usage(env = "MOQ_CONNECT_BACKOFF_TIMEOUT", cli("--connect-backoff-timeout"))]
 	timeout: Option<String>,
 }
 
-/// `[connect.goaway]` / `--goaway-*`.
+/// `[connect.goaway]` / `--connect-goaway-*`.
 #[derive(usage_rs::Config)]
 #[usage(prefix = "connect.goaway")]
 struct ConnectGoaway {
-	#[usage(env = "MOQ_GOAWAY_REDIRECT", cli("--goaway-redirect"))]
+	#[usage(env = "MOQ_CONNECT_GOAWAY_REDIRECT", cli("--connect-goaway-redirect"))]
 	redirect: Option<String>,
 
-	#[usage(env = "MOQ_GOAWAY_HANDOVER", cli("--goaway-handover"))]
+	#[usage(env = "MOQ_CONNECT_GOAWAY_HANDOVER", cli("--connect-goaway-handover"))]
 	handover: Option<String>,
 }
 
@@ -240,7 +238,6 @@ struct ConnectWebsocket {
 /// Shared QUIC tuning (`[quic]`, `--quic-*`).
 #[derive(usage_rs::Config)]
 #[usage(prefix = "quic")]
-#[doc(hidden)]
 pub struct Quic {
 	#[usage(env = "MOQ_QUIC_MAX_STREAMS", cli("--quic-max-streams"))]
 	max_streams: Option<u64>,
@@ -273,36 +270,40 @@ pub struct Quic {
 	qlog: Option<String>,
 
 	#[usage(env = "MOQ_QUIC_KEYLOG", cli("--quic-keylog"))]
-	keylog: Option<bool>,
+	keylog: Option<String>,
 }
 
 /// Log settings (`[log]`, `--log-level`).
 #[derive(usage_rs::Config)]
 #[usage(prefix = "log")]
-#[doc(hidden)]
 pub struct Log {
 	#[usage(env = "MOQ_LOG_LEVEL", cli("--log-level"))]
 	level: Option<String>,
 }
 
-/// Iroh endpoint settings (`[iroh]`, `--iroh-*`).
-#[cfg(feature = "iroh")]
 #[derive(usage_rs::Config)]
-#[usage(prefix = "iroh")]
-#[doc(hidden)]
-pub struct Iroh {
-	#[usage(env = "MOQ_IROH_ENABLED", cli("--iroh-enabled"))]
-	enabled: Option<bool>,
+#[usage(prefix = "listen.lb")]
+struct ListenLb {
+	#[usage(env = "MOQ_LISTEN_QUIC_LB_ID", cli("--listen-quic-lb-id"))]
+	id: Option<String>,
 
-	#[usage(env = "MOQ_IROH_SECRET", cli("--iroh-secret"))]
-	secret: Option<String>,
+	#[usage(env = "MOQ_LISTEN_QUIC_LB_NONCE", cli("--listen-quic-lb-nonce"))]
+	nonce: Option<u64>,
 
-	#[usage(env = "MOQ_IROH_BIND_V4", cli("--iroh-bind-v4"))]
-	bind_v4: Option<String>,
+	#[usage(flatten)]
+	forward: ListenLbForward,
+}
 
-	#[usage(env = "MOQ_IROH_BIND_V6", cli("--iroh-bind-v6"))]
-	bind_v6: Option<String>,
+/// `[listen.lb.forward]` / `--listen-quic-lb-forward-*`.
+#[derive(usage_rs::Config)]
+#[usage(prefix = "listen.lb.forward")]
+struct ListenLbForward {
+	#[usage(env = "MOQ_LISTEN_QUIC_LB_FORWARD_BIND", cli("--listen-quic-lb-forward-bind"))]
+	bind: Option<String>,
 
-	#[usage(env = "MOQ_IROH_DISABLE_RELAY", cli("--iroh-disable-relay"))]
-	disable_relay: Option<bool>,
+	#[usage(env = "MOQ_LISTEN_QUIC_LB_FORWARD_KEY", cli("--listen-quic-lb-forward-key"))]
+	key: Option<String>,
+
+	#[usage(env = "MOQ_LISTEN_QUIC_LB_FORWARD_PEERS", cli("--listen-quic-lb-forward-peers"))]
+	peers: Option<String>,
 }

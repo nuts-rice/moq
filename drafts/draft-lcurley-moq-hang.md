@@ -35,14 +35,6 @@ normative:
     date: false
 
 informative:
-  moqepoch:
-    title: "MoQ Epoch Extension"
-    target: https://datatracker.ietf.org/doc/draft-lcurley-moq-epoch/
-    author:
-      -
-        ins: L. Curley
-        name: Luke Curley
-    date: false
   h273:
     title: "Coding-independent code points for video signal type identification"
     target: https://www.itu.int/rec/T-REC-H.273
@@ -148,8 +140,7 @@ Each group contains a single frame with UTF-8 JSON.
 
 A publisher MUST NOT write multiple frames to a group until a future specification includes a delta-encoding mechanism (via JSON Patch most likely).
 
-A publisher SHOULD also serve the catalog as a `catalog.json.z` track: the identical JSON under the same group and frame rules, differing only by compression ({{compression}}).
-A consumer reads whichever of the two tracks it prefers.
+A publisher SHOULD publish the catalog track compressed ({{compression}}).
 
 ## Root
 The root of the catalog is a JSON document with the following schema:
@@ -159,13 +150,16 @@ type Catalog = {
   "version": number | undefined,
   "audio": AudioSchema | undefined,
   "video": VideoSchema | undefined,
-  "archive": ArchiveSchema | undefined,
-  "clock": ClockSchema | undefined,
+  "media": MediaSchema | undefined,
   "stats": { "track": string } | undefined,
   "echo": { "path": string } | undefined,
   "text": TextSchema | undefined,
   "json": JsonTracks | undefined,
   "binary": BinaryTracks | undefined,
+  "include": Record<string, {
+    "broadcast": string,
+    "instance": string | undefined,
+  }> | undefined,
   // ... any custom fields ...
 }
 ~~~
@@ -178,7 +172,7 @@ For example, a chat entry should name a chat track, not carry individual chat me
 This way catalog updates are rare and a client MAY choose to not subscribe.
 The `json` and `binary` sections ({{data}}) are how a track like that is listed.
 
-This specification defines audio, video, and text media tracks, plus an optional `archive` entry ({{archive-catalog}}) naming the timeline track ({{timeline}}) that indexes each track, an optional root `clock` entry ({{clock}}) mapping content time to wall time, the root `version` ({{catalog-version}}), the application data tracks in {{data}}, and optional publisher statistics and solicited viewer feedback ({{media-stats}}).
+This specification defines audio, video, and text media tracks, an optional `media` section ({{media}}) holding the clock that maps content time to wall time and the interval a viewer can join on, the root `version` ({{catalog-version}}), the application data tracks in {{data}}, optional publisher statistics and solicited viewer feedback ({{media-stats}}), and whole broadcasts listed in `include` ({{include}}).
 
 ## Version {#catalog-version}
 The root `version` field is the oldest draft of this specification that reads the catalog correctly, by draft number: `4` needs a consumer of moq-hang-04 or later.
@@ -194,10 +188,22 @@ This draft needs `version` 4 for:
 - a `track` ({{field-track}}) other than the entry's ID, which an older consumer subscribes to instead;
 - a video `warmup` ({{field-warmup}}) above zero, since an older consumer starts decoding a group at a picture that is not a keyframe.
 
-Every other catalog change in this draft is safe to ignore: `enabled` ({{field-enabled}}) leaves an older consumer selecting a disabled rendition, which plays nothing; `archive` ({{archive-catalog}}) is ignored when undecodable; `stats` and `echo` ({{media-stats}}) only offer optional tracks; `jitter`, `delay`, audio `warmup`, and the data track estimates are hints.
+Every other catalog change in this draft is safe to ignore: `enabled` ({{field-enabled}}) leaves an older consumer selecting a disabled rendition, which plays nothing; `media` ({{media}}) only offers the clock and join interval, which an older consumer goes without; `stats` and `echo` ({{media-stats}}) only offer optional tracks; `include` ({{include}}) only offers broadcasts to open on selection; video `reorder` leaves an older consumer inferring decode times from timestamps; `jitter`, `delay`, audio `warmup`, and the data track estimates are hints.
 
-## Clock {#clock}
-The catalog's root `clock` field is the broadcast's one continuous clock:
+## Media {#media}
+The catalog's root `media` field holds what applies to every audio and video track:
+
+~~~
+type MediaSchema = {
+  "clock": ClockSchema | undefined,
+  "join": JoinSchema | undefined,
+}
+~~~
+
+A `media` value that is not an object belongs to another application and is ignored.
+
+### Clock {#clock}
+The `clock` field is the broadcast's one continuous clock:
 
 ~~~
 type ClockSchema = {
@@ -208,25 +214,78 @@ type ClockSchema = {
 
 The `wall` field is the wall-clock time of PTS zero, in `timescale` units since the moq epoch, 2020-01-01T00:00:00Z.
 A consumer derives the wall-clock time of any media timestamp as `wall + pts` after converting that timestamp into this timescale, and Unix time by adding the epoch back (for HLS `EXT-X-PROGRAM-DATE-TIME` or DASH `availabilityStartTime`).
-Every media track and every timeline refer to this one mapping after timescale conversion; there are no competing wall epochs.
+Every media track refers to this one mapping after timescale conversion; there are no competing wall epochs.
 
 The `timescale` field is the units per second for `wall`, defaulting to 1000000 (microseconds) when absent.
 A zero `timescale` is invalid, as is a `wall` outside the JSON-safe integer range; both are refused rather than truncated.
 
-The mapping is fixed for the broadcast and independent of `archive`: a live-only publisher exposes its clock without creating a timeline.
+The mapping is fixed for the broadcast.
 A discontinuity marker is a delivery event, not a new epoch, and a system-clock adjustment never retimes the mapping.
+
+### Join {#media-join}
+The `join` field says how a viewer joins the media tracks:
+
+~~~
+type JoinSchema = {
+  "interval": number,
+}
+~~~
+
+The `interval` field promises that every audio and video track starts a group at least this often outside a pause, in milliseconds rounded up: it is the longest group, such as a video GOP, any of them publishes.
+It is the grid an edge numbers HLS and DASH segments on ({{hls}}), so it MUST NOT change for the broadcast.
+A publisher that knows its group duration declares it; one that does not MAY measure each track over its first second or group, whichever is longer, and declare the longest.
+A group longer than the interval is an overrun, which an edge tolerates.
+A consumer that cannot decode `join`, including a zero `interval`, MUST treat it as absent.
+Nesting the interval under `join` leaves room for a later join mechanism that is not a fixed grid.
+
+## Includes {#include}
+The optional root `include` map names whole broadcasts, such as transcoded renditions of the source, whose own catalogs describe their renditions.
+Each key is an include ID.
+Each entry MUST contain a string `broadcast`, resolved against the catalog's broadcast as in {{field-broadcast}}, and MAY contain an `instance` as in {{field-instance}}.
+A consumer MUST reject a catalog with a malformed entry or a reference that escapes above the root.
+
+An include MUST share the listing catalog's PTS timeline and root settings, including its `media.clock` and `media.join.interval` ({{media}}).
+A consumer uses the listing catalog's settings without comparing the include's own settings; a mismatch is a publisher error.
+
+Listing an entry MUST NOT subscribe to the include: a consumer opens its catalog only when it selects the include or one of its renditions.
+An HLS master selects every include it lists, reading their catalogs to describe their renditions, but MUST NOT subscribe to their media until requested by a player.
+It segments an include's renditions on the listing catalog's `media` ({{media}}), whatever the include's own catalog declares.
+A publisher producing media on demand MUST answer its catalog without starting media production.
+A selected include resolves like a rendition's reference, under the same rules for `instance` and restarts ({{field-instance}}).
+An include produced on demand has no stream until it resolves, so a publisher omits its `instance` until then.
+
+An include's rendition IDs belong to its own catalog and MUST NOT replace IDs in the listing catalog, so the same ID MAY name an include, a rendition in the listing catalog, and a rendition in the include.
+An unavailable include does not invalidate the listing catalog.
+A consumer does not expand an include's own `include`: each needs a selection of its own.
 
 ## Track Identity {#identity}
 A track name always means the same content, so a catalog update never redefines an audio or video track.
-A track's identity is the fields a consumer cannot change without reinitializing its decoder or demuxer: `codec`, `description`, and `container`, plus `displayAspectWidth` and `displayAspectHeight` for video and `sampleRate` and `numberOfChannels` for audio.
+A track's identity is the fields a consumer cannot change without reinitializing its decoder or demuxer: `codec`, `description`, and `container`, plus `displayAspectWidth`, `displayAspectHeight`, and `interlaced` for video and `sampleRate` and `numberOfChannels` for audio.
 A publisher MUST NOT change them for a track once a catalog lists it.
 
 Every other rendition field is live state that MAY change in any update within its own rules (`jitter` and `delay` never fall), as MAY the video section's `display`, `rotation`, and `flip`.
 The picture size MAY change at any keyframe, which a `description` carrying parameter sets rules out, and `codec` names a profile and level that covers every picture the track carries.
-A publisher that changes an identity field MUST publish the media under a new track name, or as a new broadcast under a new Epoch {{moql}}.
+A publisher that changes an identity field MUST publish the media under a new track name, or as a new broadcast under a new Instance {{moql}}.
 A rendition MAY keep its ID and name the new track with `track` ({{field-track}}), so a consumer follows the new name rather than reusing a decoder configured for the ID.
 A track name removed from the catalog MUST NOT return with a different identity.
 A consumer MAY configure a decoder once per track from the catalog.
+
+## Malformed Renditions {#malformed}
+A consumer MUST refuse a catalog with a malformed audio or video rendition, or with a `renditions` value that is not an object, rather than play the rest of it.
+A rendition is malformed when it is not an object or a field this document defines has the wrong type or is out of range, unless this document says to treat that field as absent.
+An unknown field never makes a rendition malformed.
+
+`codedWidth`, `codedHeight`, `displayAspectWidth`, `displayAspectHeight`, `sampleRate`, and `numberOfChannels` are integers from 1 to 2^32 - 1, and `bitrate`, `jitter`, `warmup`, and `delay` are integers from 0 to 2^53 - 1.
+
+A `codec` naming a codec below without its parameters in this form is malformed; any other string is a codec the consumer may not recognize, never a malformed one:
+
+- `avc1.` or `avc3.`, then exactly six hexadecimal digits.
+- `hvc1.` or `hev1.`, then the ISO/IEC 14496-15 fields: an optional profile space `A` to `C` with a decimal profile, hexadecimal compatibility flags of at most 32 bits, `L` or `H` with a decimal level, and up to six hexadecimal constraint bytes. One empty trailing field is tolerated.
+- `vp09.`, then three or eight two-digit decimal fields.
+- `av01.`, then the AV1 codecs parameter: profile 0 to 2, a two-digit level with tier `M` or `H`, a two-digit bit depth, and optionally every one of the monochrome, chroma, colour, and range fields.
+- `mp4a.40.`, then a decimal object type from 0 to 255.
+
+Each decimal or hexadecimal field is one or more digits, without a sign.
 
 ## Video
 A video track contains the necessary information to decode a video stream.
@@ -258,9 +317,11 @@ type VideoDecoderConfigExtensions = {
   "displayAspectWidth": number | undefined,
   "displayAspectHeight": number | undefined,
   "preference": number | undefined,
+  "reorder": number | undefined,
   "color": Color | undefined,
   "projection": Projection | undefined,
   "stereo": string | undefined,
+  "interlaced": boolean | undefined,
 }
 ~~~
 
@@ -274,6 +335,16 @@ If absent, it defaults to 0; a publisher SHOULD only write it when nonzero.
 A consumer selecting a rendition automatically MUST choose among the enabled ({{field-enabled}}) renditions it can decode with the highest `preference`, then by its own criteria, such as size and bitrate, within them.
 A consumer MAY select another rendition at the viewer's explicit request.
 A consumer that carries every rendition, rather than selecting one, ignores the field.
+
+`reorder` is the most frames that can precede a frame in decode order and follow it in presentation order, the unit of H.264 `max_num_reorder_frames` and HEVC `sps_max_num_reorder_pics`, as an integer from 0 to 255.
+`0` declares that presentation order is decode order.
+A publisher that does not know the depth MUST omit the field; absent declares nothing.
+A publisher that declares it MUST NOT send a frame that more than `reorder` earlier frames of its group follow in presentation order, and MUST NOT change or remove it for the track once declared.
+
+A consumer that authors decode times, such as a transmuxer to a container that carries them, derives them from a declared `reorder` and the frames of the current group alone, so consumers that joined at different groups agree.
+The n-th frame of a group in decode order decodes at the group's (n - `reorder`)-th earliest presentation time, counting from zero, and the group's first `reorder` frames decode at successive instants just before its earliest presentation time.
+A consumer MUST refuse a frame reordered deeper than its rendition declares rather than author an invalid decode time, and SHOULD refuse a `reorder` the codec cannot reach: above the level's decoded picture buffer, or nonzero for a codec whose presentation order is its decode order.
+Without `reorder`, a consumer infers decode times from the timestamps it has read.
 
 `color` describes the decoded pixels so a renderer can configure its pipeline without parsing the bitstream:
 
@@ -322,8 +393,12 @@ Its `fov` is the degrees of longitude the picture spans, centred straight ahead:
 `mono`, the default when absent, shows the whole frame to both eyes.
 `left-right` carries the left eye's view in the left half and the right eye's in the right half, and `top-bottom` carries the left eye's view in the top half and the right eye's in the bottom half.
 
-A consumer MUST treat an unrecognized `projection` kind or `stereo` value as absent, and MUST reject a recognized `projection` kind with a malformed field, such as a `fov` out of range.
+A consumer MUST treat an unrecognized `projection` kind or `stereo` value as absent, and a recognized `projection` kind with a malformed field, such as a `fov` out of range, makes the rendition malformed ({{malformed}}).
 Neither field is part of the track's identity.
+
+`interlaced` is true when each decoded picture weaves two fields, as an H.264 stream with `frame_mbs_only_flag` 0 decodes.
+If absent, it defaults to false; a publisher SHOULD only write it when true.
+A renderer SHOULD deinterlace such a picture, and a consumer MAY choose its decoder by it, since some hardware decoders refuse interlaced streams.
 
 For example:
 
@@ -409,13 +484,14 @@ type AudioDecoderConfigExtensions = {
 
 `layout` says what the decoded channels carry; when absent, they follow the codec's own channel order.
 `ambisonic` is full-sphere ambisonics in the AmbiX convention: ACN channel order with SN3D normalization, of the order N for which `numberOfChannels` is (N+1)^2.
-A consumer MUST reject `ambisonic` with fewer than 4 channels or a count that is not a square, and MUST treat an unrecognized `layout` as absent.
+`ambisonic` with fewer than 4 channels or a count that is not a square makes the rendition malformed ({{malformed}}), and a consumer MUST treat an unrecognized `layout` as absent.
 `layout` is not part of the track's identity.
+
+An Opus frame timestamp counts the samples the OpusHead pre-skip trims: a consumer presents each decoded sample the pre-skip, at 48 kHz, earlier than its frame timestamp places it, so the first sample kept plays at the first decoded frame's timestamp.
 
 ### PCM {#audio-pcm}
 
 Hang defines the `"pcm"` audio codec for uncompressed samples.
-The `sampleRate` and `numberOfChannels` fields MUST be present and greater than zero.
 The `description` field MUST NOT be present.
 If `bitrate` is present, it MUST equal `sampleRate * numberOfChannels * 32`.
 
@@ -546,7 +622,6 @@ A consumer discovers these tracks the same way it discovers media, by reading th
 ~~~
 type JsonSchema = {
   "mode": Mode,
-  "compression": Compression | undefined,
   "schema": string | undefined,
   "broadcast": string | undefined,
   "track": string | undefined,
@@ -563,7 +638,6 @@ It is descriptive: a consumer that does not recognize it MUST still be able to r
 ~~~
 type BinarySchema = {
   "mode": Mode,
-  "compression": Compression | undefined,
   "mime": string | undefined,
   "broadcast": string | undefined,
   "track": string | undefined,
@@ -610,29 +684,17 @@ A consumer that has not kept up, or that subscribes later, then cannot read the 
 That is the intended behaviour, since a partial log presented as a whole one is exactly what this mode exists to prevent, and under compression ({{compression}}) the retained frames are undecodable anyway without the evicted prefix as context.
 A publisher SHOULD therefore keep a `stream` track's log within what its groups retain, and split anything unbounded across successive tracks; a consumer that needs the whole log SHOULD subscribe before the publisher exceeds that.
 
-### compression {#field-compression}
-~~~
-type Compression = "deflate"
-~~~
-
-The `compression` field names the compression applied to the track's frames.
-If absent, the frames are uncompressed.
-A consumer MUST ignore a track whose `compression` it does not recognize, since it cannot decode the frames.
-
-The `deflate` value is the group-scoped DEFLATE of {{compression}}.
-A `snapshot` group covers a single value (plus any deltas), so its window spans that group alone; a `stream` group's frames compress against the earlier ones in the log.
-
 ### broadcast and track {#data-shared}
-The `broadcast`, `epoch`, and `track` fields carry the same meaning here as they do for a media rendition ({{field-broadcast}}, {{field-epoch}}, {{field-track}}).
+The `broadcast`, `instance`, and `track` fields carry the same meaning here as they do for a media rendition ({{field-broadcast}}, {{field-instance}}, {{field-track}}).
 
 ### bitrate, jitter, and delay {#data-estimates}
 The optional `bitrate` field is the track's maximum bitrate in bits per second.
 The optional `jitter` and `delay` fields carry the same meaning and rules as they do for a media rendition ({{field-jitter}}, {{field-delay}}), with a payload in place of a frame.
 
 A payload's presentation timestamp is its capture time on the broadcast's clock, the one its media renditions use, when the publisher knows it (a datagram's arrival, a sensor read), and otherwise the time the publisher wrote it.
-A publisher measures `jitter` and `delay` only from payloads that carry a capture time, and MUST omit both for a track written without one.
-A publisher MUST NOT use a timestamp on an unrelated clock, such as a device's own uptime, since it would report a meaningless lateness and, through the broadcast-wide minimum, distort every other rendition's `delay`.
-A `snapshot` update that writes no frame, such as an unchanged JSON value, is not a flush and is not measured.
+A publisher measures `delay` only from payloads that carry a capture time, and MUST omit it for a track written without one.
+A publisher MUST NOT use a timestamp on an unrelated clock, such as a device's own uptime, since it would order the payload against the media renditions meaninglessly and distort their `delay`.
+A `snapshot` update that writes no frame, such as an unchanged JSON value, is not measured.
 
 ## Binary Fields {#binary}
 A decoder config field carrying raw bytes, notably `description` (an `AllowSharedBufferSource` in WebCodecs), is carried in the catalog as a hex string ({{!RFC4648, Section 8}}).
@@ -647,7 +709,7 @@ Audio, video, and text renditions share the following fields, extending the WebC
 ~~~
 type CommonExtensions = {
   "broadcast": string | undefined,
-  "epoch": string | undefined,
+  "instance": string | undefined,
   "track": string | undefined,
   "label": string | undefined,
   "container": Container,
@@ -662,6 +724,7 @@ By default a rendition's track lives in the same broadcast that served the catal
 The `broadcast` field overrides that, naming a different broadcast that publishes the track.
 
 The value is a relative path, resolved against the path of the broadcast that served the catalog.
+It is spelled like a path {{moql}}, so a reference with a leading, trailing, or doubled `/`, or a `\` before anything but `\` or `/`, makes the rendition malformed ({{malformed}}).
 It uses relative reference resolution ({{!RFC3986, Section 5.2}}): a non-empty reference replaces the catalog broadcast's last path segment before applying `.` and `..` segments.
 For example, `./source` in a catalog served by `room/transcode` resolves to `room/source`, while `.` resolves to `room`.
 An empty reference resolves to the catalog broadcast itself.
@@ -679,26 +742,26 @@ An absent MSF `namespace` inherits the catalog's broadcast.
 Since each endpoint sees paths under its own connection root, a `namespace` equal to the catalog broadcast's path, or matching it on whole trailing segments, also names the catalog's broadcast; a gateway MUST NOT emit a different broadcast's `namespace` that matches so.
 A gateway MUST preserve the namespace and track-name pair or refuse the rendition; it MUST NOT substitute the catalog's broadcast for an unrepresentable reference.
 
-### epoch {#field-epoch}
-The optional `epoch` field names the publisher instance of the broadcast a rendition references ({{field-broadcast}}), as the canonical text of its Epoch {{moql}}: a lowercase hyphenated UUIDv7.
-Without `broadcast`, it names the instance of the catalog's own broadcast.
-A consumer MUST reject a catalog containing any other `epoch` value.
+### instance {#field-instance}
+The optional `instance` field names the stream of the broadcast a rendition references ({{field-broadcast}}), as the text of its Instance {{moql}}.
+Without `broadcast`, it names the stream of the catalog's own broadcast.
+A consumer MUST reject a catalog containing an empty `instance`.
 
 A consumer reads each path a catalog instance references from the first broadcast it resolves there, so the catalog and its renditions never resolve one path independently across a replacement.
-An absent `epoch` accepts that first broadcast, whichever instance it is.
-A consumer that follows a referenced broadcast's announcements MAY move a rendition without `epoch` onto a restarted instance.
+An absent `instance` accepts that first broadcast, whichever stream it is.
+A consumer that follows a referenced broadcast's announcements MAY move a rendition without `instance` onto a restarted stream.
 
-When `epoch` is present and the route that resolved the referenced broadcast carries an Epoch, the consumer MUST read the rendition only from that instance.
-It MUST fail the rendition rather than fall back to another instance, including one that replaced it before or after resolution, and MUST NOT follow a restart onto another instance for it.
-A later catalog update naming another Epoch for an already-resolved path MUST NOT replace the resolved broadcast; the renditions naming the other Epoch fail instead.
+When `instance` is present, the consumer MUST read the rendition only from a broadcast of that Instance.
+It MUST fail the rendition rather than fall back to another stream, including one that replaced it before or after resolution, and MUST NOT follow a restart onto another stream for it.
+A later catalog update naming another Instance for an already-resolved path MUST NOT replace the resolved broadcast; the renditions naming the other Instance fail instead.
 A new catalog instance resolves its references afresh.
 
-A route without an Epoch, such as one over an older moq-lite version or MoQ Transport without the epoch extension {{moqepoch}}, cannot prove which instance it serves, so there `epoch` is best effort: the consumer reads the broadcast it resolved.
-A consumer MUST NOT treat a catalog's `epoch` as evidence that a subscription may resume across routes.
+A route that crossed an older moq-lite version or MoQ Transport carries an Instance its receiver minted {{moql}}, which names the announcement rather than the publisher's stream, so there `instance` is best effort: the consumer reads the broadcast it resolved.
+A consumer MUST NOT treat a catalog's `instance` as evidence that a subscription may resume across routes.
 A consumer that predates the field ignores it and does not gain its guarantee.
 
-A publisher SHOULD set `epoch` only when it knows the instance it references, and MUST omit it for a broadcast produced on demand, which has no instance until a worker accepts the request.
-MSF {{moqmsf}} has no field for an instance, so a gateway converting to MSF drops `epoch` and SHOULD report that it did; its readers accept the first instance they resolve.
+A publisher SHOULD set `instance` only when it knows the stream it references, and MUST omit it for a broadcast produced on demand, which has no stream until a worker accepts the request.
+MSF {{moqmsf}} has no field for a stream instance, so a gateway converting to MSF drops `instance` and SHOULD report that it did; its readers accept the first stream they resolve.
 
 ### track {#field-track}
 A rendition's key in its map is its ID, and by default also the name of its track.
@@ -718,50 +781,51 @@ The container used to frame this rendition's media, as described in {{container}
 If absent, it defaults to `{ "kind": "legacy" }`.
 
 ### jitter {#field-jitter}
-The maximum delay, in milliseconds, that a publisher has measured before handing a frame to the transport.
+The maximum media span, in milliseconds, that a publisher hands to the transport behind a frame's presentation timestamp.
 A consumer's jitter buffer SHOULD be at least this large to avoid stalling.
 If absent, a consumer SHOULD assume no publisher delay has been measured.
 
-An encoder compares each frame's flush time with its media timestamp and subtracts the smallest lateness recently observed on the same rendition.
-The field is the spread above that minimum, so neither a constant encoder delay, a fixed clock offset, nor long-term drift counts as jitter.
-A container importer instead estimates the delay from the media span of a batch, such as a run of audio PES packets between video packets in TS or an fMP4 fragment, without measuring the time spent waiting for input.
-A publisher does not count ingest network delay in this field; a consumer measures network delay separately.
+A publisher measures the field from media timestamps alone, never from the time a frame was written.
+It covers the reorder delay of a frame presented after frames decoded behind it, and the media span of a batch written together, such as a run of audio PES packets between video packets in TS or an fMP4 fragment.
+Neither a constant encoder delay, a capture clock, nor ingest network delay counts; a consumer measures network delay separately.
 
 A publisher MUST round the value up to a whole number of milliseconds, so a consumer sizing a buffer against it is never handed a bound below the real one.
-A publisher MUST NOT advertise `0`; a track that flushes each frame immediately omits the field instead.
+A publisher MUST NOT advertise `0`; a track that writes each frame in presentation order omits the field instead.
 A consumer receiving `0` SHOULD treat the field as absent, since it is a publisher rounding down rather than a claim of zero delay.
 A publisher MUST NOT lower a previously advertised value, since a burst it emitted once it may emit again.
 
 For example:
 
-- A frame flushed without extra delay contributes no `jitter`, regardless of frame rate.
-- An encoder that consistently flushes 200 milliseconds late contributes no `jitter`; only variation above its own minimum counts.
-- A fragment or packet batch contributes the media span between its earliest timestamp and flush point.
-- Reordered frames contribute the delay they were held before flushing, without treating a decode-order presentation timestamp gap as delay by itself.
+- A frame written in presentation order contributes no `jitter`, regardless of frame rate or when it was written.
+- A B-frame stream contributes its reorder delay, the presentation timestamp minus the decode timestamp.
+- A fragment or packet batch contributes the media span between its earliest and latest timestamps.
 
 ### warmup {#field-warmup}
 
 An audio or video rendition MAY declare `warmup`, an integer duration in milliseconds after a group start before its decoded output is presentable without decoding the previous group.
 A publisher MUST round a fractional-millisecond warmup up to the next whole millisecond.
 Absent or `0` means every group start is immediately presentable.
-After a non-continuous join, a consumer MUST decode from the group start and MUST NOT present frames stamped before the group's start plus `warmup`.
-It SHOULD join that much earlier to obtain the requested presentation time.
+After a non-continuous join, a consumer MUST decode from the group start.
+It SHOULD join `warmup` earlier to obtain the requested presentation time.
+Unless it also decodes from an earlier group start, it MUST NOT present frames stamped before the group's start plus `warmup`.
+A consumer that does MAY present those frames, which can show decoding artifacts, but MUST switch to the earlier decoder's frames once that decoder reaches the presented timestamp.
 
 For video, `warmup` can describe a refresh cycle during which decoding converges without an initial keyframe.
 For audio, it describes decoder pre-roll, for example 80 milliseconds for Opus, and does not change the group-start rule.
 
 ### delay {#field-delay}
-The maximum amount, in milliseconds, by which a rendition's minimum flush lateness ({{field-jitter}}) has trailed the smallest minimum among the broadcast's renditions that measure it.
+The maximum amount, in milliseconds, by which a frame's presentation timestamp has trailed one that another rendition of the broadcast had already written.
 If absent, a consumer SHOULD assume the rendition does not trail the others.
 
-A publisher measures each rendition's minimum over the same recent window it uses for `jitter`, from one clock shared by every rendition, and advertises the largest difference observed.
-A container importer does not measure `delay`.
+A publisher compares each frame with the highest timestamp written so far by every other rendition on the same clock, and advertises the largest shortfall observed.
+A rendition alone on the broadcast measures no `delay`, and a frame trailing only its own rendition's earlier frames counts toward `jitter` instead.
+A rendition that ends, or breaks its timeline, stops holding the others back.
 The rounding, `0`, and never-lower rules of `jitter` apply unchanged.
 
 A consumer SHOULD hold at least the largest `delay` plus `jitter` among the renditions it plays together.
 A consumer MUST NOT subtract one rendition's `delay` from another's: each is a maximum over the life of the stream, so two values need not share an origin.
 
-For example, a video encoder that flushes 200 milliseconds after the audio encoder for the same media time advertises a video `delay` of 200 and no audio `delay`.
+For example, with video at 20 millisecond intervals and audio at 15 written as video 0, video 20, audio 0, audio 15, video 40, audio 30, video 60, audio 45, audio 60, the audio frame at 0 trails video already written at 20, so audio advertises a `delay` of 20 and video none.
 
 ### enabled {#field-enabled}
 The `enabled` field says whether a consumer may select an audio or video rendition; a text rendition does not carry it.
@@ -777,7 +841,7 @@ The optional catalog `stats` section names the publisher's snapshot track in the
 A publisher snapshot covers only renditions that publisher writes, omitting references to another broadcast.
 
 The optional catalog `echo` section solicits feedback: `{ "path": "viewers" }`.
-The path is relative to the broadcast serving the catalog, with the same URL-style resolution and root containment as {{field-broadcast}}.
+The path is relative to the broadcast serving the catalog, with the same spelling, URL-style resolution, and root containment as {{field-broadcast}}.
 For example, from `room/live`, `viewers` resolves to `room/viewers`, and `live/viewers` resolves to `room/live/viewers`.
 A consumer MUST reject a catalog whose echo path resolves above its connection root.
 After reading the soliciting catalog, a viewer MAY announce one broadcast under that prefix at an application-assigned name plus `.echo`, for example `room/viewers/alice.echo`.
@@ -788,9 +852,8 @@ Without `echo`, no feedback is solicited.
 
 An application may already carry its own `stats` or `echo` root key, so a reader MUST treat a `stats` value without a string `track`, or an `echo` value without a string `path`, as absent rather than refuse the catalog.
 
-Both tracks carry JSON snapshots, optionally with the `.z` sibling encoding of JSON snapshots.
-The uncompressed track carries a complete snapshot in a group's single UTF-8 JSON frame.
-The compressed sibling starts each group with a full snapshot and continues with RFC 7396 merge patches in the DEFLATE stream defined in {{compression}}.
+Both tracks carry JSON snapshots, and a publisher SHOULD publish them compressed ({{compression}}).
+Each group starts with a full snapshot as a UTF-8 JSON frame and MAY continue with RFC 7396 merge patches.
 A producer SHOULD update about once per second while observed; a report need not leave the process when unsubscribed.
 A reader takes the newest complete snapshot and treats the reporting broadcast's replacement or decreasing cumulative counters as a reset.
 
@@ -812,7 +875,7 @@ type PublisherRendition = {
 type ViewerRendition = {
   frames?: number, bytes?: number, decoded?: number, late?: number,
   errors?: number, stalls?: number, stalled?: number, underruns?: number,
-  arrival?: { timestamp: number, wall: number }, latency?: number,
+  arrival?: { timestamp: number, wall: number },
 }
 type Transport = {
   rtt?: number, rate?: number, lostBytes?: number, lostPackets?: number, age?: number,
@@ -833,7 +896,7 @@ An empty rendition entry is valid and represents zero cumulative counters; its I
 Publisher `keyframes` counts sent keyframes; `skipped` counts frames skipped before sending.
 Viewer `decoded`, `late`, and `errors` count decoded frames, frames too late for playout, and decode errors.
 `stalls` counts playout stalls, `stalled` is cumulative stalled duration, and `underruns` counts audio buffer underruns.
-`bitrate` is the latest target encoder bitrate, `latency` the latest playout latency, and `arrival` pairs the newest received media timestamp with its arrival wall time.
+`bitrate` is the latest target encoder bitrate, and `arrival` pairs the newest received media timestamp with its arrival wall time.
 Durations and media timestamps are milliseconds; `arrival.wall` is milliseconds since the MoQ epoch (2020-01-01T00:00:00Z).
 Sub-millisecond durations and timestamps are floored when encoded.
 Rates are bits per second.
@@ -857,6 +920,7 @@ type Container =
 ~~~
 
 The `kind` field selects the framing; a consumer MUST ignore a rendition whose `kind` it does not recognize.
+A container without a string `kind`, or with a recognized `kind` missing its fields, makes the rendition malformed ({{malformed}}).
 Every container shares the same group rules:
 
 A video group MUST start at a random access point: a keyframe unless the rendition declares `warmup` ({{field-warmup}}), in which case it MAY start at a picture from which decoding converges within that duration.
@@ -899,6 +963,7 @@ Audio publishers do not append per-group duration markers because the codec defi
 Data tracks retain empty payloads as data, without endpoint semantics.
 
 For example, h.264 with no `description` field would be annex.b encoded, while h.264 with a `description` field would be AVCC encoded.
+For AAC (`mp4a.40.*`), each nonempty codec payload MUST be one complete ADTS frame when `description` is absent; with an AudioSpecificConfig in `description`, it MUST be one raw AAC access unit without an ADTS header.
 For a text track, the remainder is the cue in the track's declared `format` (for example a `WEBVTT` segment).
 
 ## cmaf
@@ -916,6 +981,7 @@ A consumer MUST feed `init` to the decoder before the first frame.
 
 ## loc
 Each frame is a Low Overhead Container frame {{!I-D.ietf-moq-loc}}: a property block, carrying the timestamp among other properties, followed by the codec payload.
+The codec payload uses the same framing as {{legacy}}.
 
 For audio and video, consumers accept empty codec payload metadata with the same video-duration and audio-terminal-trimming meanings as the legacy container.
 Data tracks retain empty payloads as data.
@@ -923,175 +989,37 @@ A consumer MUST NOT submit it to a decoder.
 
 
 # Compression {#compression}
-Some metadata tracks are compressed.
+Metadata tracks are small and repetitive, so a publisher SHOULD compress the catalog ({{catalog}}), the `stats` and `echo` snapshots, and its JSON data tracks ({{json-tracks}}).
 
-Compression is signalled per track, never inferred from the track's name.
-A data track ({{data}}) declares it with the `compression` field ({{field-compression}}).
-The tracks this specification defines as always compressed, `catalog.json.z` ({{catalog}}) and the timeline tracks ({{timeline}}), are identified by their role instead.
-The `.z` suffix on those names is a naming convention, and a consumer MUST NOT treat it as a signal.
-
-Such a track is compressed per {{moqflate}}: each group is one raw DEFLATE stream, sync flushed at each frame boundary.
-The suffix is the declaration.
+Compression is a property of the track, carried by the transport rather than the catalog: each group is one raw DEFLATE stream, sync flushed at each frame boundary, per {{moqflate}}.
+A session that cannot signal it delivers the inflated frames instead, so a consumer always reads the frames this specification describes, and the catalog has no field for it.
+A track's name says nothing about its compression.
 
 
-# Timeline {#timeline}
-A timeline track indexes one track's content.
-MoQ groups carry only an opaque sequence number; the timestamps live inside the media frames.
-A timeline republishes a track's spans as metadata: one record per span, mapping a span of content time to the frame positions that carry it.
-A consumer can answer "which groups cover time T on track X" and "where is the live edge" from a few bytes per span, without downloading media.
-This is sufficient to derive an HLS or DASH playlist, seek a VOD recording, or index an archive.
+# HLS and DASH {#hls}
+An edge serves a broadcast as HLS or DASH from its media tracks.
+HLS numbers segments by position, so every edge and every reload has to derive the same consecutive numbers from timestamps alone: they come from a grid the join interval ({{media-join}}) fixes.
+A segment is the smallest whole multiple of the interval that is at least one second long, so an audio-only broadcast's short groups pack into one-second segments, and an interval of a second or more is the segment itself.
+The grid draws a line at every multiple of that segment length in presentation time.
+An edge derives the length from the interval alone, so every edge agrees.
+A broadcast without `media.join` is not served as HLS or DASH.
 
-Timelines are optional, and a track has at most one.
-Each track's timeline is cut, published, and expired independently; nothing in one timeline waits for another track.
+A group spans from its first frame's timestamp to the next group's.
+It belongs to one segment: the first line it contains, so segment N starts at the group containing N times the segment length, or, when it contains none, the line it starts after.
+A segment holds whole groups, since one starting mid-group is not independent.
+Every rendition numbers its segments on the one grid, so they share segment numbers while each cuts its boundaries at its own groups.
 
-## Catalog Section {#archive-catalog}
-The catalog's root `archive` field names every timeline, and any durable recording of their spans:
+A line no group starts a segment at, because a group longer than the segment or a pause skipped it, is a gap: the edge lists it as HLS `EXT-X-GAP`, omits it from the DASH SegmentTimeline, and never serves media for it, so the numbering never skips.
+On a 2 second grid, a group spanning 0 to 7 seconds is segment 0, segments 1 and 2 are gaps, and the group after it, starting at 7 seconds, starts segment 3; an edge that joins at that group numbers it alike without the one before.
 
-~~~
-type ArchiveSchema = {
-  "timelines": Map<TrackName, {
-    "track": TrackName,
-    "duration": number | undefined,
-  }>,
-  "timescale": number | undefined,
-  "replay": string | undefined,
-  "replayEpoch": string | undefined,
-  "store": string | undefined,
-  "version": number | undefined,
-}
-~~~
+A segment starts at its first group's timestamp, or at its line when that group starts after it, as a group resuming from a pause does; a gap starts at its line; and each lasts until the next segment starts.
+A group longer than the segment is listed at its first line, so its duration understates its media, and the gaps after it overstate theirs.
+`EXT-X-TARGETDURATION` is twice the segment length, rounded up to whole seconds: the group containing a line starts at most one interval, and so one segment length, before it, and a gap ends where the next segment starts, under two lengths after its line, so only a group longer than the interval can exceed it.
+The HLS media sequence and the segment URL derive from the segment number, and DASH addresses the same segments by `$Time$`.
 
-A consumer that cannot decode the `archive` entry MUST ignore that entry without rejecting the catalog.
-
-The `timelines` field maps each indexed track to the MoQ track carrying its records and that timeline's fixed nominal record `duration`.
-The duration is in `timescale` units and is zero for sparse timelines without a segment cadence.
-An untimed track ({{moql}}) has no duration to declare, so its timeline MUST omit `duration`; every timed timeline MUST carry it.
-Any track may be indexed, including the catalog track itself and data tracks ({{data}}).
-Naming a timeline after its track with a `.timeline.z` suffix is RECOMMENDED; a consumer MUST use the advertised names rather than assuming them.
-A live publisher without a store advertises `archive` with the timeline fields (`timelines`, `timescale`) alone.
-Every span a timeline advertises is FETCHable; with a store it is also durable.
-There is no generation: a client that must tell recordings apart compares `replay` and `store`.
-
-The `timescale` field is the units per second for the records' `pts` and `duration` values and timeline declarations.
-If absent, it defaults to 1000 (milliseconds).
-A zero `timescale` is invalid and MUST be refused.
-
-Each declared timeline duration is a nominal target, not a bound: a publisher MAY overrun it to end at a group boundary.
-The value MUST NOT change for the life of that timeline track.
-A publisher that does not know the target MUST omit that timeline until its first record closes, then declare that record's duration, or its minimum ({{timeline-cutting}}) when a gap or the end of the content closed the record before a boundary.
-
-Wall-clock mapping is the catalog root `clock` ({{clock}}), not this section: a consumer derives the wall-clock time of any record as `clock.wall + pts` after converting `pts` into the clock's timescale.
-
-The `replay` field, if present, is a relative MoQ broadcast path ({{field-broadcast}}) the archive is served back from.
-Absent, the timelines live on the catalog's own broadcast.
-A wildcard replay path names no generation.
-
-The `replayEpoch` field, if present, names the publisher instance of `replay`, with the meaning and rules of a rendition's `epoch` ({{field-epoch}}).
-
-The `store` field, if present, is the object-store URL the recording objects live under, in the layout the moq-archive crate defines.
-Authorization for `replay` and `store` is external.
-
-The `version` field is the version of that recording object format.
-It is 3 for this specification.
-A publisher that exposes a store MUST set it; a publisher that does not MUST omit it.
-
-A catalog that composes another broadcast's renditions MUST preserve that child's `archive` entry instead of synthesizing one.
-
-## Track Framing {#timeline-framing}
-A timeline track is a sliding window of records.
-An unbounded publisher only appends records, while a DVR publisher also removes records from the front as they expire.
-
-The first frame of each group is a UTF-8 JSON object containing a checkpoint of the retained window:
-
-~~~
-{
-  "offset": number,
-  "start"?: number,
-  "records": TimelineRecord[],
-}
-~~~
-
-The `offset` is the absolute index of the oldest retained record.
-`start` is the absolute index of `records[0]` and defaults to `offset` when omitted.
-A publisher MAY omit a retained prefix from a checkpoint; a consumer that did not receive that prefix reports `offset` through `start` as skipped.
-Each subsequent frame is one UTF-8 JSON operation, either `{ "push": TimelineRecord }` to append a record at the next absolute index, or `{ "pop": number }` to remove that many records from the front.
-Indices MUST NOT exceed 2^53 - 1.
-
-A publisher MAY roll groups to bound late-join cost or improve compression.
-Each new group restates a decodable suffix of the retained window, so group boundaries are an encoding detail and MUST NOT surface as duplicate records to the application.
-A consumer that missed records reports their absolute index range as skipped before continuing with the retained suffix.
-
-The frames are DEFLATE-compressed ({{!RFC1951}}) within each group.
-The publisher ends each frame's compressed data with an empty sync-flush block (the `0x00 0x00 0xff 0xff` trailer is removed, as in {{?RFC7692}}), so a consumer decompresses frames incrementally from the group's first frame.
-The `.z` suffix on the RECOMMENDED track names marks this compression, mirroring the catalog's `catalog.json.z` sibling.
-
-## Records {#timeline-records}
-Each record describes one span of its track:
-
-~~~
-type TimelineRecord = {
-  "sequence": number,
-  "pts": number | undefined,
-  "duration": number | undefined,
-  "start": TimelinePosition,
-  "end": TimelinePosition,
-  "keyframe": boolean | undefined,
-}
-
-type TimelinePosition = {
-  "group": number,
-  "frame": number | undefined,
-}
-~~~
-
-The `sequence` field is the record's number, consecutive within its timeline and equal to the record's window index.
-
-The `pts` field is the timestamp of the span's first frame and `duration` its length, both in the timescale of the catalog section.
-The next record's `pts` equals `pts + duration` unless content time itself jumped; a consumer SHOULD treat such a jump as a discontinuity.
-A record of a timed track MUST carry both fields.
-An untimed track ({{moql}}) has no content time, so its records MUST omit both; a consumer that needs content time, such as a derived format ({{timeline-derived}}), MUST refuse an untimed record rather than substitute an arrival or send time.
-
-A position names frame `frame` of group `group`, as used by moq-lite FETCH and SUBSCRIBE; `frame` defaults to 0.
-Positions order by group, then frame.
-The span holds every frame from `start` (inclusive) to `end` (exclusive).
-An `end` at frame 0 of group `g` holds every frame of group `g - 1` and none of `g`, whether or not `g` exists; an `end` at a later frame of `g` holds the frames of `g` before it.
-Every group from `start.group` to the last group holding a frame exists and holds at least one frame of the span.
-A record starts where the previous one ended, unless the track skipped group sequences between them.
-
-The `keyframe` field states whether the span's first frame is a keyframe, i.e. whether a player can join or switch renditions there.
-If absent, it defaults to true.
-
-A record MUST tolerate and SHOULD preserve unknown fields, like the catalog.
-
-## Cutting {#timeline-cutting}
-Where a span ends is publisher policy.
-A publisher MUST NOT publish a record until its span is final: every frame between `start` and `end` has been published.
-The newest record is therefore the live edge of its track.
-
-The RECOMMENDED policy is one rule for every track:
-
-- A record ends at the first group boundary at least a minimum duration past its own start, so short groups (audio) pack into one record and long ones (video) get one each.
-- A group still open several declared durations past the record's start is split between frames, so a group that never closes (an append-log such as a `moq-json` stream) is indexed as it grows.
-- A skipped group sequence ends the record at its newest known content, not where the next group starts, so a pause is not counted as content.
-
-A minimum of 4 seconds is RECOMMENDED.
-Before an unhinted track declares, a safety ceiling of 10 seconds, or the minimum if longer, is RECOMMENDED.
-Sparse data that publishes on its own schedule, such as a catalog, SHOULD use a minimum of zero: each group is then its own record, ended as soon as the group finishes, so its newest group is indexed without waiting for another that may never come.
-An untimed track has no duration to measure: each group is its own record, ended as soon as the group finishes or the next group starts, and no group is split between frames.
-
-A publisher MAY add boundaries of its own, such as following a source's segmentation or cutting audio where video starts a group, so a derived segment needs fewer records.
-The final record of an ended track has no successor; its `duration` runs to the newest known content, which a publisher SHOULD carry past the start of the last frame when it knows where that frame ends.
-
-## Derived Formats {#timeline-derived}
-Segmented formats such as HLS and DASH need one segment numbering across renditions, which per-track timelines do not provide on their own.
-An edge deriving one chooses the first enabled video rendition by name with a timeline, or the first such enabled audio rendition when there is none, and keeps a video choice while that rendition stays enabled in the catalog with its timeline; an audio choice yields to the first enabled video rendition with a timeline once there is one.
-Segment URLs identify the reference and its record `sequence`, and the HLS media sequence is that `sequence`, so every edge numbers a segment alike.
-When the reference changes, the edge resumes at the new reference's first record whose `sequence` exceeds the last advertised one and that starts no earlier than the advertised content ends, never changing an advertised segment; until such a record exists, the playlist holds.
-A record that skips sequences restarts the playlist with a discontinuity, since a playlist numbers its segments consecutively; a content gap before it is a discontinuity as well.
-DASH starts a new Period at a handoff and preserves absolute content timestamps through its presentation time offset.
-Another video rendition snaps each boundary to its nearest record that starts a group on a keyframe; a segment with no such record nearby has no content on that rendition (a gap; HLS `EXT-X-GAP`).
-Other renditions take the frames whose timestamps fall inside each segment's span.
-A publisher wanting such an export SHOULD start video groups at the same timestamps across renditions.
+An edge lists a segment once a later one starts or the track ends.
+An edge that joins partway through a segment lists nothing before the first segment it sees start, since it cannot know the groups before its first.
+A rendition's segments after its timestamps go back start a discontinuity on that rendition alone; `EXT-X-PROGRAM-DATE-TIME` lets players resynchronize across renditions.
 
 
 # MPEG-TS Service Information {#mpegts-si}
@@ -1170,7 +1098,7 @@ the broadcast path, not the payload. This track is distinct from an application'
 `hang/chat.json` snapshot extension.
 
 # Security Considerations
-A rendition's `broadcast` reference ({{field-broadcast}}) resolves against the consumer's root, which is the subtree it is authorized for.
+A rendition's `broadcast` reference ({{field-broadcast}}), like an include's ({{include}}), resolves against the consumer's root, which is the subtree it is authorized for.
 Clamping a reference that escapes above that root would silently redirect the subscription to an unrelated broadcast, so a consumer rejects the catalog instead.
 
 TODO Security
@@ -1189,45 +1117,44 @@ This document has no IANA actions.
 ## moq-hang-04
 {:numbered="false"}
 
-- The archive `version` is 3: the recording format stores a track's `priority` signed, -128 through 127 with 0 unset, instead of its moq-lite byte.
+- Defined AAC payloads without a `description` as ADTS, and payloads with an AudioSpecificConfig as raw AAC.
+- A `broadcast` reference and an echo `path` are spelled like a path: one with an empty segment or a lone `\` refuses the catalog instead of collapsing.
+- Removed `catalog.json.z` and the data track `compression` field: compression is a track property the transport carries ({{compression}}), so each compressed track is one name, and the catalog, `stats` and `echo` snapshots, and JSON data tracks SHOULD be compressed.
+- Replaced the root `archive` section and its per-track timelines with the root `media` section ({{media}}). Its `join.interval` is the longest group of any audio or video track, fixed for the broadcast, and the grid an edge numbers HLS and DASH segments on, each segment the smallest whole multiple of it at least a second long, from each group's first timestamp ({{hls}}); the root `clock` moved to `media.clock`. Segment indexes, frame positions, `end`, `keyframe`, `timescale`, `replay`, `replayEpoch`, `store`, and `version` are gone.
 - A reader refuses a JSON frame in which an object repeats a member name.
+- A malformed audio or video rendition ({{malformed}}) refuses the catalog: a known codec string without valid parameters, a zero or out-of-range dimension, sample rate, or channel count, a bitrate or duration above 2^53 - 1, or a container without a string `kind`.
 - Added the root `version` ({{catalog-version}}): the oldest draft that reads the catalog, which a consumer refuses when above its own. A `track` other than the entry's ID or a video `warmup` needs 4. Consumers MUST ignore unknown fields.
 - A data track marks a discontinuity with a group of one object with no bytes, since its empty payload is data. An object with no bytes on an audio or video track, or sharing its group, is malformed.
-- Each archive timeline declares its own fixed nominal record duration, omitted for an untimed track; removed the broadcast-wide duration bound.
 - Removed the Recording section: the store layout is a moq-archive format, documented with that crate, not part of this draft.
+- Removed the viewer feedback `latency` field.
 - Added the optional video `preference` field: a consumer selects automatically among the highest preference it can decode.
-- Added an optional `epoch` beside every rendition and data track `broadcast` reference, and `replayEpoch` beside the archive's `replay` ({{field-epoch}}). A consumer reads each referenced path from the first broadcast it resolves for a catalog instance; a present `epoch` fails a rendition proven to resolve another instance, and is best effort over a route without an Epoch.
-- Derived HLS and DASH exports hand disabled references to enabled renditions at the first record numbered past the advertised ones, keeping the record `sequence` as the HLS media sequence and starting a DASH period.
+- Added the optional video `reorder` field: the most frames that can precede one in decode order and follow it in presentation, fixed for the track once declared. A consumer that authors decode times derives them from it and the current group alone, refusing deeper reordering; without it, a consumer infers them from timestamps.
+- Added an optional `instance` beside every rendition and data track `broadcast` reference ({{field-instance}}). A consumer reads each referenced path from the first broadcast it resolves for a catalog instance; a present `instance` fails a rendition that resolves another stream, and is best effort against an Instance a receiver minted.
+- Added the optional root `include` map ({{include}}): whole broadcasts named by a relative `broadcast` and an optional `instance`, opened only on selection, whose rendition IDs stay their own.
+- Includes share the listing catalog's PTS timeline and root settings, including its clock and join interval.
+- An HLS master selects the includes it lists by reading their catalogs, without demanding media, and segments them on the listing catalog's `media`; an on-demand publisher answers its catalog without starting media production.
 - Added optional `stats` and `echo` catalog sections, publisher/viewer snapshots keyed by rendition ID, and the `.echo` feedback broadcast convention.
+- An Opus frame timestamp counts the OpusHead pre-skip: a consumer presents each decoded sample the pre-skip earlier than its frame timestamp places it.
 
-- Fixed a track's identity for its name ({{identity}}): codec, description, container, display aspect, sample rate, and channel count never change, while every other field, including size, bitrate, and framerate, updates in place. A change of identity takes a new track name, which a rendition may name with `track` while keeping its ID, or a new Epoch.
+- Fixed a track's identity for its name ({{identity}}): codec, description, container, display aspect, sample rate, and channel count never change, while every other field, including size, bitrate, and framerate, updates in place. A change of identity takes a new track name, which a rendition may name with `track` while keeping its ID, or a new stream Instance.
 - Specified MSF text metadata preservation and refusal of unrepresentable text packaging during gateway conversion.
 - Specified conversion between relative broadcast references and MSF track namespaces without changing track identity, reading a namespace aligned with the catalog path's trailing segments as the catalog itself.
 
-- Added optional audio and video `warmup` durations, rounded up to whole milliseconds, and allowed video groups to start at convergent random access pictures.
-- Defined encoder `jitter` as flush lateness above the rendition's own recent minimum, replacing fixed frame-duration hints; container batches retain media-span estimates.
+- Added optional audio and video `warmup` durations, rounded up to whole milliseconds, and allowed video groups to start at convergent random access pictures. A consumer also decoding from an earlier group start may present frames before `warmup`, switching to that decoder once it reaches the presented timestamp.
+- Defined `jitter` from media timestamps alone, the reorder delay and batch spans a publisher writes, replacing fixed frame-duration hints and wall-clock flush lateness.
 - Timed CMAF samples from the frame timestamp, which is the fragment's earliest presentation time; `tfdt` is only relative within the fragment, and places the samples of an untimed frame. A timed CMAF track counts in its `mdhd` ticks.
-- Allowed a DVR to delete timeline objects no checkpoint recovery needs, oldest first.
 - Replaced the live-edge floor with monotonic group starts: a group may overlap the previous group's content but not start before it.
 - Added optional `bitrate` and `jitter` fields to `json` and `binary` track entries.
-- Added the optional `delay` rendition field: how far a rendition's minimum flush lateness trails the broadcast's earliest rendition, never lowered once advertised and never subtracted across renditions.
+- Added the optional `delay` rendition field: how far a rendition's timestamps trail those other renditions already wrote, never lowered once advertised and never subtracted across renditions.
 - Recommended namespaced keys for application root sections.
 - Added the optional `delay` field to `json` and `binary` track entries, measured only from payloads stamped with their capture time on the broadcast clock.
 - Replaced the video `stalled` field with an optional `enabled` field on audio and video renditions. A consumer MUST NOT select a disabled rendition and ignores `stalled`. A consumer that predates `enabled` keeps selecting a disabled rendition.
-- Replaced the broadcast's one aligned timeline with one timeline per track: the catalog `archive` entry's `track` became a `timelines` map from each indexed track, the catalog included, to its timeline track.
-- Required consumers to ignore an undecodable `archive` entry without rejecting the catalog.
-- Replaced the segment record with a per-track record: `sequence`, `pts`, `duration`, and a `start`/`end` range of group and frame positions, dropping cross-track pacing and completeness.
-- One cutting rule for every track: a record ends at the first group boundary past a minimum (4 seconds RECOMMENDED, zero for sparse data such as a catalog) and splits a group between frames once it stays open several declared durations, so a group that never closes is indexed as it grows.
-- Recording format version 2: each track stores record N at `segments/N`, beside its timeline's `segments/N`, with a `Frame Start` field in the segment object. Tracks commit and expire independently, and a DVR keeps each track's newest record.
-- Described deriving HLS and DASH at the edge from a reference rendition's records.
-- An edge keeps its derived-format video reference rendition while that rendition stays in the catalog; an audio reference yields once video has a timeline.
-- Added an optional `epoch` to `.info`: the source route's Epoch, compared on resume so a restarted source fails enrollment.
-- Recorded untimed tracks untimed: `.info` omits `timescale`, segment frame entries omit `Timestamp`, and timeline records omit `pts` and `duration`, one record per group. A DVR refuses an untimed track.
 - Audio `sampleRate` and `numberOfChannels` describe the decoded output, so HE-AAC names its SBR rate and parametric stereo names two channels.
 - Added an optional `track` field to video, audio, text, `json`, and `binary` entries naming the track in its broadcast; the entry's key is its ID and names the track when `track` is absent. A consumer MUST reject a catalog using one ID for both a video and an audio rendition.
 - Defined video `displayAspectWidth` and `displayAspectHeight` as the whole picture's display aspect, not the sample aspect.
 - Added the optional video `color` field: H.273 primaries, transfer, matrix, and range, plus the SMPTE ST 2086 mastering display and CTA-861.3 content light levels.
 - Added the optional video `projection` (rectilinear, or equirectangular with a longitude `fov`) and `stereo` (mono, left-right, or top-bottom) fields and the optional audio `layout` field (ambisonic).
+- Added the optional video `interlaced` field, true when each decoded picture weaves two fields, and made it part of the track's identity ({{identity}}).
 
 ## moq-hang-03
 {:numbered="false"}

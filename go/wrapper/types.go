@@ -1,8 +1,6 @@
 package moq
 
 import (
-	"time"
-
 	ffi "moq.dev/moq-ffi/moq"
 )
 
@@ -13,18 +11,14 @@ type (
 	// AudioCodec selects the audio encoder codec. Build one with OpusAudioCodec or AacAudioCodec;
 	// adding a codec later adds a constructor, not a breaking enum change.
 	AudioCodec = ffi.MoqAudioCodec
-	// AudioDecoderOutput configures the PCM format, sample rate, and channels an audio.Consumer delivers.
-	AudioDecoderOutput = ffi.MoqAudioDecoderOutput
 	// AudioEncoderInput declares the PCM sample format, sample rate, and channel count of frames written to an audio producer.
 	AudioEncoderInput = ffi.MoqAudioEncoderInput
-	// AudioEncoderOutput configures the encoder: codec, optional sample rate, channels, bitrate, frame duration, and preset.
+	// AudioEncoderOutput configures the encoder: codec, optional sample rate, channels, bitrate, and frame duration.
 	AudioEncoderOutput = ffi.MoqAudioEncoderOutput
 	// AudioSampleFormat is a raw PCM sample layout, mirroring WebCodecs AudioData.format.
 	AudioSampleFormat = ffi.MoqAudioSampleFormat
-	// AudioFrame is one audio frame: PCM payload plus a presentation timestamp in microseconds.
+	// AudioFrame is one audio frame: PCM payload plus a presentation Timestamp.
 	AudioFrame = ffi.MoqAudioFrame
-	// ConnectionStatus is a connection lifecycle transition reported by Session.Status.
-	ConnectionStatus = ffi.MoqConnectionStatus
 	// CongestionControl is the congestion control family for a QUIC connection.
 	CongestionControl = ffi.MoqCongestionControl
 	// ErrorScope is whether a protocol code is from the session or stream registry.
@@ -35,54 +29,61 @@ type (
 	ProtocolKind = ffi.MoqProtocolKind
 	// OriginConfig configures a new origin, such as its maximum cache size in bytes.
 	OriginConfig = ffi.MoqOriginConfig
-	// Route is the publisher Epoch a broadcast is announced under (nil when unknown), the hop chain it takes to reach an origin, and its static production and link cost (lower wins).
-	Route = ffi.MoqRoute
+	// RouteInfo is the read-only facts on a received route: the Instance of the stream it serves (routes with one instance are one continuous stream) and its static production and link cost (lower wins), and its informational Rtt to the origin node.
+	RouteInfo = ffi.MoqRouteInfo
+	// Instance names one continuous stream at a path. Compare two with Eq: a session mints one
+	// for a route whose wire carries none, and it differs from a named instance with the same Text.
+	Instance = ffi.MoqInstance
 	// Announce is a route over a prefix: the origin-relative Prefix, what each filter
-	// wildcard matched (nil Captures for a route that only overlaps the scope), and the
-	// Route serving it. It carries no broadcast; resolve a path with
-	// [OriginConsumer.RequestBroadcast].
+	// wildcard matched (Captures), and the RouteInfo serving it. It carries no broadcast;
+	// resolve a path with [OriginConsumer.Request]. Captures is a required slice,
+	// empty when the filter has no wildcards.
 	Announce = ffi.MoqAnnounce
-	// AnnounceEvent is what an AnnounceConsumer yields: AnnounceEventStart,
-	// AnnounceEventUpdate, AnnounceEventEnd, or AnnounceEventRestart.
+	// AnnounceEvent is what an AnnounceConsumer yields: AnnounceEventPresent, AnnounceEventUnavailable,
+	// AnnounceEventAvailable, AnnounceEventAbsent, or AnnounceEventOffline.
+	// Another publisher instance taking a path over keeps it present; see it with [OriginConsumer.Follow].
 	AnnounceEvent = ffi.MoqAnnounceEvent
-	// AnnounceEventStart reports a route now covering a prefix that had none.
-	AnnounceEventStart = ffi.MoqAnnounceEventStart
-	// AnnounceEventUpdate reports the route covering a prefix changing hops or cost.
-	AnnounceEventUpdate = ffi.MoqAnnounceEventUpdate
-	// AnnounceEventEnd reports that no route covers a prefix any more, carrying its last route.
-	AnnounceEventEnd = ffi.MoqAnnounceEventEnd
-	// AnnounceEventRestart reports another publisher instance now serving a prefix:
-	// drop what was resolved under it and request afresh.
-	AnnounceEventRestart = ffi.MoqAnnounceEventRestart
+	// AnnounceEventPresent reports a route now covering a path that was absent; it may arrive unavailable.
+	AnnounceEventPresent = ffi.MoqAnnounceEventPresent
+	// AnnounceEventUnavailable reports that a present path lost every usable path to its origin but may
+	// recover one: it stays present while requests for it may fail.
+	AnnounceEventUnavailable = ffi.MoqAnnounceEventUnavailable
+	// AnnounceEventAvailable reports that a present path recovered a usable path: request it again.
+	AnnounceEventAvailable = ffi.MoqAnnounceEventAvailable
+	// AnnounceEventAbsent reports that the origin withdrew a path, carrying its last route.
+	AnnounceEventAbsent = ffi.MoqAnnounceEventAbsent
+	// AnnounceEventOffline reports that this side let go of a path, carrying its last route: the session
+	// it arrived on closed, or the network lost every path to it, so its origin may still serve it.
+	AnnounceEventOffline = ffi.MoqAnnounceEventOffline
 	// Range is a span of a track to deliver: from Start up to End, or onward when End is nil.
 	// A relative start is the first frame of its group, a relative end includes its whole
 	// group, and an absolute end is exclusive.
 	Range = ffi.MoqRange
-	// Anchor is where one end of a Range falls: AnchorAbsolute, AnchorRelative, or AnchorTime.
+	// Anchor is where one end of a Range falls: AnchorOldest, AnchorAbsolute, AnchorRelative, or AnchorTime.
 	Anchor = ffi.MoqAnchor
-	// AnchorAbsolute is an exact group and frame.
+	// AnchorOldest is the oldest group still around, as far back as the max delay allows. A start only.
+	AnchorOldest = ffi.MoqAnchorOldest
+	// AnchorAbsolute is a group, delivered from its first frame.
 	AnchorAbsolute = ffi.MoqAnchorAbsolute
 	// AnchorRelative is the group Groups before the latest one, clamped to group 0: 0 is the latest.
 	AnchorRelative = ffi.MoqAnchorRelative
-	// AnchorTime is the group containing TimestampUs, a presentation time in microseconds.
+	// AnchorTime is the group containing a presentation Timestamp.
 	AnchorTime = ffi.MoqAnchorTime
 	// Order is which of a subscription's pending groups the publisher sends first.
 	Order = ffi.MoqOrder
-	// VideoDecoderOutput configures what a video.Consumer delivers: an optional resize, a max delay, and whether frames keep the decoder's surface (macOS only; refused elsewhere).
-	VideoDecoderOutput = ffi.MoqVideoDecoderOutput
-	// VideoSurface is a decoded frame's platform surface, from VideoDecodedFrame.Surface: VideoSurfacePixelBuffer on macOS and iOS.
-	VideoSurface = ffi.MoqVideoSurface
-	// VideoSurfacePixelBuffer is an Apple CVPixelBufferRef (IOSurface-backed NV12), as the address in Pointer.
-	VideoSurfacePixelBuffer = ffi.MoqVideoSurfacePixelBuffer
+	// Compression is how a track's frames are compressed on the wire: CompressionDeflate.
+	Compression = ffi.MoqCompression
+	// Position is a location within a track: a group sequence and a frame index in it.
+	Position = ffi.MoqPosition
 	// VideoCodec identifies a published video track's codec: H.264 or H.265.
 	VideoCodec = ffi.MoqVideoCodec
 	// VideoPixelFormat is a CPU pixel layout (I420 or RGBA): written to video.Producer, or read from a VideoDecodedFrame.
 	VideoPixelFormat = ffi.MoqVideoPixelFormat
 	// VideoEncoderInput declares the pixel layout, resolution, and framerate of frames written to a video producer.
 	VideoEncoderInput = ffi.MoqVideoEncoderInput
-	// VideoEncoderOutput configures the video track name, codec, bitrate, keyframe interval, and backend preference.
+	// VideoEncoderOutput configures the video codec, bitrate, keyframe interval, and backend preference.
 	VideoEncoderOutput = ffi.MoqVideoEncoderOutput
-	// VideoFrame is one raw video frame: pixels in the configured layout plus a presentation timestamp in microseconds.
+	// VideoFrame is one raw video frame: pixels in the configured layout plus a presentation Timestamp.
 	VideoFrame = ffi.MoqVideoFrame
 	// VideoEncoderKind selects the encoder implementation. Build one with
 	// AutoEncoder, HardwareEncoder, SoftwareEncoder, or NamedEncoder.
@@ -157,14 +158,10 @@ const (
 	OrderDescending = ffi.MoqOrderDescending
 )
 
-// ConnectionStatus values: the lifecycle of a client session's connection.
+// Compression values: how a track's frames are compressed on the wire.
 const (
-	// ConnectionStatusConnected means a session connected (the first connect, or a reconnect after a drop).
-	ConnectionStatusConnected = ffi.MoqConnectionStatusConnected
-	// ConnectionStatusDisconnected means the session dropped; a reconnect attempt follows.
-	ConnectionStatusDisconnected = ffi.MoqConnectionStatusDisconnected
-	// ConnectionStatusMigrating means the peer sent a GOAWAY; the replacement is being dialed while the old session keeps serving.
-	ConnectionStatusMigrating = ffi.MoqConnectionStatusMigrating
+	// CompressionDeflate makes each group one DEFLATE stream, which suits small, repetitive frames like JSON.
+	CompressionDeflate = ffi.MoqCompressionDeflate
 )
 
 // CongestionControl values.
@@ -177,13 +174,18 @@ const (
 	CongestionControlNone = ffi.MoqCongestionControlNone
 )
 
+// ParseInstance names an instance with text, failing with ErrInvalidInstance when it is empty.
+func ParseInstance(text string) (*Instance, error) {
+	return ffi.MoqInstanceParse(text)
+}
+
 // Versions lists the protocol versions offered by default, most preferred
-// first, spelled the way WithVersions takes them.
+// first, spelled the way ClientConfig.Versions takes them.
 func Versions() []string {
 	return ffi.MoqVersions()
 }
 
-// QlogSupported reports whether this build can write qlog traces for WithQUICQlog.
+// QlogSupported reports whether this build can write qlog traces for QUICConfig.Qlog.
 func QlogSupported() bool {
 	return ffi.MoqQlogSupported()
 }
@@ -191,23 +193,6 @@ func QlogSupported() bool {
 // LogLevel configures the native tracing log level (e.g. "info", "debug").
 func LogLevel(level string) error {
 	return ffi.MoqLogLevel(level)
-}
-
-// MintEpoch mints a fresh publisher epoch from the wall clock and secure randomness,
-// ordered newest last. Mint one per publisher run and announce it in Route.Epoch, so
-// viewers see a restart as a new broadcast instead of a stalled one.
-func MintEpoch() string {
-	return ffi.MoqMintEpoch()
-}
-
-// EpochTime is the wall-clock time an epoch encodes, to the millisecond. It
-// returns ErrInvalidEpoch unless epoch is a lowercase hyphenated UUIDv7.
-func EpochTime(epoch string) (time.Time, error) {
-	ms, err := ffi.MoqEpochTimeMs(epoch)
-	if err != nil {
-		return time.Time{}, err
-	}
-	return time.UnixMilli(int64(ms)), nil
 }
 
 // Protocol registries and recognized kinds carried by ProtocolError.
@@ -236,8 +221,6 @@ const (
 	ProtocolKindVersion = ffi.MoqProtocolKindVersion
 	// ProtocolKindDeliveryTimeout identifies delivery timeout.
 	ProtocolKindDeliveryTimeout = ffi.MoqProtocolKindDeliveryTimeout
-	// ProtocolKindSessionClosed identifies session closed.
-	ProtocolKindSessionClosed = ffi.MoqProtocolKindSessionClosed
 	// ProtocolKindGoingAway identifies going away.
 	ProtocolKindGoingAway = ffi.MoqProtocolKindGoingAway
 	// ProtocolKindTooFarBehind identifies too far behind.
@@ -264,6 +247,20 @@ const (
 	ProtocolKindUnknown = ffi.MoqProtocolKindUnknown
 	// ProtocolKindTooManyRequests identifies an exceeded session request cap.
 	ProtocolKindTooManyRequests = ffi.MoqProtocolKindTooManyRequests
+	// ProtocolKindAuthTokenCacheOverflow identifies an exceeded token cache limit.
+	ProtocolKindAuthTokenCacheOverflow = ffi.MoqProtocolKindAuthTokenCacheOverflow
+	// ProtocolKindMalformedAuthToken identifies an unparseable authorization token.
+	ProtocolKindMalformedAuthToken = ffi.MoqProtocolKindMalformedAuthToken
+	// ProtocolKindUnknownAuthTokenAlias identifies an unregistered token alias.
+	ProtocolKindUnknownAuthTokenAlias = ffi.MoqProtocolKindUnknownAuthTokenAlias
+	// ProtocolKindInvalidRequestId identifies an invalid request ID.
+	ProtocolKindInvalidRequestId = ffi.MoqProtocolKindInvalidRequestId
+	// ProtocolKindInvalidPath identifies an invalid session path.
+	ProtocolKindInvalidPath = ffi.MoqProtocolKindInvalidPath
+	// ProtocolKindInvalidAuthority identifies an invalid session authority.
+	ProtocolKindInvalidAuthority = ffi.MoqProtocolKindInvalidAuthority
+	// ProtocolKindTooManyRequestUpdates identifies an exceeded request update limit.
+	ProtocolKindTooManyRequestUpdates = ffi.MoqProtocolKindTooManyRequestUpdates
 )
 
 // AudioSampleFormat values: the raw PCM sample layout fed to or returned from the

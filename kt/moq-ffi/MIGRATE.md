@@ -1,32 +1,22 @@
 # Migrating the Kotlin moq-ffi package
 
-How to update your code for each breaking change, newest first.
-
 ## Unreleased
 
-### A client asks only about what it watches (#6165)
+### Separate datagram tracks
 
-On moq-lite, a client session asks its relay for announcements only under paths something watches, through `announced()` or `announcedBroadcast()`, instead of under its whole scope at connect.
-`MoqOriginConsumer.requestBroadcast()` watches nothing, so on a client it fails with an unroutable error for a path nothing watches, even when the relay announces it.
-Resolve the path with `announcedBroadcast()`, or hold `announced()` over its prefix while requesting.
-moq-transport and moq-lite-03/04 sessions are unchanged.
-Regenerate the bindings for the changed `request_broadcast` checksum.
+Generated bindings now expose separate `MoqDatagramProducer`, `MoqDatagramConsumer`, `MoqDatagramInfo`, `MoqDatagramRequest`, and `MoqDatagramRequests` types. Create or subscribe through the broadcast's datagram methods, write with `append` / `insert`, and read with `recv`; stream-track datagram methods are removed. Demand is aggregate subscriber priority, and the broadcast request handler has a separate `datagrams` queue. Regenerate and rebuild native bindings together with your wrapper.
 
-### Catalog references carry their epoch
+### Viewer targets are bounded ([#7090](https://github.com/moq-dev/moq/pull/7090))
 
-`MoqVideo` and `MoqAudio` gain `epoch`, the publisher instance their `broadcast` reference names; it defaults to `null`, so only positional construction changes.
-`MoqBroadcastConsumer.resolve` takes the rendition's `epoch` after `reference`; pass it alongside, or `null` to resolve whichever instance answers.
-Resolving, and the rendition-based consumers, throw `MoqException.Mux` for a rendition whose broadcast is proven to serve another epoch.
-Regenerate the bindings for the changed records and checksums.
+Viewer ceilings and PROBE target overrides are refused with the new `MoqException.OutOfRange` once they would sum above 2^53 - 1 bps, the most a PROBE target carries; nothing changes on a refusal. `MoqViewers.watch` and `setTarget` and `MoqViewer.update` throw it. Handle the new variant wherever you match the error exhaustively. Regenerate bindings and rebuild the matching native library together.
 
-### Finished tracks stay until the broadcast ends (#6157)
+### Media setup refusals are typed
 
-A finished track, raw or media, now stays listed, with its catalog rendition and demand, until its broadcast closes or the new `MoqBroadcastProducer.finish()` lets go, instead of unlisting when its producer finishes or is released.
-Publish a replacement under a new name, and expect a finished track's demand watch to end with the broadcast.
-Regenerate the bindings for the new `MoqBroadcastFinish` and the changed checksums.
+Audio and video subscribe setup now reports `MoqException.UnsupportedConfig` when the decoder refuses a codec, layout, or description, or when every video decoder for the codec reports that this device cannot decode the stream. Handle this variant to try another rendition instead of inspecting an audio/video error message or `Unsupported`. Decoder faults, such as a missing driver or no device, and later peer and decode failures keep their existing errors. Regenerate bindings and rebuild the matching native library together.
 
-### Regenerate the matching bindings
+### Follow the core API migration guide
 
-Documentation on `MoqAudioProducer::write` and `finish` changes their UniFFI metadata checksums.
-Regenerate the Kotlin sources and package matching native libraries, then rebuild callers.
-The method signatures and behavior are unchanged.
+These bindings are generated from moq-ffi. Apply every change in the
+[moq-ffi migration guide](../../rs/moq-ffi/MIGRATE.md), using this language's generated casing.
+Regenerate the bindings and rebuild the matching native library together; method metadata checksums are not a separate API migration.
+The [hand-written wrapper](../moq/MIGRATE.md) has its own migration guide.

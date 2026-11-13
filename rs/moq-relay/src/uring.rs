@@ -9,14 +9,16 @@
 //! moq-transport and the SETUP-negotiated versions run through
 //! [`moq_uring::transport::Local`], since their drivers need `Send`.
 //!
-//! The split of work mirrors the relay's topology: a worker owns everything
-//! transport-shaped (the handshake, the session's protocol machine), while
-//! authentication and session supervision run on the shared tokio runtime,
-//! which owns the HTTP client, the timers, and the origins. The session
-//! handle is `Send + Sync` whatever drives its transport, which is what makes
-//! the handoff free.
+//! Each accepted session runs through the same [`Connection`] as the tokio
+//! listeners. The split of work mirrors the relay's topology: a worker owns
+//! everything transport-shaped (the handshake, the session's protocol machine),
+//! while authentication and session supervision run on the shared tokio runtime,
+//! which owns the HTTP client and the origins. The session handle is
+//! `Send + Sync` whatever drives its transport, which is what makes the handoff
+//! free.
 
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::task::Poll;
@@ -25,7 +27,7 @@ use anyhow::Context as _;
 use futures::FutureExt as _;
 use tracing::Instrument;
 
-use crate::{auth, cluster, connection::Lifecycle, shutdown};
+use crate::{Connection, auth, cluster, shutdown};
 
 /// A stop signal a worker parks on, wakeable from the shared runtime.
 #[derive(Default)]
@@ -70,8 +72,9 @@ struct Serve {
 	/// The moq ALPNs this listener speaks, for the WebTransport subprotocol
 	/// pick.
 	alpns: Arc<Vec<String>>,
-	/// The negotiated-version restriction, when the operator set one.
-	versions: moq_net::Versions,
+	/// The moq handshake every connection runs, mapped from `listen` as the
+	/// tokio listeners map it, opening `[quic] receive_window` on admission.
+	moq: moq_net::Server,
 	/// The address every worker socket shares, reported as a session's `local`.
 	local: SocketAddr,
 	/// `listen.timeout`, which each worker's endpoint starts at a connection's
@@ -80,6 +83,8 @@ struct Serve {
 	/// `listen.reset.secret`, shared so any worker resets any worker's
 	/// connections, a restarted group's included.
 	reset_secret: Option<[u8; 32]>,
+	/// The served TLS policy, which builds each client's identity against its roots.
+	tls: moq_tokio::tls::Serve,
 }
 
 /// A bound group of io_uring QUIC workers sharing one port.
@@ -87,13 +92,14 @@ struct Serve {
 /// [`bind`](Self::bind) opens every socket, so a returned value already owns
 /// the listen address and a port conflict is an error here rather than a
 /// worker that quietly died. [`spawn`](Self::spawn) starts every thread, and
-/// nothing is served until [`serve`](Self::serve).
+/// nothing is served until [`Spawned::serve`].
 pub struct Workers {
 	members: Vec<moq_sock::shard::Socket>,
 	addr: SocketAddr,
 	server: moq_uring::quic::server::Config,
-	/// The same live resolver used by every worker and the fingerprint endpoint.
-	certificates: moq_tokio::tls::Certificates,
+	/// The TLS policy every worker serves, and the live resolver behind the
+	/// fingerprint endpoint.
+	tls: moq_tokio::tls::Serve,
 	/// One counter set per worker, in shard order. Created here rather than on
 	/// the worker thread so `/metrics` can publish every worker's series from
 	/// the first scrape, before the threads exist: a series that only appears
@@ -103,7 +109,7 @@ pub struct Workers {
 	udp: moq_uring::udp::Config,
 	pin: bool,
 	alpns: Arc<Vec<String>>,
-	versions: moq_net::Versions,
+	moq: moq_net::Server,
 	timeout: Option<std::time::Duration>,
 	reset_secret: Option<[u8; 32]>,
 
@@ -111,7 +117,7 @@ pub struct Workers {
 	stops: Vec<Arc<Stop>>,
 	/// Releases each spawned worker to accept; dropped unsent, it exits instead.
 	starts: Vec<std::sync::mpsc::Sender<()>>,
-	/// A worker's fatal error, reported to whoever polls [`failed`](Self::failed).
+	/// A worker's fatal error, reported to whoever polls [`Spawned::failed`].
 	failures: tokio::sync::mpsc::UnboundedReceiver<anyhow::Error>,
 	failures_tx: tokio::sync::mpsc::UnboundedSender<anyhow::Error>,
 
@@ -128,37 +134,62 @@ impl Workers {
 	pub fn bind(server: moq_tokio::server::Config, config: moq_tokio::worker::Config) -> anyhow::Result<Self> {
 		// Before any TLS loads or socket binds, so a bad `[quic]` has no side effects.
 		server.quic.validate()?;
-		let listen = &server.listen;
+		// Every setting by name, so one added to `listen` fails to compile here until
+		// these workers honor or refuse it.
+		let moq_tokio::listen::Resolved {
+			bind,
+			versions,
+			// With the versions and timeout, mapped onto the moq handshake by `listen.server()`.
+			extensions: _,
+			implementation: _,
+			timeout,
+			tls: listen_tls,
+			preferred_v4,
+			preferred_v6,
+			lb:
+				moq_tokio::listen::LoadBalancer {
+					id: lb_id,
+					nonce: _,
+					// Needs an id, refused below.
+					forward: _,
+				},
+			reset_secret,
+		} = server.listen.resolve()?;
+		// The one mapping of `listen` onto the moq handshake, shared with the tokio listeners.
+		let moq = server.listen.server();
 		let quic = &server.quic;
-		let tls = match server.tls {
+		for (configured, setting) in [
+			(preferred_v4.is_some(), "listen.preferred_v4"),
+			(preferred_v6.is_some(), "listen.preferred_v6"),
+		] {
+			anyhow::ensure!(
+				!configured,
+				"io_uring workers cannot advertise a QUIC preferred address ({setting}); use the tokio runtime"
+			);
+		}
+		if lb_id.is_some() {
+			anyhow::bail!(
+				"io_uring workers issue shard-steered connection ids and cannot also carry a \
+				 QUIC-LB server id (listen.lb.id)"
+			);
+		}
+		let serve = match server.tls {
 			Some(tls) => {
 				// A second configured source must not be silently ignored.
 				anyhow::ensure!(
-					listen.tls.cert.is_empty()
-						&& listen.tls.key.is_empty()
-						&& listen.tls.generate.is_empty()
-						&& listen.tls.root.is_empty()
-						&& listen.tls.identity.is_none()
-						&& listen.tls.resolver.is_none()
-						&& listen.tls.peers.is_none(),
+					listen_tls.cert.is_empty()
+						&& listen_tls.key.is_empty()
+						&& listen_tls.generate.is_empty()
+						&& listen_tls.root.is_empty()
+						&& listen_tls.identity.is_none()
+						&& listen_tls.peers.is_none(),
 					"a shared TLS policy cannot be combined with listen.tls settings"
 				);
 				tls
 			}
-			None => listen.tls.load()?,
+			None => listen_tls.load()?,
 		};
-		let certificates = tls.certificates();
 
-		// Everything below is a setting this listener cannot deliver. Refusing
-		// beats starting and quietly behaving differently from what the
-		// operator configured, which is the whole failure mode this mode is
-		// most likely to produce.
-		if listen.load_balancer().is_some() {
-			anyhow::bail!(
-				"io_uring workers issue shard-steered connection ids and cannot also carry a \
-				 QUIC-LB server id (listen.lb_id)"
-			);
-		}
 		// One resolution for the whole group, so a DNS answer that rotates
 		// between queries cannot hand members different addresses.
 		//
@@ -167,10 +198,7 @@ impl Workers {
 		// address here would open a QUIC listener nobody asked for.
 		let requested: SocketAddr = {
 			use std::net::ToSocketAddrs;
-			let bind = listen
-				.bind
-				.as_ref()
-				.context("io_uring workers need an explicit listen.bind")?;
+			let bind = bind.as_ref().context("io_uring workers need an explicit listen.bind")?;
 			let bind = bind.to_string();
 			bind.to_socket_addrs()
 				.with_context(|| format!("failed to resolve {bind}"))?
@@ -195,10 +223,6 @@ impl Workers {
 		// Every configured version's ALPN, as the tokio listener advertises.
 		// `h3` rides along for browsers, which negotiate the moq version as a
 		// WebTransport subprotocol instead.
-		let versions: moq_net::Versions = match listen.version.is_empty() {
-			true => Default::default(),
-			false => listen.version.clone().into(),
-		};
 		let alpns: Vec<String> = versions.alpns().into_iter().map(str::to_owned).collect();
 
 		let alpn = alpns
@@ -207,22 +231,26 @@ impl Workers {
 			.chain([b"h3".to_vec()])
 			.collect();
 		let quic = quic.resolve();
-		let mut tls = tls.config(alpn)?;
-		if quic.keylog {
+		let mut tls = serve.config(alpn)?;
+		if let Some(path) = &quic.keylog {
 			let tls = Arc::make_mut(&mut tls);
-			tls.key_log = Arc::new(rustls::KeyLogFile::new());
+			tls.key_log = Arc::new(moq_tokio::tls::KeyLog::open(path)?);
 		}
 		let mut server = moq_uring::quic::server::Config::new(tls);
 		server.transport = transport(&quic)?;
+		// Held back until admission, which opens the configured window.
+		let moq = match server.transport.limits.receive_window {
+			Some(window) => moq.with_receive_window(window),
+			None => moq,
+		};
+		server.transport.limits.receive_window = NonZeroU64::new(moq_net::transport::SETUP_RECEIVE_WINDOW);
 
 		// GSO is a property of the socket, not the connection, so it rides the
 		// worker's UDP config rather than the connection's.
 		let mut udp = moq_uring::udp::Config::default();
 		udp.gso = quic.gso.unwrap_or(true);
 
-		let reset_secret = listen
-			.reset
-			.secret
+		let reset_secret = reset_secret
 			.as_deref()
 			.map(moq_tokio::secret::Secret::read)
 			.transpose()
@@ -237,12 +265,12 @@ impl Workers {
 			members,
 			addr,
 			server,
-			certificates,
+			tls: serve,
 			udp,
 			pin: config.pin,
 			alpns: Arc::new(alpns),
-			versions,
-			timeout: listen.resolved_timeout(),
+			moq,
+			timeout,
 			reset_secret,
 			threads: Vec::new(),
 			stops: Vec::new(),
@@ -271,7 +299,7 @@ impl Workers {
 	///
 	/// Tracks rotations: every worker resolves through the same live identity.
 	pub fn certificates(&self) -> moq_tokio::tls::Certificates {
-		self.certificates.clone()
+		self.tls.certificates()
 	}
 
 	/// Spawn the worker threads, each set up but not yet accepting.
@@ -280,14 +308,14 @@ impl Workers {
 	/// authentication and session supervision. Returns once every worker is
 	/// set up; a worker that cannot start (an old kernel, a ring failure) is
 	/// an error here rather than a thread that quietly died. Nothing accepts
-	/// until [`serve`](Self::serve), so a failure here has served nobody.
+	/// until [`Spawned::serve`], so a failure here has served nobody.
 	pub fn spawn(
-		&mut self,
+		mut self,
 		cluster: cluster::Cluster,
 		auth: auth::Auth,
 		shutdown: shutdown::Observer,
 		sessions: crate::session::Registry,
-	) -> anyhow::Result<()> {
+	) -> anyhow::Result<Spawned> {
 		let serve = Serve {
 			cluster,
 			auth,
@@ -295,10 +323,11 @@ impl Workers {
 			sessions,
 			tokio: tokio::runtime::Handle::current(),
 			alpns: self.alpns.clone(),
-			versions: self.versions.clone(),
+			moq: self.moq.clone(),
 			local: self.addr,
 			timeout: self.timeout,
 			reset_secret: self.reset_secret,
+			tls: self.tls.clone(),
 		};
 
 		let cores = match self.pin {
@@ -325,9 +354,13 @@ impl Workers {
 				start: start_rx,
 				failures: self.failures_tx.clone(),
 			};
+			// A scoped embedder subscriber belongs to these workers too; threads do
+			// not inherit their creator's tracing dispatcher.
+			let dispatch = tracing::dispatcher::get_default(Clone::clone);
+			let parent = tracing::Span::current();
 			let thread = std::thread::Builder::new()
 				.name(format!("moq-uring-{index}"))
-				.spawn(move || run_worker(spawn))
+				.spawn(move || tracing::dispatcher::with_default(&dispatch, || parent.in_scope(|| run_worker(spawn))))
 				.with_context(|| format!("failed to spawn io_uring worker {index}"))?;
 
 			// A worker that fails setup drops its sender, so a recv error and
@@ -349,11 +382,11 @@ impl Workers {
 			self.starts.push(start_tx);
 		}
 
-		Ok(())
+		Ok(Spawned { workers: self })
 	}
 
-	/// Start every [`spawn`](Self::spawn)ed worker accepting.
-	pub fn serve(&mut self) {
+	/// Start every [`Workers::spawn`]ed worker accepting.
+	fn serve(&mut self) {
 		for start in self.starts.drain(..) {
 			// A worker that died since setup is reported through `failed`.
 			let _ = start.send(());
@@ -362,7 +395,7 @@ impl Workers {
 
 	/// The first worker's fatal error. Pends until one dies, which a healthy
 	/// group never does, so this composes into a `select!` loop.
-	pub async fn failed(&mut self) -> anyhow::Error {
+	async fn failed(&mut self) -> anyhow::Error {
 		match self.failures.recv().await {
 			Some(err) => err,
 			// Senders live in `self`, so this is unreachable; pend regardless.
@@ -371,7 +404,7 @@ impl Workers {
 	}
 
 	/// Stop every worker and wait for its thread, off the caller's runtime.
-	pub async fn shutdown(mut self) {
+	async fn shutdown(mut self) {
 		let threads = self.signal();
 		if threads.is_empty() {
 			return;
@@ -386,6 +419,26 @@ impl Workers {
 			stop.stop();
 		}
 		std::mem::take(&mut self.threads)
+	}
+}
+
+/// Workers that have all initialized and can now begin accepting sessions.
+pub struct Spawned {
+	workers: Workers,
+}
+
+impl Spawned {
+	/// Release every initialized worker to accept sessions.
+	pub fn serve(&mut self) {
+		self.workers.serve();
+	}
+	/// Wait for the first worker's fatal error.
+	pub async fn failed(&mut self) -> anyhow::Error {
+		self.workers.failed().await
+	}
+	/// Stop every worker and wait until its thread has ended.
+	pub async fn shutdown(self) {
+		self.workers.shutdown().await;
 	}
 }
 
@@ -413,13 +466,7 @@ impl std::fmt::Debug for Workers {
 ///
 /// One qlog sink is built for the whole group and cloned into every worker, so
 /// the traces share a single writer thread however many workers there are.
-fn transport(quic: &moq_tokio::quic::Resolved) -> anyhow::Result<moq_uring::quic::Transport> {
-	// The datagram path fixes both payload ceilings at SEGMENT and hands
-	// `conn.send` slices of exactly that, so there is no larger size to find.
-	anyhow::ensure!(
-		!quic.mtu_discovery,
-		"io_uring workers send a fixed-size UDP payload, so quic.mtu_discovery has nothing to discover"
-	);
+fn transport(quic: &moq_tokio::quic::Resolved) -> anyhow::Result<moq_uring::quic::transport::Config> {
 	// The tokio path reports this through `moq_tokio::Error::QlogUnsupported`,
 	// which nothing builds here: this listener is the io_uring stack.
 	#[cfg(not(feature = "qlog"))]
@@ -428,7 +475,16 @@ fn transport(quic: &moq_tokio::quic::Resolved) -> anyhow::Result<moq_uring::quic
 		"qlog capture requires a build with the 'qlog' feature; drop quic.qlog"
 	);
 
-	let mut transport = moq_uring::quic::Transport::default();
+	// Mirrors `moq_tokio::Error::ReceiveWindowTooSmall`: incomplete messages hold
+	// connection credit, so a window that cannot fit the largest one stalls.
+	anyhow::ensure!(
+		quic.receive_window >= moq_net::transport::MIN_RECEIVE_WINDOW,
+		"quic.receive_window {} cannot fit the largest message, {} bytes",
+		quic.receive_window,
+		moq_net::transport::MIN_RECEIVE_WINDOW
+	);
+
+	let mut transport = moq_uring::quic::transport::Config::default();
 	#[cfg(feature = "qlog")]
 	if let Some(dir) = quic.qlog.as_deref() {
 		transport.qlog = Some(
@@ -437,23 +493,27 @@ fn transport(quic: &moq_tokio::quic::Resolved) -> anyhow::Result<moq_uring::quic
 		);
 		tracing::info!(dir = %dir.display(), "writing qlog");
 	}
-	transport.idle_timeout = quic.idle_timeout;
-	transport.max_streams = quic.max_streams;
+	// The uring transport spells "no idle timeout" as zero.
+	transport.idle_timeout = quic.idle_timeout.unwrap_or_default();
 	transport.keep_alive = quic.keep_alive;
-	// `[quic]` resolves every window, defaults included, so both runtimes run
+	transport.mtu_discovery = quic.mtu_discovery;
+	// `[quic]` resolves every limit, defaults included, so both runtimes run
 	// the same ones rather than each backend's own.
-	transport.receive_window = Some(quic.receive_window);
-	transport.stream_receive_window = Some(quic.stream_receive_window);
-	transport.send_window = Some(quic.send_window);
-	transport.congestion = match quic.congestion_control {
-		Some(moq_tokio::quic::CongestionControl::Loss) => moq_uring::quic::Congestion::Loss,
+	transport.limits.max_streams = NonZeroU64::new(quic.max_streams);
+	transport.limits.receive_window = NonZeroU64::new(quic.receive_window);
+	transport.limits.stream_receive_window = NonZeroU64::new(quic.stream_receive_window);
+	transport.limits.send_window = NonZeroU64::new(quic.send_window);
+	transport.congestion = match (&quic.controller, quic.congestion_control) {
+		// The application's own controller wins over a family, as on the tokio path.
+		(Some(controller), _) => controller.0.clone(),
+		(None, Some(moq_tokio::quic::CongestionControl::Loss)) => moq_uring::quic::Congestion::Loss.into(),
 		// Unset means the backend's own default, and live media wants a steady
 		// send rate an encoder can track over CUBIC's sawtooth.
-		Some(moq_tokio::quic::CongestionControl::Delay) | None => moq_uring::quic::Congestion::Delay,
-		Some(moq_tokio::quic::CongestionControl::None) => moq_uring::quic::Congestion::None,
+		(None, Some(moq_tokio::quic::CongestionControl::Delay) | None) => moq_uring::quic::Congestion::Delay.into(),
+		(None, Some(moq_tokio::quic::CongestionControl::None)) => moq_uring::quic::Congestion::None.into(),
 		// A family added to the tokio stack later, rather than a silent
 		// substitution the operator would never learn about.
-		Some(other) => anyhow::bail!("io_uring workers cannot run the {other:?} congestion controller"),
+		(None, Some(other)) => anyhow::bail!("io_uring workers cannot run the {other:?} congestion controller"),
 	};
 	Ok(transport)
 }
@@ -481,7 +541,7 @@ struct Spawn {
 	/// Reports setup back to [`Workers::spawn`], which blocks on it so a
 	/// worker that cannot start is an error there rather than a dead thread.
 	ready: std::sync::mpsc::Sender<anyhow::Result<()>>,
-	/// Fires on [`Workers::serve`]; closes when the group stops first.
+	/// Fires on [`Spawned::serve`]; closes when the group stops first.
 	start: std::sync::mpsc::Receiver<()>,
 	/// Where a fatal error goes once the worker is running.
 	failures: tokio::sync::mpsc::UnboundedSender<anyhow::Error>,
@@ -556,11 +616,11 @@ fn serve_worker(spawn: Spawn) -> bool {
 			.udp(member, udp)
 			.context("failed to adopt the worker socket")?;
 		let mut endpoint_config = moq_uring::quic::endpoint::Config::default().with_server(server);
-		endpoint_config.activity = serve.shutdown.activity.clone();
+		endpoint_config.admission = serve.shutdown.admission.clone();
 		endpoint_config.handshake.timeout = serve.timeout;
 		endpoint_config.reset_secret = serve.reset_secret;
 		let endpoint =
-			moq_uring::quic::Endpoint::new(socket, endpoint_config).context("failed to build the QUIC endpoint")?;
+			moq_uring::quic::Endpoint::new(endpoint_config, socket).context("failed to build the QUIC endpoint")?;
 		Ok((worker, endpoint))
 	})();
 
@@ -583,19 +643,7 @@ fn serve_worker(spawn: Spawn) -> bool {
 		loop {
 			match endpoint.accept().await {
 				Ok(conn) => {
-					let id = serve.cluster.next_connection_id();
-					let conn_handle = accept_handle.clone();
-					let serve = serve.clone();
-					let lifecycle =
-						Lifecycle::new(serve.cluster.clone(), serve.auth.clone(), id, Some(conn.remote_addr()))
-							.with_shutdown(serve.shutdown.clone())
-							.with_sessions(serve.sessions.clone());
-					accept_handle.spawn(async move {
-						let shared = serve.tokio.clone();
-						lifecycle
-							.start(&shared, serve_connection(conn_handle, conn, serve, &lifecycle))
-							.await;
-					});
+					accept_handle.spawn(serve_connection(accept_handle.clone(), conn, serve.clone()));
 				}
 				Err(err) => {
 					let _ = accept_failures
@@ -613,95 +661,60 @@ fn serve_worker(spawn: Spawn) -> bool {
 	true
 }
 
-/// What remains of a connection's handshake deadline, and how to tell the peer
-/// it passed.
-struct Deadline {
-	timer: moq_uring::Timer,
-	/// Closes with the timeout code once a session exists to carry it. Until
-	/// then a timed-out handshake is just dropped, and its guard closes in the
-	/// handshake's own error space, as HTTP/3 has no MoQ codes.
-	close: Option<moq_uring::quic::web::Session>,
+/// Accept one connection on its worker, then serve it through [`Connection`].
+async fn serve_connection(handle: moq_uring::Handle, conn: moq_uring::quic::Connection, serve: Serve) {
+	let remote = conn.remote_address();
+	// Like the tokio listener, a connection that never reaches its SETUP is no session.
+	let request = match moq_tokio::panic::isolate(accept(handle, conn, &serve)).await {
+		Some(Ok(request)) => request,
+		Some(Err(err)) => return tracing::debug!(%remote, %err, "failed to accept session"),
+		// `isolate` logged the panic; only this handshake is lost.
+		None => return,
+	};
+	Connection::new(request, serve.cluster.clone(), serve.auth.clone())
+		.with_id(serve.cluster.next_connection_id())
+		.with_shutdown(serve.shutdown.clone())
+		.with_sessions(serve.sessions.clone())
+		.run()
+		.await;
 }
 
-impl Deadline {
-	fn new(handle: &moq_uring::Handle, conn: &moq_uring::quic::Connection) -> Self {
-		let mut timer = handle.timer();
-		timer.set(conn.handshake().deadline);
-		Self { timer, close: None }
-	}
-
-	async fn bound<T, E: Into<anyhow::Error>>(
-		&mut self,
-		handshake: impl Future<Output = Result<T, E>>,
-	) -> anyhow::Result<T> {
-		use web_transport_trait::poll::Session as _;
-		let timer = std::pin::pin!(self.timer.wait());
-		let handshake = std::pin::pin!(handshake);
-		match futures::future::select(timer, handshake).await {
-			futures::future::Either::Left(_) => {
-				// Close before dropping the pending handshake, whose cancellation guard
-				// would otherwise replace the timeout with an abandoned-handshake error.
-				let err = moq_net::Error::Timeout;
-				if let Some(close) = &mut self.close {
-					close.close(moq_net::SessionError::Timeout.to_code(), &err.to_string());
-				}
-				Err(err.into())
-			}
-			futures::future::Either::Right((result, _)) => result.map_err(Into::into),
-		}
-	}
-}
-
-/// Start one accepted connection on its worker: the handshakes here, then
-/// [`serve_request`].
-async fn serve_connection(
+/// Run the transport handshake and read the moq SETUP, by the deadline the endpoint
+/// started at the connection's first packet and enforced through the QUIC handshake.
+async fn accept(
 	handle: moq_uring::Handle,
 	conn: moq_uring::quic::Connection,
-	serve: Serve,
-	lifecycle: &Lifecycle,
-) -> anyhow::Result<Supervision> {
-	use web_transport_trait::poll::Session as _;
-
-	// The endpoint started this deadline at the connection's first packet and
-	// enforced it through the QUIC handshake; it covers SETUP OK too.
-	let mut deadline = Deadline::new(&handle, &conn);
+	serve: &Serve,
+) -> anyhow::Result<Request> {
+	let deadline = conn.handshake().deadline;
 
 	// Read the link facts now: the handshake below consumes the connection.
-	let remote = conn.remote_addr();
+	let remote = conn.remote_address();
 	let sni = conn.server_name().map(str::to_owned);
 	// TLS validated this against the configured roots before the connection
 	// existed, so a chain here is an authenticated peer.
-	let identity = conn.peer_chain().map(|chain| {
-		let chain = chain
-			.into_iter()
-			.map(moq_tokio::rustls::pki_types::CertificateDer::from)
-			.collect();
-		moq_tokio::tls::PeerIdentity::from_chain(chain)
-	});
+	let identity = conn.peer_identity().map(|chain| serve.tls.peer(chain));
 
 	// Browsers speak WebTransport; everyone else raw QUIC. The moq version
 	// rides the ALPN for raw QUIC and the WebTransport subprotocol for `h3`.
-	// The negotiated moq protocol: the WebTransport sub-protocol for `h3`, else the ALPN.
 	let mut alpn = conn.protocol().map(str::to_owned);
-	let (transport, url) = match conn.protocol() {
+	let (conn, url) = match conn.protocol() {
 		Some("h3") => {
-			let request = deadline
-				.bound(moq_uring::quic::web::Request::accept(conn))
+			let request = within(deadline, moq_uring::quic::web::Request::accept(conn))
 				.await
 				.context("WebTransport handshake failed")?;
-			let url = request.url().clone();
+			let url = request.url.clone();
 			let protocol = request
-				.protocols()
+				.protocols
 				.iter()
 				.find(|offered| serve.alpns.iter().any(|alpn| alpn == *offered))
 				.cloned();
-			let mut response = moq_uring::quic::web::Response::default();
+			let mut response = web_transport_proto::ConnectResponse::OK;
 			if let Some(protocol) = &protocol {
 				response = response.with_protocol(protocol);
 			}
-			alpn = protocol.clone();
-			let session = deadline
-				.bound(request.respond(response))
+			alpn = protocol;
+			let session = within(deadline, request.respond(response))
 				.await
 				.context("WebTransport response failed")?;
 			(session, Some(url))
@@ -709,198 +722,279 @@ async fn serve_connection(
 		_ => (moq_uring::quic::web::Session::raw(conn), None),
 	};
 
-	deadline.close = Some(transport.clone());
-	let conn = transport.clone();
-	let server = moq_net::Server::new().with_versions(serve.versions.clone());
-	let binding = match url {
-		Some(_) => moq_net::transport::Binding::Uri,
-		None => moq_net::transport::Binding::InBand,
-	};
-	let session = moq_uring::transport::Session::new(transport, binding);
-	let now = moq_net::time::now();
-	// moq-lite on its own ALPN runs unboxed on this worker. Everything else
-	// (moq-transport, and the versions that negotiate in a bidi SETUP, which a
-	// browser offering no subprotocol falls back to) boxes its futures with a
-	// native `Send` bound, which only a `Local` session meets.
-	let unboxed = alpn
-		.as_deref()
-		.and_then(moq_net::Version::from_alpn)
-		.is_some_and(|version| version.is_lite());
-	let mut accepted = Accepted {
+	let session = moq_uring::transport::Local::new(conn.clone());
+	let handshake = serve
+		.moq
+		.accept_request(moq_net::time::Instant::now(), session)
+		.with_deadline(deadline)
+		.await
+		.context("moq handshake failed")?;
+	Ok(Request {
 		handle,
+		shared: serve.tokio.clone(),
 		conn,
-		deadline,
-		serve,
+		handshake,
+		local: serve.local,
 		remote,
 		sni,
 		identity,
 		alpn,
 		url,
-	};
-	match unboxed {
-		true => {
-			let request = accepted
-				.deadline
-				.bound(server.accept_request_lite(now, session))
-				.await
-				.context("moq handshake failed")?;
-			serve_request(accepted, request, lifecycle).await
-		}
-		false => {
-			let request = accepted
-				.deadline
-				.bound(server.accept_request(now, moq_uring::transport::Local::new(session)))
-				.await
-				.context("moq handshake failed")?;
-			serve_request(accepted, request, lifecycle).await
-		}
-	}
+		caps: kio::Producer::new(None),
+		quic_limits: Default::default(),
+	})
 }
 
-/// A connection past its transport handshake, with the facts read off it
-/// before the moq handshake consumed it.
-struct Accepted {
+/// Finish a transport handshake by `deadline`, or fail with a timeout.
+///
+/// Nothing is established yet that could carry a close code, so an expired
+/// handshake is dropped, which closes its connection.
+async fn within<T, E: Into<anyhow::Error>>(
+	deadline: Option<moq_net::time::Instant>,
+	handshake: impl Future<Output = Result<T, E>>,
+) -> anyhow::Result<T> {
+	let done = match deadline {
+		Some(deadline) => kio::clock::timeout_at(deadline, handshake)
+			.await
+			.map_err(|_| moq_net::Error::Timeout)?,
+		None => handshake.await,
+	};
+	done.map_err(Into::into)
+}
+
+/// A session on an io_uring worker whose SETUP awaits the relay's reply.
+///
+/// It never leaves its worker, which drives the connection and, once the session
+/// starts, its protocol; admission and supervision hop to the shared runtime.
+pub(crate) struct Request {
 	handle: moq_uring::Handle,
+	/// The runtime that owns authentication and session supervision.
+	shared: tokio::runtime::Handle,
 	conn: moq_uring::quic::web::Session,
-	deadline: Deadline,
-	serve: Serve,
+	handshake: moq_net::server::Handshake,
+	local: SocketAddr,
 	remote: SocketAddr,
 	sni: Option<String>,
 	identity: Option<moq_tokio::tls::PeerIdentity>,
 	alpn: Option<String>,
-	url: Option<moq_uring::url::Url>,
+	/// The request URL, on WebTransport only.
+	url: Option<url::Url>,
+	/// The latest caps the lease paced, `None` until it paces any. The lease lives on the
+	/// shared runtime, so a task on this worker applies them to the connection.
+	caps: kio::Producer<Option<auth::Caps>>,
+	/// What [`ok`](crate::incoming::Sealed::ok) applies before answering SETUP.
+	quic_limits: moq_quic::Limits,
 }
 
-/// A started session's supervision, boxed so both handshake paths return one type.
-type Supervision = futures::future::BoxFuture<'static, anyhow::Result<()>>;
+impl crate::incoming::Sealed for Request {
+	/// Spawned on the worker by [`ok`](Self::ok).
+	type Driver = ();
 
-/// Authenticate on the shared runtime, then start the session on the worker.
-/// Returns the session's supervision, which runs on the shared runtime too.
-async fn serve_request<S: moq_net::transport::poll::Session>(
-	accepted: Accepted,
-	request: moq_net::server::Handshake<S>,
-	lifecycle: &Lifecycle,
-) -> anyhow::Result<Supervision> {
-	let Accepted {
-		handle,
-		conn,
-		mut deadline,
-		serve,
-		remote,
-		sni,
-		identity,
-		alpn,
-		url,
-	} = accepted;
-
-	// WebTransport addresses its path through the URL, but both transports can
-	// carry a credential in the MoQ SETUP.
-	let transport = match url {
-		Some(_) => moq_auth::Transport::WebTransport,
-		None => moq_auth::Transport::Quic,
-	};
-	let mut auth_request = crate::auth::request_for_setup(&serve.auth, &request, transport);
-	if let Some(url) = &url {
-		auth_request.path = url.path().to_string();
-		auth_request.query = url.query().map(str::to_owned);
+	fn remote(&self) -> Option<SocketAddr> {
+		Some(self.remote)
 	}
-	auth_request.remote = Some(remote);
-	auth_request.local = Some(serve.local);
-	// Like the tokio listener: the SNI, else the host a WebTransport client addressed.
-	auth_request.server_name = sni.or_else(|| {
-		url.as_ref()
+
+	fn transport(&self) -> &'static str {
+		self.auth_transport().as_str()
+	}
+
+	fn shared(&self) -> Option<&tokio::runtime::Handle> {
+		Some(&self.shared)
+	}
+
+	fn admission(&self, auth: &auth::Auth) -> moq_auth::Request {
+		let mut request = auth::request_for_setup(auth, &self.handshake, self.auth_transport());
+		// WebTransport addresses its path through the URL; raw QUIC carries it in SETUP.
+		if let Some(url) = &self.url {
+			request.path = url.path().to_string();
+			request.query = url.query().map(str::to_owned);
+		}
+		request.remote = Some(self.remote);
+		request.local = Some(self.local);
+		// Only the SNI, like the tokio listener: the CONNECT host selected no certificate.
+		request.server_name = self.sni.clone();
+		request.host = self
+			.url
+			.as_ref()
 			.and_then(|url| url.host_str())
-			.filter(|host| !host.is_empty())
 			.map(str::to_owned)
-	});
-	auth_request.alpn = alpn.clone();
-	auth_request.tls = identity.as_ref().and_then(crate::auth::peer);
-	let admission = lifecycle.clone();
-	// The handshake deadline covers admission too, so a peer cannot hold the connection
-	// open behind a decision that never comes. Dropping the shared task withdraws it.
-	let decided = deadline
-		.bound(lifecycle.shared(&serve.tokio, async move { admission.admit(auth_request).await }))
-		.await
-		.inspect_err(|err| {
-			if matches!(err.downcast_ref::<moq_net::Error>(), Some(moq_net::Error::Timeout)) {
-				serve.cluster.refusals.record(crate::refusals::Refusal::Unavailable);
+			.or_else(|| self.sni.clone());
+		request.alpn = self.alpn.clone();
+		request.tls = self.identity.as_ref().and_then(auth::peer);
+		request
+	}
+
+	async fn expired(&mut self) {
+		self.handshake.expired().await
+	}
+
+	async fn reject(self, code: moq_net::SessionError) {
+		self.handshake.close(code.into());
+	}
+
+	fn pacer(&self) -> Option<auth::Pacer> {
+		let caps = self.caps.clone();
+		Some(auth::Pacer::new(move |new| {
+			if let Ok(mut caps) = caps.write() {
+				*caps = Some(new);
 			}
-		})?;
-	let (admitted, registration) = match decided {
-		Ok(admitted) => admitted,
-		Err(err) => {
-			// The status is what separates "your credential is bad" from "the auth
-			// server is down". Collapsing both into Unauthorized tells a client to
-			// stop reconnecting through an outage it could have waited out.
-			request.close(match err.status {
-				axum::http::StatusCode::UNAUTHORIZED | axum::http::StatusCode::FORBIDDEN => {
-					moq_net::Error::Unauthorized
+		}))
+	}
+
+	fn with_quic_limits(mut self, limits: moq_quic::Limits) -> anyhow::Result<Self> {
+		limits.validate()?;
+		self.quic_limits = limits;
+		Ok(self)
+	}
+
+	fn auth(&self) -> moq_net::auth::Handle {
+		self.handshake.auth()
+	}
+
+	fn requests(&mut self) -> moq_net::auth::Requests {
+		self.handshake.requests()
+	}
+
+	fn role(&self) -> Option<moq_net::setup::Role> {
+		self.handshake.role()
+	}
+
+	fn peer_hop(&self) -> Option<std::num::NonZeroU64> {
+		self.handshake.peer_hop()
+	}
+
+	fn with_stats(mut self, stats: moq_net::stats::Session) -> Self {
+		self.handshake = self.handshake.with_stats(stats);
+		self
+	}
+
+	fn with_limits(mut self, limits: moq_net::session::Limits) -> Self {
+		self.handshake = self.handshake.with_limits(limits);
+		self
+	}
+
+	fn with_publisher(mut self, publish: moq_net::origin::Consumer) -> Self {
+		self.handshake = self.handshake.with_publisher(publish);
+		self
+	}
+
+	fn with_subscriber(mut self, subscribe: moq_net::origin::Producer) -> Self {
+		self.handshake = self.handshake.with_subscriber(subscribe);
+		self
+	}
+
+	async fn ok(self) -> anyhow::Result<(moq_net::Session, Self::Driver)> {
+		let Self {
+			handle,
+			conn,
+			mut handshake,
+			caps,
+			mut quic_limits,
+			..
+		} = self;
+		// The other limits go first; moq-net opens the receive window after them, so a
+		// `receive_rate` paces the opened window.
+		if let Some(window) = quic_limits.receive_window.take() {
+			handshake = handshake.with_receive_window(window);
+		}
+		conn.set_limits(quic_limits).expect("validated by with_quic_limits");
+
+		// Holds only a consumer: dropping the lease, and with it the pacer, closes `caps`,
+		// which ends the task and releases its handle on the connection.
+		let caps = caps.consume();
+		let pacing = {
+			let conn = conn.clone();
+			async move {
+				let mut applied = None;
+				while let Ok(next) = caps
+					.wait(|caps| match **caps != applied {
+						true => std::task::Poll::Ready(**caps),
+						false => std::task::Poll::Pending,
+					})
+					.await
+				{
+					if let Some(caps) = next
+						&& let Err(err) = conn.set_limits(caps.limits())
+					{
+						tracing::warn!(%err, "failed to apply bitrate caps");
+					}
+					applied = next;
 				}
-				other => moq_net::Error::App(other.as_u16()),
-			});
-			return Err(err.source);
-		}
-	};
+			}
+		};
+		handle.spawn(pacing.in_current_span());
 
-	let cluster::Admitted {
-		lease,
-		publisher,
-		subscriber,
-		stats,
-	} = admitted;
+		let (session, driver) = handshake.ok().await?;
+		let driver_handle = handle.clone();
+		let driver = async move {
+			match driver_handle.run(driver).await {
+				moq_net::Error::Closed => {}
+				err => tracing::debug!(%err, "session driver ended"),
+			}
+		};
+		handle.spawn(moq_tokio::panic::isolate(driver).in_current_span().map(drop));
+		Ok((session, ()))
+	}
 
-	// A peer's QUIC limits widen before SETUP OK, so its first requests see them.
-	if let Some(limits) = serve.cluster.quic_limits(&lease) {
-		conn.set_limits(limits)?;
+	async fn drive((): Self::Driver) -> anyhow::Result<()> {
+		Ok(())
 	}
-	let mut request = request
-		.with_stats(stats.clone())
-		.with_limits(serve.cluster.limits(&lease));
-	if let Some(subscriber) = subscriber {
-		request = request.with_publisher(subscriber);
-	}
-	if let Some(publisher) = publisher {
-		request = request.with_subscriber(publisher);
-	}
-	let lease = lease.preparing(request.auth(), request.role())?;
-	let serving = serve.shutdown.serve();
-	// Bounded by the drain deadline too, like the tokio path, so a peer that stalls
-	// the SETUP reply cannot hold the drain. That is a tokio timer, so it runs on the
-	// shared runtime, and dropping it aborts the task.
-	let shutdown = serve.shutdown.clone();
-	let expired = std::pin::pin!(lifecycle.shared(&serve.tokio, async move { shutdown.expired().await }));
-	let reply = std::pin::pin!(deadline.bound(request.ok()));
-	let (session, driver) = match futures::future::select(reply, expired).await {
-		futures::future::Either::Left((reply, _)) => {
-			reply.inspect_err(|err| crate::connection::setup_failed(&stats, err.downcast_ref()))?
-		}
-		futures::future::Either::Right(_) => anyhow::bail!("the SETUP reply was still pending at the drain deadline"),
-	};
-	let driver_handle = handle.clone();
-	let driver = async move {
-		match driver_handle.run(driver).await {
-			moq_net::Error::Closed => {}
-			err => tracing::debug!(%err, "session driver ended"),
-		}
-	};
-	handle.spawn(moq_tokio::panic::isolate(driver).in_current_span().map(drop));
+}
 
-	// The driver stays on this worker. The session handle is Send + Sync, so its
-	// supervision (credential expiry, GOAWAY drain) runs with the timers and the
-	// shutdown broadcast on the shared runtime.
-	let lifecycle = lifecycle.clone();
-	Ok(async move {
-		lifecycle
-			.supervise(serving, session, lease, registration, transport)
-			.await
+impl Request {
+	/// WebTransport when the request carried a URL, else raw QUIC.
+	fn auth_transport(&self) -> moq_auth::Transport {
+		match self.url {
+			Some(_) => moq_auth::Transport::WebTransport,
+			None => moq_auth::Transport::Quic,
+		}
 	}
-	.boxed())
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
 	use super::*;
+
+	/// Unsupported listen settings fail before loading TLS or binding a socket.
+	#[test]
+	fn bind_refuses_preferred_addresses() {
+		moq_tokio::crypto::install_default().unwrap();
+		type Set = fn(&mut moq_tokio::listen::Config);
+		let cases: [(&str, Set); 2] = [
+			("listen.preferred_v4", |listen| {
+				listen.preferred_v4 = Some("192.0.2.1:443".parse().unwrap());
+			}),
+			("listen.preferred_v6", |listen| {
+				listen.preferred_v6 = Some("[2001:db8::1]:443".parse().unwrap());
+			}),
+		];
+		for (setting, set) in cases {
+			for configured in [false, true] {
+				let mut server = moq_tokio::server::Config::default();
+				if configured {
+					server.listen.bind = Some("127.0.0.1:0".parse().unwrap());
+					server.listen.tls.generate = vec!["localhost".into()];
+				}
+				set(&mut server.listen);
+				let err = Workers::bind(server, moq_tokio::worker::Config::new(1))
+					.expect_err("the workers cannot advertise a preferred address");
+				assert!(err.to_string().contains(setting), "{err:#}");
+			}
+		}
+	}
+
+	/// The workers refuse what the tokio listener refuses, before binding a socket.
+	#[test]
+	fn bind_refuses_an_invalid_listen() {
+		moq_tokio::crypto::install_default().unwrap();
+		let mut server = moq_tokio::server::Config::default();
+		server.listen.bind = Some("127.0.0.1:0".parse().unwrap());
+		server.listen.tls.generate = vec!["localhost".into()];
+		server.listen.lb.nonce = Some(8);
+		let err = Workers::bind(server, moq_tokio::worker::Config::new(1))
+			.expect_err("a QUIC-LB nonce without an id is refused");
+		assert!(err.to_string().contains("--listen-quic-lb-nonce"), "{err:#}");
+	}
 
 	/// A window the operator set has to reach the worker. Refusing it, or
 	/// accepting the config and leaving the field unset, would both hide it.
@@ -908,33 +1002,56 @@ mod tests {
 	/// `Config` is non-exhaustive, so the windows are filled in after `default`
 	/// rather than in a struct literal.
 	#[test]
-	#[allow(clippy::field_reassign_with_default)]
 	fn windows_are_applied() {
 		let mut quic = moq_tokio::quic::Config::default();
-		quic.receive_window = Some(64 << 20);
+		quic.receive_window = Some(128 << 20);
 		quic.stream_receive_window = Some(8 << 20);
 		quic.send_window = Some(32 << 20);
 
 		let transport = transport(&quic.resolve()).expect("windows must be accepted");
-		assert_eq!(transport.receive_window, Some(64 << 20));
-		assert_eq!(transport.stream_receive_window, Some(8 << 20));
-		assert_eq!(transport.send_window, Some(32 << 20));
+		assert_eq!(transport.limits.receive_window, NonZeroU64::new(128 << 20));
+		assert_eq!(transport.limits.stream_receive_window, NonZeroU64::new(8 << 20));
+		assert_eq!(transport.limits.send_window, NonZeroU64::new(32 << 20));
+	}
+
+	/// `quic.mtu_discovery` reaches the workers as it does the tokio backends: off unless set.
+	#[test]
+	fn mtu_discovery_is_applied() {
+		let mut quic = moq_tokio::quic::Config::default();
+		assert!(!transport(&quic.resolve()).expect("default").mtu_discovery);
+		quic.mtu_discovery = Some(true);
+		assert!(transport(&quic.resolve()).expect("discovery").mtu_discovery);
+	}
+
+	/// Incomplete messages hold connection credit, so the window has to fit the largest.
+	#[test]
+	fn a_receive_window_below_the_largest_message_is_refused() {
+		let min = moq_net::transport::MIN_RECEIVE_WINDOW;
+		let mut quic = moq_tokio::quic::Config::default();
+		quic.receive_window = Some(min - 1);
+		let err = transport(&quic.resolve()).expect_err("below the largest message");
+		assert!(err.to_string().contains("largest message"), "{err}");
+
+		quic.receive_window = Some(min);
+		assert_eq!(
+			transport(&quic.resolve()).expect("the minimum").limits.receive_window,
+			NonZeroU64::new(min)
+		);
 	}
 
 	/// The same `[quic]` section runs the same windows on both runtimes, set or
 	/// left at the documented defaults: the tokio backends apply `Resolved`'s
 	/// windows as they are, and the workers must get exactly those.
 	#[test]
-	#[allow(clippy::field_reassign_with_default)]
 	fn windows_match_the_tokio_runtime() {
 		let mut set = moq_tokio::quic::Config::default();
-		set.receive_window = Some(128 << 20);
+		set.receive_window = Some(256 << 20);
 		set.stream_receive_window = Some(8 << 20);
 		set.send_window = Some(32 << 20);
 
 		for (quic, expected) in [
-			(moq_tokio::quic::Config::default(), (64 << 20, 4 << 20, 16 << 20)),
-			(set, (128 << 20, 8 << 20, 32 << 20)),
+			(moq_tokio::quic::Config::default(), (4 << 20, 1 << 20, 4 << 20)),
+			(set, (256 << 20, 8 << 20, 32 << 20)),
 		] {
 			let resolved = quic.resolve();
 			let tokio = (
@@ -946,25 +1063,29 @@ mod tests {
 
 			let transport = transport(&resolved).expect("windows must be accepted");
 			let uring = (
-				transport.receive_window,
-				transport.stream_receive_window,
-				transport.send_window,
+				transport.limits.receive_window,
+				transport.limits.stream_receive_window,
+				transport.limits.send_window,
 			);
-			assert_eq!(uring, (Some(tokio.0), Some(tokio.1), Some(tokio.2)));
+			assert_eq!(
+				uring,
+				(
+					NonZeroU64::new(tokio.0),
+					NonZeroU64::new(tokio.1),
+					NonZeroU64::new(tokio.2)
+				)
+			);
 		}
 	}
 
 	/// A direct `bind` validates `[quic]` too, so a key log nobody can read back fails
 	/// instead of binding and logging nothing.
 	#[test]
-	#[allow(clippy::field_reassign_with_default)]
-	fn bind_refuses_a_keylog_without_sslkeylogfile() {
-		// SAFETY: nextest runs each test in its own process, so nothing else reads the environment.
-		unsafe { std::env::remove_var("SSLKEYLOGFILE") };
+	fn bind_refuses_an_empty_keylog_path() {
 		let mut server = moq_tokio::server::Config::default();
-		server.quic.keylog = Some(true);
-		let err = Workers::bind(server, moq_tokio::worker::Config::new(1))
-			.expect_err("a keylog without SSLKEYLOGFILE must be refused");
+		server.quic.keylog = Some(std::path::PathBuf::new());
+		let err =
+			Workers::bind(server, moq_tokio::worker::Config::new(1)).expect_err("an empty keylog path must be refused");
 		assert!(
 			matches!(err.downcast_ref(), Some(moq_tokio::Error::KeylogUnset)),
 			"{err:#}"
@@ -975,9 +1096,9 @@ mod tests {
 	/// the workers waiting to serve instead of hanging on their join.
 	#[tokio::test]
 	async fn a_group_stopped_before_serving_joins() {
-		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+		moq_tokio::crypto::install_default().unwrap();
 		if let Err(moq_uring::Error::Unsupported(reason)) = moq_uring::Worker::new(Default::default())
-			&& std::env::var_os("MOQ_STRICT").is_none()
+			&& std::env::var_os("CI_STRICT").is_none()
 		{
 			eprintln!("skipping io_uring relay test: {reason}");
 			return;
@@ -986,9 +1107,9 @@ mod tests {
 		let mut server = moq_tokio::server::Config::default();
 		server.listen.bind = Some("127.0.0.1:0".parse().unwrap());
 		server.listen.tls.generate = vec!["localhost".into()];
-		let mut workers = Workers::bind(server, moq_tokio::worker::Config::new(2)).unwrap();
-		let cluster = cluster::Cluster::new(cluster::Options::default()).unwrap();
-		workers
+		let workers = Workers::bind(server, moq_tokio::worker::Config::new(2)).unwrap();
+		let cluster = cluster::Cluster::spawn(cluster::Options::default()).unwrap();
+		let workers = workers
 			.spawn(
 				cluster,
 				auth::Auth::refuse("test"),
@@ -1002,42 +1123,52 @@ mod tests {
 	/// An auth decision still pending at the drain deadline is abandoned by then.
 	#[tokio::test]
 	async fn pending_admission_is_abandoned_at_the_deadline() {
-		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+		moq_tokio::crypto::install_default().unwrap();
 		if let Err(moq_uring::Error::Unsupported(reason)) = moq_uring::Worker::new(Default::default())
-			&& std::env::var_os("MOQ_STRICT").is_none()
+			&& std::env::var_os("CI_STRICT").is_none()
 		{
 			eprintln!("skipping io_uring relay test: {reason}");
 			return;
 		}
 
 		let dir = tempfile::tempdir().unwrap();
-		let key = rcgen::KeyPair::generate().unwrap();
+		let key = rind_rcgen::KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
 		let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+			.map(|mut params| {
+				params.serial_number = Some(1u64.into());
+				params
+			})
 			.unwrap()
 			.self_signed(&key)
 			.unwrap();
 		let (cert_path, key_path) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
 		std::fs::write(&cert_path, cert.pem()).unwrap();
-		std::fs::write(&key_path, key.serialize_pem()).unwrap();
+		std::fs::write(
+			&key_path,
+			pem::encode(&pem::Pem::new("PRIVATE KEY", key.to_pkcs8().secret_pkcs8_der())),
+		)
+		.unwrap();
 
 		let window = std::time::Duration::from_secs(1);
 		let mut config = crate::Config::default();
 		config.listen.bind = Some("127.0.0.1:0".parse().unwrap());
 		config.listen.tls.cert = vec![cert_path];
 		config.listen.tls.key = vec![key_path];
-		config.runtime.workers = Some(1);
+		config.runtime.workers = crate::runtime::Workers::Count(std::num::NonZeroU16::new(1).unwrap());
 		config.runtime.pin = false;
 		config.runtime.io_uring = true;
-		config.drain_timeout = window;
+		config.drain_timeout = Some(window.into());
 		let mut relay = crate::Relay::load(config).await.unwrap().with_signals(false);
 		let port = relay.addr().unwrap().port();
 		let mut admissions = relay.admissions().unwrap();
 		let trigger = relay.shutdown_trigger().clone();
+		let ready = relay.ready();
 		let running = tokio::spawn(relay.run());
+		ready.wait().await.expect("relay ready");
 
 		let mut client = moq_tokio::connect::Config::default();
 		client.tls.insecure = Some(true);
-		client.once = Some(true);
+
 		client.bind = Some("127.0.0.1:0".parse().unwrap());
 		let url: url::Url = format!("moql://127.0.0.1:{port}/drain").parse().unwrap();
 		let client = client.init(Default::default()).unwrap();
@@ -1048,7 +1179,7 @@ mod tests {
 		// is well past the drain window.
 		tokio::time::pause();
 		trigger.start();
-		tokio::time::timeout(window + std::time::Duration::from_secs(1), admission.abandoned())
+		kio::clock::timeout(window + std::time::Duration::from_secs(1), admission.abandoned())
 			.await
 			.expect("the admission outlived the drain deadline");
 		running.await.unwrap().unwrap();
@@ -1059,43 +1190,53 @@ mod tests {
 	/// that never comes is abandoned at the handshake deadline.
 	#[tokio::test]
 	async fn pending_admission_is_abandoned_at_the_handshake_deadline() {
-		let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+		moq_tokio::crypto::install_default().unwrap();
 		if let Err(moq_uring::Error::Unsupported(reason)) = moq_uring::Worker::new(Default::default())
-			&& std::env::var_os("MOQ_STRICT").is_none()
+			&& std::env::var_os("CI_STRICT").is_none()
 		{
 			eprintln!("skipping io_uring relay test: {reason}");
 			return;
 		}
 
 		let dir = tempfile::tempdir().unwrap();
-		let key = rcgen::KeyPair::generate().unwrap();
+		let key = rind_rcgen::KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
 		let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+			.map(|mut params| {
+				params.serial_number = Some(1u64.into());
+				params
+			})
 			.unwrap()
 			.self_signed(&key)
 			.unwrap();
 		let (cert_path, key_path) = (dir.path().join("cert.pem"), dir.path().join("key.pem"));
 		std::fs::write(&cert_path, cert.pem()).unwrap();
-		std::fs::write(&key_path, key.serialize_pem()).unwrap();
+		std::fs::write(
+			&key_path,
+			pem::encode(&pem::Pem::new("PRIVATE KEY", key.to_pkcs8().secret_pkcs8_der())),
+		)
+		.unwrap();
 
 		let timeout = std::time::Duration::from_secs(1);
 		let mut config = crate::Config::default();
 		config.listen.bind = Some("127.0.0.1:0".parse().unwrap());
 		config.listen.tls.cert = vec![cert_path];
 		config.listen.tls.key = vec![key_path];
-		config.listen.timeout = Some(timeout);
-		config.runtime.workers = Some(1);
+		config.listen.timeout = Some(timeout.into());
+		config.runtime.workers = crate::runtime::Workers::Count(std::num::NonZeroU16::new(1).unwrap());
 		config.runtime.pin = false;
 		config.runtime.io_uring = true;
-		config.drain_timeout = std::time::Duration::from_millis(100);
+		config.drain_timeout = Some(std::time::Duration::from_millis(100).into());
 		let mut relay = crate::Relay::load(config).await.unwrap().with_signals(false);
 		let port = relay.addr().unwrap().port();
 		let mut admissions = relay.admissions().unwrap();
 		let trigger = relay.shutdown_trigger().clone();
+		let ready = relay.ready();
 		let running = tokio::spawn(relay.run());
+		ready.wait().await.expect("relay ready");
 
 		let mut client = moq_tokio::connect::Config::default();
 		client.tls.insecure = Some(true);
-		client.once = Some(true);
+
 		client.bind = Some("127.0.0.1:0".parse().unwrap());
 		let url: url::Url = format!("moql://127.0.0.1:{port}/deadline").parse().unwrap();
 		let client = client.init(Default::default()).unwrap();
@@ -1104,7 +1245,7 @@ mod tests {
 
 		// The handshake deadline is an io_uring timer, which a paused tokio clock cannot
 		// advance, so this waits out the real second with nobody answering.
-		tokio::time::timeout(timeout * 5, admission.abandoned())
+		kio::clock::timeout(timeout * 5, admission.abandoned())
 			.await
 			.expect("the admission outlived the handshake deadline");
 		trigger.start();

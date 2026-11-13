@@ -1,4 +1,12 @@
-import { Instant, Milli, Nano } from "@moq/clock";
+import { Duration, type Instant } from "@moq/clock";
+import * as btree from "sorted-btree";
+import { max, min } from "./util/sequence.ts";
+
+// sorted-btree ships only CommonJS: Node binds its default import to `module.exports`,
+// while Bun and bundlers bind it to the class.
+const BTree = (btree.default as unknown as { default?: typeof btree.default }).default ?? btree.default;
+
+const compare = (a: bigint, b: bigint): number => (a < b ? -1 : a > b ? 1 : 0);
 
 /**
  * How long a subscriber waits for a group stream it cannot account for once the publisher
@@ -8,17 +16,21 @@ import { Instant, Milli, Nano } from "@moq/clock";
  * so a stream opened before the end can still be in flight after it. This bounds the wait on
  * IETF, and on moq-lite when the subscription has no max delay to bound it with.
  */
-export const GRACE = Milli(1000);
+export const GRACE = Duration.millis(1000);
 
-// private: plumbing
-/** The grace for a subscription with `maxDelay`: how long it was willing to wait for a late group anyway, or {@link GRACE} without one. */
-export function grace(maxDelay: Milli): Milli {
-	return maxDelay > 0 ? maxDelay : GRACE;
+/** The grace for a subscription with `delay.max`: how long it was willing to wait for a late group anyway, or {@link GRACE} without one. */
+export function grace(maxDelay: Duration): Duration {
+	return maxDelay.isZero() ? GRACE : maxDelay;
 }
+
+// Bun 1.4's heap (bun:jsc `heapStats`) grows about 191 bytes per disjoint run of a ledger, its
+// age entry and timestamp included.
+/** Bookkeeping a track bills per run of its arrivals, so a peer fragmenting them costs what the cache would hold. */
+export const RUN_OVERHEAD = 192;
 
 // A run of accounted sequences `[start, end)`, and when the gap below it opened, which is
 // when its missing groups became late.
-type Run = { start: number; end: number; since: Instant };
+type Run = { start: bigint; end: bigint; since: Instant };
 
 /**
  * The sequences a feed has accounted for, and how long each gap between them is waited for.
@@ -33,100 +45,187 @@ export class Ledger {
 	// can no longer be waited for, so it folds into the runs around it, which bounds this by
 	// the gaps opened within the grace rather than every gap ever seen. A fold is final: a
 	// later, longer grace or a lowered floor cannot reopen it.
-	#runs: Run[] = [];
+	#runs = new BTree<bigint, Run>(undefined, compare);
+	// Demand can restart a gap below an older one. Index ages separately so expiring
+	// one gap never scans all the younger ones. Both indexes own exactly the same runs.
+	#ages = new BTree<Run, undefined>(undefined, (a, b) => a.since.cmp(b.since) || compare(a.start, b.start));
+	#last?: Run;
+	// Exclude the leading gap, which has no lower run to fold into.
+	#next?: Run;
+
+	#remove(run: Run): void {
+		this.#runs.delete(run.start);
+		this.#ages.delete(run);
+	}
+
+	#nextExpiry(): void {
+		const first = this.#runs.minKey();
+		const oldest = this.#ages.minKey();
+		this.#next = oldest?.start === first ? this.#ages.nextHigherKey(oldest) : oldest;
+	}
 
 	/** Record sequences `[start, end)` as accounted for. Gaps fold only on {@link expire}. */
-	account(start: number, end: number, at: Instant): void {
+	account(start: bigint, end: bigint, at: Instant): void {
 		if (start >= end) return;
 
 		// An in-order feed extends the last run in place, the usual case for every arrival.
-		const last = this.#runs.at(-1);
+		const last = this.#last;
 		if (last && last.start <= start && start <= last.end) {
-			last.end = Math.max(last.end, end);
+			last.end = max(last.end, end);
 			return;
 		}
 
-		const runs: Run[] = [];
-		let merged: Run | undefined;
-		let placed = false;
-		for (const run of this.#runs) {
-			if (run.end < start) {
-				runs.push(run);
-			} else if (end < run.start) {
-				// Splitting a gap leaves both halves as late as it was.
-				if (!placed) runs.push(merged ?? { start, end, since: run.since });
-				placed = true;
-				runs.push(run);
-			} else {
-				merged = {
-					start: Math.min(merged?.start ?? start, run.start),
-					end: Math.max(merged?.end ?? end, run.end),
-					since: merged?.since ?? run.since,
-				};
-			}
+		const lower = this.#runs.getPairOrNextLower(start)?.[1];
+		const below = lower && lower.end >= start ? lower : undefined;
+		if (below && end <= below.end) return;
+
+		// Splitting a gap inherits its age; only an arrival past all runs opens a new one.
+		const run = below ?? { start, end, since: this.#runs.getPairOrNextHigher(start)?.[1].since ?? at };
+		run.end = max(run.end, end);
+		let next = this.#runs.getPairOrNextHigher(start);
+		if (next?.[1] === below) next = this.#runs.nextHigherPair(start);
+		while (next && next[0] <= run.end) {
+			run.end = max(run.end, next[1].end);
+			this.#remove(next[1]);
+			next = this.#runs.nextHigherPair(next[0]);
 		}
-		// A run past every other one opens a new gap.
-		if (!placed) runs.push(merged ?? { start, end, since: at });
-		this.#runs = runs;
+		if (!below) {
+			this.#runs.set(run.start, run);
+			this.#ages.set(run, undefined);
+		}
+		if (!next) this.#last = run;
+		this.#nextExpiry();
 	}
 
 	/** Fold every gap at least `grace` old into the runs around it. */
-	expire(at: Instant, grace: Milli): void {
-		const limit = Nano.fromMilli(grace);
-		const runs: Run[] = [];
-		for (const run of this.#runs) {
-			const below = runs.at(-1);
-			if (below && Instant.durationSince(at, run.since) >= limit) {
-				runs[runs.length - 1] = { ...below, end: run.end };
-			} else {
-				runs.push(run);
-			}
+	expire(at: Instant, grace: Duration): void {
+		while (this.#next && at.since(this.#next.since).ge(grace)) {
+			const run = this.#next;
+			const below = this.#runs.nextLowerPair(run.start)?.[1];
+			if (!below) throw new Error("an expiring gap must have a lower run");
+			below.end = run.end;
+			this.#remove(run);
+			if (this.#last === run) this.#last = below;
+			this.#nextExpiry();
 		}
-		this.#runs = runs;
+	}
+
+	/**
+	 * Fold the oldest gap into the runs around it however young, giving up on it early, and
+	 * return the sequences it held; undefined when no gap is left to fold.
+	 */
+	foldOldest(): { start: bigint; end: bigint } | undefined {
+		const run = this.#next;
+		if (!run) return undefined;
+		const below = this.#runs.nextLowerPair(run.start)?.[1];
+		if (!below) throw new Error("a folding gap must have a lower run");
+		const gap = { start: below.end, end: run.start };
+		below.end = run.end;
+		this.#remove(run);
+		if (this.#last === run) this.#last = below;
+		this.#nextExpiry();
+		return gap;
 	}
 
 	/** Whether a gap separates two runs, so {@link expire} has anything to fold. */
 	hasGaps(): boolean {
-		return this.#runs.length > 1;
+		return this.#runs.size > 1;
+	}
+
+	/** How many runs it holds: one more than its gaps. */
+	get size(): number {
+		return this.#runs.size;
 	}
 
 	/** The lowest sequence accounted for. */
-	first(): number | undefined {
-		return this.#runs[0]?.start;
+	first(): bigint | undefined {
+		return this.#runs.minKey();
+	}
+
+	/** The exclusive end of the run accounting for `sequence`, undefined when none does. */
+	runEnd(sequence: bigint): bigint | undefined {
+		const run = this.#runs.getPairOrNextLower(sequence)?.[1];
+		return run !== undefined && sequence < run.end ? run.end : undefined;
+	}
+
+	/** The exclusive end of the highest run starting at or below `sequence`. */
+	endBelow(sequence: bigint): bigint | undefined {
+		return this.#runs.getPairOrNextLower(sequence)?.[1].end;
 	}
 
 	/** Whether every sequence in `[start, end)` is accounted for. */
-	covers(start: number, end: number): boolean {
+	covers(start: bigint, end: bigint): boolean {
 		if (start >= end) return true;
 		// Runs merge on insert, so one run covers the span or none does.
-		return this.#runs.some((run) => run.start <= start && end <= run.end);
+		const run = this.#runs.getPairOrNextLower(start)?.[1];
+		return run !== undefined && end <= run.end;
 	}
 
 	/**
 	 * The gaps within `[start, end)`, each with when a later arrival opened it: none for the one
 	 * past the last run, which nothing has opened yet.
 	 */
-	gaps(start: number, end: number): { start: number; end: number; since?: Instant }[] {
-		const gaps: { start: number; end: number; since?: Instant }[] = [];
+	gaps(start: bigint, end: bigint): { start: bigint; end: bigint; since?: Instant }[] {
+		const gaps: { start: bigint; end: bigint; since?: Instant }[] = [];
 		let below = start;
-		for (const run of this.#runs) {
+		const lower = this.#runs.getPairOrNextLower(start)?.[1];
+		for (const [, run] of this.#runs.entries(lower?.start ?? start)) {
 			if (below >= end) return gaps;
 			if (run.end <= below) continue;
-			if (below < run.start) gaps.push({ start: below, end: Math.min(run.start, end), since: run.since });
+			if (below < run.start) gaps.push({ start: below, end: min(run.start, end), since: run.since });
 			below = run.end;
 		}
 		if (below < end) gaps.push({ start: below, end });
 		return gaps;
 	}
 
-	/** Restart the age of every gap reaching into `[start, end)`, which the demand newly asks for. */
-	demand(start: number, end: number, at: Instant): void {
+	/**
+	 * Take `[start, end)` back out of what is accounted for, owed again from `at`: a verdict that
+	 * accounted for it was reversed. The gap it leaves opens at `at`, so it is waited for a fresh
+	 * grace, even where it joins an older gap. Mirrors the Rust `Ledger::unaccount`.
+	 */
+	unaccount(start: bigint, end: bigint, at: Instant): void {
 		if (start >= end) return;
-		let below = 0;
-		this.#runs = this.#runs.map((run) => {
-			const reached = below < end && start < run.start;
+		const lower = this.#runs.getPairOrNextLower(start)?.[1];
+		const overlapping: Run[] = [];
+		for (const [, run] of this.#runs.entries(lower?.start ?? start)) {
+			if (run.start >= end) break;
+			if (run.end > start) overlapping.push(run);
+		}
+		if (overlapping.length === 0) return;
+		for (const run of overlapping) {
+			this.#remove(run);
+			if (this.#last === run) this.#last = undefined;
+			if (run.start < start) {
+				const below = { start: run.start, end: start, since: run.since };
+				this.#runs.set(below.start, below);
+				this.#ages.set(below, undefined);
+			}
+			if (end < run.end) {
+				const above = { start: end, end: run.end, since: at };
+				this.#runs.set(above.start, above);
+				this.#ages.set(above, undefined);
+			}
+		}
+		const last = this.#runs.maxKey();
+		this.#last = last === undefined ? undefined : this.#runs.get(last);
+		this.demand(start, end, at);
+	}
+
+	/** Restart the age of every gap reaching into `[start, end)`, which the demand newly asks for. */
+	demand(start: bigint, end: bigint, at: Instant): void {
+		if (start >= end) return;
+		const lower = this.#runs.getPairOrNextLower(start)?.[1];
+		let below = lower?.end ?? 0n;
+		for (const [, run] of this.#runs.entries(start)) {
+			if (below >= end) break;
+			if (start < run.start) {
+				this.#ages.delete(run);
+				run.since = at;
+				this.#ages.set(run, undefined);
+			}
 			below = run.end;
-			return reached ? { ...run, since: at } : run;
-		});
+		}
+		this.#nextExpiry();
 	}
 }

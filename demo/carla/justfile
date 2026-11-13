@@ -10,7 +10,7 @@ set fallback
 #
 # Run a local relay, both trucks, and the web player.
 default:
-    bun install
+    uv run --no-project python ../../sh/js/install.py update
     bun run concurrently --kill-others --names relay,trucks,web --prefix-colors auto \
     	"just relay" \
     	"just wait && just wait-port 127.0.0.1 2000 && just worker" \
@@ -24,15 +24,6 @@ worker *ARGS:
 # Run the web player against a relay.
 web url='http://localhost:4443':
     cd web && VITE_RELAY_URL="{{ url }}" bun --bun vite --open
-
-# Build the player for carla.moq.dev, against the public demo relay.
-build-web:
-    bun install --frozen-lockfile
-    cd web && VITE_RELAY_URL=https://cdn.moq.dev/demo bun run build
-
-# Deploy the player to carla.moq.dev.
-deploy: build-web
-    cd web && bun wrangler deploy
 
 # Build the worker's virtualenv, with moq's Python bindings from this checkout.
 venv:
@@ -78,33 +69,43 @@ service-status:
 service-logs:
     journalctl --user -u carla-worker.service -u carla-sim.service -f
 
-# None of these need CARLA or a GPU. `just js` and `just rs` cover the player and
-# the bridge.
+# The root workspace's dev tools, in an environment of their own: syncing the
+# shared venv would uninstall `just py`'s editable build while its checks run.
+dev := "uv run --project ../../.. --isolated --only-group dev"
+
+# None of these need CARLA or a GPU. `just js` covers the player and
+# `bridge-check` the bridge.
 #
-# Lint and test the worker and its launchers.
+# Type-check and test the worker and its launchers; the root `python` module in
+# `just check` lints and formats it.
 check:
-    uv sync --project ../.. --locked --no-install-workspace
-    cd sim && uv run --project ../../.. --no-sync ruff check .
-    cd sim && uv run --project ../../.. --no-sync ruff format --check .
-    cd sim && uv run --project ../../.. --no-sync pyright
-    cd sim && uv run --project ../../.. --no-sync pytest -q
+    cd sim && {{ dev }} --locked pyright
+    cd sim && {{ dev }} --locked pytest -q
     sim/python.test.sh
     sim/server.test.sh
     sim/systemd/install-user-service.test.sh
     bridge/gpu.test.sh
 
-# Auto-fix the worker's lint and formatting.
-fix:
-    uv sync --project ../.. --no-install-workspace
-    cd sim && uv run --project ../../.. --no-sync ruff check --fix .
-    cd sim && uv run --project ../../.. --no-sync ruff format .
+# The bridge is a Cargo workspace of its own, so the root's `just rs` skips it.
+#
+# Format-check, lint, and test the bridge.
+bridge-check:
+    cd bridge && cargo fmt --check
+    cd bridge && bash ../../../sh/local.sh cargo clippy --locked --all-targets -- -D warnings
+    cd bridge && bash ../../../sh/local.sh cargo test --locked
+    cd bridge && RUSTDOCFLAGS="-D warnings" bash ../../../sh/local.sh cargo doc --locked --no-deps
+
+# Format the bridge and apply its lint fixes.
+bridge-fix:
+    cd bridge && bash ../../../sh/local.sh cargo clippy --locked --fix --allow-staged --allow-dirty --all-targets
+    cd bridge && cargo fmt
 
 # A Vulkan stand-in plays the CARLA plugin. A host with no NVIDIA GPU skips, and
 # one whose NVIDIA driver is not loaded fails.
 #
 # Run the GPU bridge end to end on this host's NVIDIA GPU.
 bridge-gpu:
-    cd ../.. && demo/carla/bridge/gpu.sh cargo test --locked -p moq-carla-bridge --test gpu -- --ignored
+    cd bridge && ./gpu.sh cargo test --locked --test gpu -- --ignored
 
 # Wait for a TCP port to accept connections. bash's /dev/tcp rather than nc,
 # because the user units gate on this at boot and nc is not in the devshell.

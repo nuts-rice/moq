@@ -1,90 +1,161 @@
+//! Incoming WebTransport streams, their leases, and errors.
+
 use std::{
 	io,
 	pin::Pin,
 	sync::Arc,
-	task::{Context, Poll},
+	task::{Context, Poll, ready},
 };
 
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
 
-use crate::quic::web::{CloseReason, ReadError, ReadExactError, ReadToEndError, SessionError};
+use crate::quic::driver::recv;
+use crate::quic::web::CloseReason;
 
-/// A stream that can be used to receive bytes. See [`crate::quic::driver::RecvStream`].
+/// A stream that can be used to receive bytes. See [`crate::quic::driver::recv::Stream`].
+///
+/// Dropping it before the end stops it with code 0, or WT_SESSION_GONE once the session closed.
 #[derive(Debug)]
-pub struct RecvStream {
-	inner: crate::quic::driver::RecvStream,
+pub struct Stream {
+	/// Taken when moq-net stops through its mutable poll trait.
+	inner: Option<recv::Stream>,
 	close: Arc<CloseReason>,
+	id: crate::quic::driver::stream::Id,
 }
 
-impl RecvStream {
-	pub(crate) fn new(stream: crate::quic::driver::RecvStream, close: Arc<CloseReason>) -> Self {
-		Self { inner: stream, close }
+impl Stream {
+	pub(crate) fn new(stream: recv::Stream, close: Arc<CloseReason>) -> Self {
+		Self {
+			id: stream.id(),
+			inner: Some(stream),
+			close,
+		}
 	}
 
-	/// Decode the peer's reset code, and report a session error as the session's close reason.
-	fn map_error(&self, e: crate::quic::driver::ReadError) -> ReadError {
-		match e {
-			crate::quic::driver::ReadError::Reset(code) => match self.close.decode_stream_code(code) {
-				Some(code) => ReadError::Reset(code),
-				None => ReadError::InvalidReset(code),
+	fn inner(&mut self) -> Result<&mut recv::Stream, Error> {
+		self.inner.as_mut().ok_or(Error::ClosedStream)
+	}
+
+	/// Lease the stream's unreleased bytes. See [`recv::Stream::poll_lease`].
+	pub fn poll_lease(&mut self, waiter: &kio::Waiter, want: usize) -> Poll<Result<recv::Lease<'_>, Error>> {
+		let close = &self.close;
+		match &mut self.inner {
+			Some(inner) => match inner.poll_lease(waiter, want) {
+				Poll::Ready(Ok(lease)) => Poll::Ready(Ok(lease)),
+				Poll::Ready(Err(e)) => poll_error(close, waiter, e).map(Err),
+				Poll::Pending => Poll::Pending,
 			},
-			e => match ReadError::from(e) {
-				ReadError::SessionError(e) => ReadError::SessionError(self.close.map(e)),
-				e => e,
-			},
+			None => Poll::Ready(Err(Error::ClosedStream)),
+		}
+	}
+
+	/// Poll until the peer resets the stream, the receiver evicts it, or the session closes,
+	/// without reading it; pending for good once every byte was read. See
+	/// [`recv::Stream::received_reset`].
+	pub fn poll_reset(&mut self, waiter: &kio::Waiter) -> Poll<Error> {
+		let close = &self.close;
+		let Some(inner) = &mut self.inner else {
+			return Poll::Ready(Error::ClosedStream);
+		};
+		match ready!(inner.poll_received_reset(waiter)) {
+			Ok(None) => Poll::Pending,
+			Ok(Some(code)) => poll_error(close, waiter, recv::Error::Reset(code)),
+			Err(err) => poll_error(close, waiter, err),
+		}
+	}
+
+	/// Rank this stream for eviction. See [`recv::Stream::set_priority`].
+	pub fn set_priority(&mut self, priority: i64) {
+		if let Some(inner) = &mut self.inner {
+			inner.set_priority(priority);
 		}
 	}
 
 	/// Tell the other end to stop sending data with the given error code. See
-	/// [`crate::quic::driver::RecvStream::stop`]. This is a u32 with WebTransport since it shares the error
-	/// space with HTTP/3. A raw QUIC session sends the code as is.
-	pub fn stop(&mut self, code: u32) -> Result<(), crate::quic::driver::ClosedStream> {
-		let code = self.close.encode_stream_code(code);
-		self.inner.stop(code)
+	/// [`recv::Stream::stop`]. This is a u32 with WebTransport since it shares the error
+	/// space with HTTP/3. A raw QUIC session sends the code as is. Does nothing once stopped.
+	fn stop_mut(&mut self, code: u32) {
+		if let Some(inner) = self.inner.take() {
+			inner.stop(self.close.encode_stream_code(code));
+		}
 	}
 
-	// Unfortunately, we have to wrap ReadError for a bunch of functions.
-
-	/// Read some data into the buffer and return the amount read. See [`crate::quic::driver::RecvStream::read`].
-	pub async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, ReadError> {
-		self.inner.read(buf).await.map_err(|e| self.map_error(e))
+	/// Stop receiving and tell the peer why.
+	pub fn stop(mut self, code: u32) {
+		self.stop_mut(code);
 	}
 
-	/// Fill the entire buffer with data. See [`crate::quic::driver::RecvStream::read_exact`].
-	pub async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), ReadExactError> {
-		self.inner.read_exact(buf).await.map_err(|e| match e {
-			crate::quic::driver::ReadExactError::ReadError(e) => self.map_error(e).into(),
-			e => e.into(),
-		})
+	/// Resolves once the stream ends after its bytes are read, the peer resets it, or the session closes.
+	#[kio::wrapper]
+	pub fn poll_closed(&mut self, waiter: &kio::Waiter) -> Poll<Result<(), Error>> {
+		let close = &self.close;
+		let Some(inner) = &mut self.inner else {
+			return Poll::Ready(Ok(()));
+		};
+		match ready!(inner.poll_closed(waiter)) {
+			Ok(None) => Poll::Ready(Ok(())),
+			Ok(Some(code)) => poll_error(close, waiter, recv::Error::Reset(code)).map(Err),
+			Err(err) => poll_error(close, waiter, err).map(Err),
+		}
 	}
 
-	/// Read a chunk of data from the stream. See [`crate::quic::driver::RecvStream::read_chunk`].
-	pub async fn read_chunk(&mut self, max_length: usize) -> Result<Option<Bytes>, ReadError> {
-		self.inner
-			.read_chunk(max_length, true)
-			.await
-			.map(|chunk| chunk.map(|chunk| chunk.bytes))
-			.map_err(|e| self.map_error(e))
+	/// Poll for some bytes without retaining the destination buffer.
+	pub fn poll_read(&mut self, waiter: &kio::Waiter, mut buf: &mut [u8]) -> Poll<Result<Option<usize>, Error>> {
+		let close = self.close.clone();
+		match ready!(self.inner()?.poll_read_buf(waiter, &mut buf)) {
+			Ok(n) => Poll::Ready(Ok(n)),
+			Err(err) => poll_error(&close, waiter, err).map(Err),
+		}
 	}
 
-	/// Read until the end of the stream or the limit is hit. See [`crate::quic::driver::RecvStream::read_to_end`].
-	pub async fn read_to_end(&mut self, size_limit: usize) -> Result<Vec<u8>, ReadToEndError> {
-		self.inner.read_to_end(size_limit).await.map_err(|e| match e {
-			crate::quic::driver::ReadToEndError::Read(e) => self.map_error(e).into(),
-			e => e.into(),
-		})
+	/// Read some data into `buf` and return the amount read. See [`recv::Stream::read`].
+	pub async fn read(&mut self, buf: &mut impl BufMut) -> Result<Option<usize>, Error> {
+		match self.inner()?.read(buf).await {
+			Ok(res) => Ok(res),
+			Err(e) => Err(error(&self.close, e).await),
+		}
+	}
+
+	/// Fill the entire buffer with data. See [`recv::Stream::read_exact`].
+	pub async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Error> {
+		match self.inner()?.read_exact(buf).await {
+			Ok(res) => Ok(res),
+			Err(e) => Err(error(&self.close, e).await),
+		}
+	}
+
+	/// Read a chunk of data from the stream. See [`recv::Stream::read_chunk`].
+	pub async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, Error> {
+		match self.inner()?.read_chunk(max).await {
+			Ok(res) => Ok(res),
+			Err(e) => Err(error(&self.close, e).await),
+		}
+	}
+
+	/// Read until the end of the stream or the limit is hit. See [`recv::Stream::read_to_end`].
+	pub async fn read_to_end(&mut self, limit: usize) -> Result<Vec<u8>, Error> {
+		match self.inner()?.read_to_end(limit).await {
+			Ok(res) => Ok(res),
+			Err(e) => Err(error(&self.close, e).await),
+		}
 	}
 
 	/// Block until the stream has been reset and return the error code. See
-	/// [`crate::quic::driver::RecvStream::received_reset`].
+	/// [`recv::Stream::received_reset`].
 	///
-	/// Unlike the driver, this returns a SessionError, not a ResetError, because 0-RTT is not supported.
-	pub async fn received_reset(&mut self) -> Result<Option<u32>, SessionError> {
-		match self.inner.received_reset().await {
+	/// Returns the stream's reset code, or fails with its session error or
+	/// [`Error::Evicted`] once the receiver evicted it to free a stuck window.
+	pub async fn received_reset(&mut self) -> Result<Option<u32>, Error> {
+		let Some(inner) = &mut self.inner else {
+			return Ok(None);
+		};
+		match inner.received_reset().await {
 			Ok(None) => Ok(None),
-			Ok(Some(code)) => Ok(self.close.decode_stream_code(code)),
-			Err(crate::quic::driver::ResetError::ConnectionLost(conn_err)) => Err(self.close.map(conn_err.into())),
-			Err(crate::quic::driver::ResetError::ZeroRttRejected) => unreachable!("0-RTT not supported"),
+			Ok(Some(code)) => match error(&self.close, recv::Error::Reset(code)).await {
+				Error::Reset(code) => Ok(Some(code)),
+				err => Err(err),
+			},
+			Err(err) => Err(error(&self.close, err).await),
 		}
 	}
 
@@ -94,38 +165,161 @@ impl RecvStream {
 	/// >
 	/// > WebTransport sessions share the QUIC connection with HTTP/3 and potentially other
 	/// > sessions.
-	/// > The [crate::quic::driver::StreamId::index] might not increment by 1 like expected when using raw QUIC.
+	/// > The [crate::quic::driver::stream::Id::index] might not increment by 1 like expected when using raw QUIC.
 	/// > This is why the Javascript WebTransport API does not expose the Stream ID.
-	pub fn quic_id(&self) -> crate::quic::driver::StreamId {
-		self.inner.id()
+	pub fn id(&self) -> crate::quic::driver::stream::Id {
+		self.id
 	}
-
-	// We purposely don't expose the 0RTT because it's not valid with WebTransport
 }
 
-impl tokio::io::AsyncRead for RecvStream {
+/// Decode the peer's reset code, and report a session error, or a reset for a session
+/// that is gone, as the session's close reason, pending until that reason is known.
+fn poll_error(close: &CloseReason, waiter: &kio::Waiter, e: recv::Error) -> Poll<Error> {
+	Poll::Ready(match e {
+		recv::Error::Reset(code) => match close.decode_stream_code(code) {
+			Some(code) => Error::Reset(code),
+			None => match close.poll_session_gone(waiter, code) {
+				Some(err) => return err.map(Error::Session),
+				None => Error::InvalidReset(code),
+			},
+		},
+		e => match Error::from(e) {
+			Error::Session(e) => Error::Session(close.map(e)),
+			e => e,
+		},
+	})
+}
+
+/// [`poll_error`] as a future.
+async fn error(close: &CloseReason, e: recv::Error) -> Error {
+	kio::wait(|waiter| poll_error(close, waiter, e.clone())).await
+}
+
+impl Drop for Stream {
+	fn drop(&mut self) {
+		// Chosen at drop, since the session may have closed since the stream opened. The
+		// driver's raw 0 is outside the HTTP/3 range, so a WebTransport peer can't decode it.
+		if let Some(inner) = &mut self.inner {
+			inner.set_drop_stop(self.close.encode_stream_code(0));
+		}
+	}
+}
+
+impl tokio::io::AsyncRead for Stream {
 	fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut tokio::io::ReadBuf) -> Poll<io::Result<()>> {
-		Pin::new(&mut self.inner).poll_read(cx, buf)
+		match &mut self.inner {
+			Some(inner) => Pin::new(inner).poll_read(cx, buf),
+			None => Poll::Ready(Err(io::ErrorKind::NotConnected.into())),
+		}
 	}
 }
 
-impl web_transport_trait::RecvStream for RecvStream {
-	type Error = ReadError;
-
+impl moq_net::transport::poll::RecvStream for Stream {
+	type Error = Error;
+	type Lease<'a> = recv::Lease<'a>;
+	fn poll_lease(&mut self, waiter: &kio::Waiter, want: usize) -> Poll<Result<Self::Lease<'_>, Self::Error>> {
+		Self::poll_lease(self, waiter, want)
+	}
+	fn set_priority(&mut self, priority: i64) {
+		Self::set_priority(self, priority);
+	}
 	fn stop(&mut self, code: u32) {
-		Self::stop(self, code).ok();
+		Self::stop_mut(self, code);
 	}
-
-	async fn read(&mut self, dst: &mut [u8]) -> Result<Option<usize>, Self::Error> {
-		self.read(dst).await
-	}
-
-	async fn read_chunk(&mut self, max: usize) -> Result<Option<Bytes>, Self::Error> {
-		self.read_chunk(max).await
-	}
-
-	async fn closed(&mut self) -> Result<(), Self::Error> {
-		self.received_reset().await?;
-		Ok(())
+	fn poll_reset(&mut self, waiter: &kio::Waiter) -> Poll<Self::Error> {
+		Self::poll_reset(self, waiter)
 	}
 }
+impl moq_net::transport::poll::Lease for recv::Lease<'_> {
+	fn is_fin(&self) -> bool {
+		Self::is_fin(self)
+	}
+	fn chunks(&self) -> impl Iterator<Item = &[u8]> {
+		Self::chunks(self)
+	}
+	fn release(self) {
+		Self::release(self);
+	}
+}
+
+/// An error when reading from [`crate::quic::web::recv::Stream`]. Similar to [`crate::quic::driver::recv::Error`].
+#[derive(Clone, thiserror::Error, Debug)]
+#[non_exhaustive]
+pub enum Error {
+	/// The session carrying the stream failed.
+	#[error("session error: {0}")]
+	Session(#[from] super::Error),
+
+	/// The peer reset this stream with its application code.
+	#[error("RESET_STREAM: {0}")]
+	Reset(u32),
+
+	/// The peer reset the stream with a code outside the WebTransport registry.
+	#[error("invalid RESET_STREAM: {0}")]
+	InvalidReset(crate::quic::driver::VarInt),
+
+	/// The stream was already stopped.
+	#[error("stream already closed")]
+	ClosedStream,
+
+	/// The connection's receive window was stuck and this stream was discarded to free it.
+	#[error("evicted")]
+	Evicted,
+
+	/// The stream finished before [`read_exact`](crate::quic::web::recv::Stream::read_exact)
+	/// filled its buffer, after this many bytes.
+	#[error("finished early")]
+	FinishedEarly(usize),
+
+	/// The stream is longer than [`read_to_end`](crate::quic::web::recv::Stream::read_to_end)'s limit.
+	#[error("too long")]
+	TooLong,
+
+	/// A lease wanted more than the connection receive window can hold.
+	#[error("want exceeds the receive window")]
+	TooLarge,
+}
+
+impl From<crate::quic::driver::recv::Error> for Error {
+	fn from(value: crate::quic::driver::recv::Error) -> Self {
+		use crate::quic::driver::recv::Error as DriverError;
+		match value {
+			DriverError::Reset(code) => match web_transport_proto::error_from_http3(code.into_inner()) {
+				Some(code) => Error::Reset(code),
+				None => Error::InvalidReset(code),
+			},
+			DriverError::Connection(e) => Error::Session(e.into()),
+			DriverError::Evicted => Error::Evicted,
+			DriverError::FinishedEarly(n) => Error::FinishedEarly(n),
+			DriverError::TooLong => Error::TooLong,
+			DriverError::TooLarge => Error::TooLarge,
+		}
+	}
+}
+
+impl moq_net::transport::Error for Error {
+	fn close_kind(&self) -> moq_net::transport::CloseKind {
+		match self {
+			Self::Evicted => moq_net::transport::CloseKind::Evicted,
+			Self::Session(e) => e.close_kind(),
+			_ => moq_net::transport::CloseKind::Transport,
+		}
+	}
+	fn session_error(&self) -> Option<(u32, String)> {
+		if let Error::Session(e) = self {
+			return e.session_error();
+		}
+
+		None
+	}
+
+	fn stream_error(&self) -> Option<u32> {
+		match self {
+			Error::Reset(code) => Some(*code),
+			_ => None,
+		}
+	}
+}
+
+/// The driver's receive lease, which retains flow-control credit until released.
+pub use crate::quic::driver::recv::Lease;

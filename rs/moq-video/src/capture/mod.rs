@@ -3,8 +3,9 @@
 //! - macOS camera -> AVFoundation, screen -> ScreenCaptureKit, both yielding
 //!   zero-copy `CVPixelBuffer` surfaces straight to VideoToolbox.
 //! - Linux camera -> native V4L2 (YUYV / MJPEG -> CPU I420), or a PipeWire
-//!   camera node (`pipewire` feature), X11 display and window -> X11, Wayland
-//!   display and window -> xdg-desktop-portal + PipeWire (`pipewire` feature).
+//!   camera node (`pipewire` feature), X11 display and window -> X11, and a
+//!   system-picked screen or window -> xdg-desktop-portal + PipeWire (`pipewire`
+//!   feature).
 //! - Windows camera -> native Media Foundation (`IMFSourceReader`), display and
 //!   window -> Windows.Graphics.Capture (GPU NV12, Windows 10 2004 or newer).
 //!
@@ -12,7 +13,7 @@
 
 use std::sync::Arc;
 
-use crate::{Error, Frame, Rate};
+use crate::{Error, Frame, FrameRate, Output};
 
 mod channel;
 use channel::FrameChannel;
@@ -82,22 +83,34 @@ pub enum Source {
 	/// A camera / webcam. `None` opens the default camera.
 	///
 	/// The identifiers from [`cameras`] are an AVFoundation `uniqueID` on macOS,
-	/// a `/dev/videoN` path on Linux, and a Media Foundation symbolic link on
-	/// Windows. Bare numeric indices remain accepted on Linux and Windows.
+	/// a Media Foundation symbolic link on Windows, and on Linux a `/dev/videoN`
+	/// path or, with the `pipewire` feature, a `pipewire:<node name>` id. Bare
+	/// numeric indices remain accepted on Linux and Windows.
 	///
-	/// With the `pipewire` feature, Linux also lists PipeWire camera nodes as
-	/// `pipewire:<node name>`, and `pipewire` alone opens the camera with the
-	/// highest session priority, which the session manager treats as default.
-	/// The id picks the backend: a `/dev/videoN` path always opens V4L2, and a
-	/// `pipewire` id always opens PipeWire. `None` opens `/dev/video0`, except
-	/// inside a sandbox (Flatpak or Snap), where it opens PipeWire's default
-	/// camera through the camera portal.
+	/// With the `pipewire` feature, Linux lists a webcam that a PipeWire node
+	/// fronts by the node's id, since PipeWire shares the camera with other
+	/// clients while a V4L2 open holds it exclusively. Only devices no node
+	/// fronts list as `/dev/videoN`. `pipewire` alone opens the listed camera
+	/// with the highest session priority, which the session manager treats as
+	/// default.
+	///
+	/// The id picks the backend: a `/dev/videoN` path always opens V4L2, listed
+	/// or not, so an id saved from an earlier listing keeps working, and a
+	/// `pipewire` id always opens PipeWire.
+	///
+	/// With the `pipewire` feature, `None` opens PipeWire's default camera when
+	/// PipeWire lists a camera, and `/dev/video0` otherwise, such as on a host
+	/// without a PipeWire session. Inside a sandbox (Flatpak or Snap) it always
+	/// goes through the camera portal. Without the feature, `None` opens
+	/// `/dev/video0`.
 	Camera(Option<String>),
 
 	/// A whole display. `None` opens the main display.
 	///
-	/// The id is the opaque value [`displays`] reports. On Wayland the
-	/// xdg-desktop-portal picker owns selection and no stable id is available.
+	/// The id is the opaque value [`displays`] reports. Linux supports X11
+	/// displays only, including XWayland's `x11:` ids; on Wayland the main
+	/// display and any other id are refused, so ask the system picker with
+	/// [`Source::Portal`] instead.
 	Display(Option<String>),
 
 	/// A single window, by the id [`windows`] reports. Supported on macOS,
@@ -110,8 +123,9 @@ pub enum Source {
 
 	/// A screen or window chosen through the Linux system picker.
 	///
-	/// Clone the selection for demand-driven reopens; create a new one to ask
-	/// for a different source. Restoration depends on compositor support.
+	/// Clone the selection to reopen the same source, as an on-demand capture
+	/// does for each viewer; create a new one to ask for a different source.
+	/// Restoration depends on compositor support.
 	#[cfg(all(target_os = "linux", feature = "pipewire"))]
 	Portal(portal::Selection),
 }
@@ -173,12 +187,12 @@ pub struct Mode {
 	///
 	/// Empty when the driver describes a continuous range instead of listing
 	/// rates, or cannot enumerate intervals for this size.
-	pub framerates: Vec<Rate>,
+	pub framerates: Vec<FrameRate>,
 }
 
 impl Mode {
 	/// The highest rate this mode offers, or `None` when the driver listed none.
-	pub fn max_framerate(&self) -> Option<Rate> {
+	pub fn max_framerate(&self) -> Option<FrameRate> {
 		self.framerates.first().copied()
 	}
 }
@@ -260,10 +274,13 @@ pub struct Config {
 	/// Preferred output height in pixels.
 	pub height: Option<u32>,
 	/// Preferred exact frame rate.
-	pub framerate: Option<Rate>,
+	pub framerate: Option<FrameRate>,
 	/// Draw the mouse cursor into captured frames. Screen/window/app sources
 	/// only; ignored by cameras. Defaults to `true`.
 	pub cursor: bool,
+	/// Where captured pixels live. Defaults to [`Output::Native`]: whatever the
+	/// platform captures into, a GPU surface or CPU pixels.
+	pub output: Output,
 }
 
 impl Default for Config {
@@ -274,6 +291,7 @@ impl Default for Config {
 			height: None,
 			framerate: None,
 			cursor: true,
+			output: Output::Native,
 		}
 	}
 }
@@ -290,9 +308,11 @@ pub struct Stream {
 	chan: Arc<FrameChannel>,
 	width: u32,
 	height: u32,
-	framerate: Option<Rate>,
+	framerate: Option<FrameRate>,
 	color: Option<crate::Color>,
 	label: String,
+	/// [`Config::output`], applied to each frame as it is read.
+	output: Output,
 	/// First frame captured during [`open`] (some backends learn their geometry
 	/// only from a frame); returned by the first [`read`](Self::read).
 	pending: Option<Frame>,
@@ -307,7 +327,7 @@ impl Stream {
 		chan: Arc<FrameChannel>,
 		width: u32,
 		height: u32,
-		framerate: Option<Rate>,
+		framerate: Option<FrameRate>,
 		label: String,
 		pending: Option<Frame>,
 		backend: Keepalive,
@@ -320,6 +340,7 @@ impl Stream {
 			framerate,
 			color,
 			label,
+			output: Output::Native,
 			pending,
 			_backend: backend,
 		}
@@ -335,10 +356,21 @@ impl Stream {
 	/// Dropping this future cancels only the pending read. Dropping the stream
 	/// releases the capture source.
 	pub async fn read(&mut self) -> Result<Option<Frame>, Error> {
-		if let Some(frame) = self.pending.take() {
-			return Ok(Some(frame));
-		}
-		self.chan.recv().await
+		let frame = match self.pending.take() {
+			Some(frame) => frame,
+			None => match self.chan.recv().await? {
+				Some(frame) => frame,
+				None => return Ok(None),
+			},
+		};
+		let surface = self.output.convert(frame.surface)?;
+		Ok(Some(Frame::new(surface, frame.timestamp)))
+	}
+
+	/// How many captured frames no [`read`](Self::read) returned, because a newer one replaced
+	/// them while the reader was busy.
+	pub(crate) fn skipped(&self) -> u64 {
+		self.chan.skipped()
 	}
 
 	/// Width of the captured frames in pixels.
@@ -352,7 +384,7 @@ impl Stream {
 	}
 
 	/// The negotiated frame rate, or `None` if the source doesn't report one.
-	pub fn framerate(&self) -> Option<Rate> {
+	pub fn framerate(&self) -> Option<FrameRate> {
 		self.framerate
 	}
 
@@ -382,7 +414,7 @@ pub(crate) struct Synthetic {
 #[cfg(all(test, feature = "openh264"))]
 impl Synthetic {
 	/// Open a synthetic device with the given geometry, returning it and the stream reading it.
-	pub(crate) fn open(size: crate::Size, framerate: Rate) -> (Self, Stream) {
+	pub(crate) fn open(size: crate::Size, framerate: FrameRate) -> (Self, Stream) {
 		let chan = FrameChannel::new();
 		let stream = Stream::new(
 			chan.clone(),
@@ -397,7 +429,7 @@ impl Synthetic {
 	}
 
 	/// Deliver a frame acquired at `captured`.
-	pub(crate) fn push_at(&self, surface: crate::frame::Surface, captured: moq_clock::Instant) {
+	pub(crate) fn push_at(&self, surface: crate::frame::Surface, captured: kio::clock::Instant) {
 		self.chan.push_at(surface, captured);
 	}
 
@@ -410,10 +442,21 @@ impl Synthetic {
 	pub(crate) fn close(&self) {
 		self.chan.close();
 	}
+
+	/// Whether the stream reading this device was dropped, as a closed camera is.
+	pub(crate) fn released(&self) -> bool {
+		Arc::strong_count(&self.chan) == 1
+	}
 }
 
 /// Open the capture source described by `config`.
 pub async fn open(config: &Config) -> Result<Stream, Error> {
+	let mut stream = open_source(config).await?;
+	stream.output = config.output;
+	Ok(stream)
+}
+
+async fn open_source(config: &Config) -> Result<Stream, Error> {
 	match &config.source {
 		Source::Camera(device) => {
 			let _ = device;
@@ -425,6 +468,13 @@ pub async fn open(config: &Config) -> Result<Stream, Error> {
 			{
 				match LinuxCamera::select(device.as_deref(), sandboxed()) {
 					LinuxCamera::V4l2(device) => v4l2::open(config, device).await,
+					LinuxCamera::Default => {
+						#[cfg(feature = "pipewire")]
+						if pipewire::camera::present().await {
+							return pipewire::camera::open(config, None).await;
+						}
+						v4l2::open(config, None).await
+					}
 					#[cfg(feature = "pipewire")]
 					LinuxCamera::PipeWire(node) => pipewire::camera::open(config, node).await,
 					#[cfg(not(feature = "pipewire"))]
@@ -452,18 +502,7 @@ pub async fn open(config: &Config) -> Result<Stream, Error> {
 			{
 				wgc::open(config).await
 			}
-			#[cfg(all(target_os = "linux", feature = "pipewire"))]
-			{
-				if x11::selected(device.as_deref()) {
-					x11::open_display(config, device.as_deref()).await
-				} else {
-					if let Some(device) = device {
-						tracing::debug!(%device, "portal screen capture ignores the device selector; the picker owns selection");
-					}
-					pipewire::open(config, None).await
-				}
-			}
-			#[cfg(all(target_os = "linux", not(feature = "pipewire")))]
+			#[cfg(target_os = "linux")]
 			{
 				x11::open_display(config, device.as_deref()).await
 			}
@@ -492,7 +531,7 @@ pub async fn open(config: &Config) -> Result<Stream, Error> {
 			}
 		}
 		#[cfg(all(target_os = "linux", feature = "pipewire"))]
-		Source::Portal(selection) => pipewire::open(config, Some(selection)).await,
+		Source::Portal(selection) => pipewire::open(config, selection).await,
 		Source::App(id) => {
 			let _ = id;
 			#[cfg(target_os = "macos")]
@@ -510,10 +549,12 @@ pub async fn open(config: &Config) -> Result<Stream, Error> {
 /// List the available cameras and the identifiers [`Source::Camera`] accepts.
 ///
 /// On Linux, V4L2 lists only devices offering YUYV or MJPEG. With the `pipewire`
-/// feature, PipeWire camera nodes follow, excluding V4L2 paths already listed.
-/// PipeWire-only cameras remain visible. A session without PipeWire lists V4L2
-/// alone. Inside a sandbox the PipeWire nodes come through the camera portal,
-/// which may ask the user for camera access.
+/// feature, PipeWire camera nodes come first, and a V4L2 device that a listed
+/// node fronts is listed only as that node, since PipeWire shares the device
+/// with other clients while a V4L2 open holds it exclusively. V4L2 devices no
+/// node fronts remain visible. A session without PipeWire, or one whose daemon
+/// does not answer, lists V4L2 alone. Inside a sandbox the PipeWire nodes come
+/// through the camera portal, which may ask the user for camera access.
 pub async fn cameras() -> Result<Vec<Camera>, Error> {
 	#[cfg(target_os = "macos")]
 	{
@@ -523,10 +564,7 @@ pub async fn cameras() -> Result<Vec<Camera>, Error> {
 	{
 		let cameras = blocking(v4l2::cameras).await?;
 		#[cfg(feature = "pipewire")]
-		let cameras = {
-			let pipewire = pipewire::camera::cameras(&cameras).await?;
-			[cameras, pipewire].concat()
-		};
+		let cameras = pipewire::camera::cameras(cameras).await?;
 		Ok(cameras)
 	}
 	#[cfg(target_os = "windows")]
@@ -562,6 +600,13 @@ pub async fn camera_modes(camera: Option<&str>) -> Result<Vec<Mode>, Error> {
 			LinuxCamera::V4l2(camera) => {
 				let camera = camera.map(str::to_string);
 				blocking(move || v4l2::modes(camera.as_deref())).await
+			}
+			LinuxCamera::Default => {
+				#[cfg(feature = "pipewire")]
+				if pipewire::camera::present().await {
+					return pipewire::camera::modes(None).await;
+				}
+				blocking(|| v4l2::modes(None)).await
 			}
 			#[cfg(feature = "pipewire")]
 			LinuxCamera::PipeWire(node) => pipewire::camera::modes(node).await,
@@ -641,10 +686,14 @@ const PIPEWIRE: &str = "pipewire";
 #[cfg(any(target_os = "linux", test))]
 #[derive(Debug, PartialEq, Eq)]
 enum LinuxCamera<'a> {
+	/// No camera named, outside a sandbox: PipeWire's default camera when the
+	/// `pipewire` feature is on and PipeWire lists a camera, else `/dev/video0`.
+	Default,
 	/// A V4L2 device, by path or index. `None` opens `/dev/video0`.
 	V4l2(Option<&'a str>),
-	/// A PipeWire camera, by `node.name`. `None` picks the camera with the
-	/// highest session priority, the one the session manager links by default.
+	/// A PipeWire camera, by `node.name`. `None` picks the listed camera with
+	/// the highest session priority, the one the session manager links by
+	/// default.
 	PipeWire(Option<&'a str>),
 }
 
@@ -655,7 +704,7 @@ impl<'a> LinuxCamera<'a> {
 	fn select(selector: Option<&'a str>, sandboxed: bool) -> Self {
 		match selector {
 			None if sandboxed => Self::PipeWire(None),
-			None => Self::V4l2(None),
+			None => Self::Default,
 			Some(PIPEWIRE) => Self::PipeWire(None),
 			Some(selector) => match selector.strip_prefix(PIPEWIRE).and_then(|rest| rest.strip_prefix(':')) {
 				Some(name) => Self::PipeWire(Some(name)),
@@ -688,7 +737,7 @@ where
 {
 	tokio::task::spawn_blocking(f)
 		.await
-		.map_err(|err| Error::Codec(anyhow::anyhow!("capture enumeration thread failed: {err}")))?
+		.map_err(|err| Error::codec(anyhow::anyhow!("capture enumeration thread failed: {err}")))?
 }
 
 #[cfg(test)]
@@ -717,7 +766,7 @@ mod tests {
 
 	#[test]
 	fn camera_selectors_name_their_backend() {
-		assert_eq!(LinuxCamera::select(None, false), LinuxCamera::V4l2(None));
+		assert_eq!(LinuxCamera::select(None, false), LinuxCamera::Default);
 		assert_eq!(LinuxCamera::select(None, true), LinuxCamera::PipeWire(None));
 		for sandboxed in [false, true] {
 			assert_eq!(

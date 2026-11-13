@@ -329,7 +329,7 @@ impl Candidates {
 				// stagger between attempts dwarfs this.
 				if self.count == 0 && !self.delayed && self.full.pending() {
 					self.delayed = true;
-					let _ = moq_clock::timeout(self.delay, self.answer_full()).await;
+					let _ = kio::clock::timeout(self.delay, self.answer_full()).await;
 					continue;
 				}
 
@@ -560,7 +560,6 @@ impl Candidates {
 /// afresh needs a name whose answer changes between dials. Entries carry the
 /// port too, so two servers on one loopback address can stand in for two hosts.
 #[cfg(test)]
-#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 pub(crate) mod hosts {
 	use std::collections::HashMap;
 	use std::net::SocketAddr;
@@ -589,7 +588,7 @@ impl Query {
 
 		Self {
 			call: Some(tokio::spawn(async move {
-				moq_clock::sleep(delay).await;
+				kio::clock::sleep(delay).await;
 				Ok(addrs)
 			})),
 			..Default::default()
@@ -598,7 +597,6 @@ impl Query {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
 	use super::*;
 
@@ -766,7 +764,7 @@ mod tests {
 		);
 		candidates.delay = DEFAULT_RESOLUTION_DELAY;
 
-		let start = tokio::time::Instant::now();
+		let start = kio::clock::now();
 		assert_eq!(candidates.next().await, Some(addr("[2001:db8::1]:443")));
 		assert_eq!(
 			start.elapsed(),
@@ -786,7 +784,7 @@ mod tests {
 		);
 		candidates.delay = DEFAULT_RESOLUTION_DELAY;
 
-		let start = tokio::time::Instant::now();
+		let start = kio::clock::now();
 		assert_eq!(candidates.next().await, Some(addr("1.2.3.4:443")));
 		assert_eq!(start.elapsed(), DEFAULT_RESOLUTION_DELAY);
 	}
@@ -799,7 +797,7 @@ mod tests {
 		candidates.delay = DEFAULT_RESOLUTION_DELAY;
 		candidates.full.call = Some(tokio::spawn(async { Err(io::Error::other("nope")) }));
 
-		let start = tokio::time::Instant::now();
+		let start = kio::clock::now();
 		assert_eq!(candidates.next().await, Some(addr("1.2.3.4:443")));
 		assert_eq!(start.elapsed(), Duration::ZERO);
 	}
@@ -816,7 +814,7 @@ mod tests {
 
 		assert_eq!(candidates.next().await, Some(addr("1.2.3.4:443")));
 
-		let start = tokio::time::Instant::now();
+		let start = kio::clock::now();
 		assert_eq!(candidates.next().await, Some(addr("5.6.7.8:443")));
 		assert_eq!(start.elapsed(), Duration::ZERO);
 	}
@@ -841,7 +839,7 @@ mod tests {
 		assert_eq!(candidates.next().await, Some(addr("1.2.3.4:443")));
 		assert_eq!(candidates.next().await, Some(addr("5.6.7.8:443")));
 
-		let start = tokio::time::Instant::now();
+		let start = kio::clock::now();
 		assert_eq!(candidates.next().await, Some(addr("[2001:db8::1]:443")));
 		assert_eq!(start.elapsed(), Duration::from_secs(1), "waited on the full answer");
 		assert_eq!(candidates.next().await, None, "an address was dialed twice");
@@ -869,7 +867,7 @@ mod tests {
 
 		// That dial is in flight when the full answer lands, so the next candidate
 		// comes from the platform's order rather than the fast lane's leftovers.
-		tokio::time::sleep(Duration::from_millis(20)).await;
+		kio::clock::sleep(Duration::from_millis(20)).await;
 		assert_eq!(candidates.next().await, Some(addr("[2001:db8::1]:443")));
 		assert_eq!(candidates.next().await, Some(addr("5.6.7.8:443")));
 		assert_eq!(candidates.next().await, None);

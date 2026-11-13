@@ -9,6 +9,7 @@ use super::{Message, TrackInfo, Version, message::MAX_MESSAGE_SIZE, message::dec
 
 const TRACKS_ADD: u64 = 0x0;
 const TRACKS_REMOVE: u64 = 0x1;
+const TRACKS_FINISH: u64 = 0x2;
 // The same event the announce stream marks its initial set with.
 const SYNCED: u64 = 0x4;
 
@@ -16,20 +17,29 @@ const SYNCED: u64 = 0x4;
 ///
 /// Lite07+ only.
 #[derive(Clone, Debug)]
-pub struct Tracks<'a> {
-	pub broadcast: Path<'a>,
-	/// The publisher instance the subscriber expects; see [`crate::origin::Route::epoch`].
-	pub epoch: Option<crate::Epoch>,
+pub struct Tracks {
+	pub broadcast: Path,
+	/// The instance the subscriber expects; see [`crate::origin::RouteInfo::instance`].
+	pub instance: Option<crate::Instance>,
+	/// The Node ID of the origin that serves the request, or 0 for whichever the
+	/// publisher selects.
+	pub node: u64,
 }
 
-impl Message for Tracks<'_> {
-	fn decode_msg(r: &mut Decoder<'_>, version: Version) -> Result<Self, DecodeError> {
+impl<'a> Message<'a> for Tracks {
+	const CONTROL: Option<crate::stats::Message> = Some(crate::stats::Message::TrackInfo);
+	fn decode_msg(r: &mut Decoder<'a>, version: Version) -> Result<Self, DecodeError> {
 		if !version.has_tracks() {
 			return Err(DecodeError::Version);
 		}
 		let broadcast = Path::decode(r, version)?;
-		let epoch = super::epoch::decode_epoch(r, version)?;
-		Ok(Self { broadcast, epoch })
+		let instance = super::instance::decode_pin(r, version)?;
+		let node = super::instance::decode_node(r, version)?;
+		Ok(Self {
+			broadcast,
+			instance,
+			node,
+		})
 	}
 
 	fn encode_msg(&self, w: &mut Encoder<'_>, version: Version) -> Result<(), EncodeError> {
@@ -37,7 +47,8 @@ impl Message for Tracks<'_> {
 			return Err(EncodeError::Version);
 		}
 		self.broadcast.encode(w, version)?;
-		super::epoch::encode_epoch(w, version, self.epoch.as_ref())
+		super::instance::encode_pin(w, version, self.instance.as_ref())?;
+		super::instance::encode_node(w, version, self.node)
 	}
 }
 
@@ -48,20 +59,25 @@ impl Message for Tracks<'_> {
 pub enum TracksEvent<'a> {
 	/// TRACKS_ADD: a listed track, with the TRACK_INFO a Track Stream would answer.
 	Added { name: Cow<'a, str>, info: TrackInfo },
-	/// TRACKS_REMOVE: a track named by an earlier TRACKS_ADD is no longer listed.
+	/// TRACKS_REMOVE: a track named by an earlier TRACKS_ADD is no longer listed, unfinished.
 	Removed { name: Cow<'a, str> },
+	/// TRACKS_FINISH: a track named by an earlier TRACKS_ADD is no longer listed because it
+	/// finished.
+	Finished { name: Cow<'a, str> },
 	/// SYNCED: every track this hop listed when the stream opened, and still lists, was sent.
 	Synced,
 }
 
 impl Encode<Version> for TracksEvent<'_> {
 	fn encode(&self, w: &mut Encoder<'_>, version: Version) -> Result<(), EncodeError> {
+		w.control = Some(crate::stats::Message::TrackInfo);
 		if !version.has_tracks() {
 			return Err(EncodeError::Version);
 		}
 		w.varint(match self {
 			Self::Added { .. } => TRACKS_ADD,
 			Self::Removed { .. } => TRACKS_REMOVE,
+			Self::Finished { .. } => TRACKS_FINISH,
 			Self::Synced => SYNCED,
 		})?;
 		let prefix = w.prefix_varint();
@@ -70,7 +86,7 @@ impl Encode<Version> for TracksEvent<'_> {
 				w.string(name)?;
 				info.encode(w, version)?;
 			}
-			Self::Removed { name } => w.string(name)?,
+			Self::Removed { name } | Self::Finished { name } => w.string(name)?,
 			Self::Synced => {}
 		}
 		if w.since(&prefix) > MAX_MESSAGE_SIZE {
@@ -81,8 +97,9 @@ impl Encode<Version> for TracksEvent<'_> {
 	}
 }
 
-impl Decode<Version> for TracksEvent<'_> {
-	fn decode(r: &mut Decoder<'_>, version: Version) -> Result<Self, DecodeError> {
+impl<'a> Decode<'a, Version> for TracksEvent<'a> {
+	fn decode(r: &mut Decoder<'a>, version: Version) -> Result<Self, DecodeError> {
+		r.control = Some(crate::stats::Message::TrackInfo);
 		if !version.has_tracks() {
 			return Err(DecodeError::Version);
 		}
@@ -93,11 +110,14 @@ impl Decode<Version> for TracksEvent<'_> {
 		let msg = (|| {
 			Ok(match typ {
 				TRACKS_ADD => Self::Added {
-					name: Cow::Owned(body.string()?),
+					name: Cow::Borrowed(body.str()?),
 					info: TrackInfo::decode(&mut body, version)?,
 				},
 				TRACKS_REMOVE => Self::Removed {
-					name: Cow::Owned(body.string()?),
+					name: Cow::Borrowed(body.str()?),
+				},
+				TRACKS_FINISH => Self::Finished {
+					name: Cow::Borrowed(body.str()?),
 				},
 				SYNCED => Self::Synced,
 				// A new stream with no earlier builds to tolerate.
@@ -121,7 +141,19 @@ mod test {
 
 	fn roundtrip(event: &TracksEvent<'_>) -> TracksEvent<'static> {
 		let buf = event.encode_bytes(Version::Lite07).unwrap();
-		TracksEvent::decode_slice(&buf, Version::Lite07).unwrap().0
+		match TracksEvent::decode_slice(&buf, Version::Lite07).unwrap().0 {
+			TracksEvent::Added { name, info } => TracksEvent::Added {
+				name: name.into_owned().into(),
+				info,
+			},
+			TracksEvent::Removed { name } => TracksEvent::Removed {
+				name: name.into_owned().into(),
+			},
+			TracksEvent::Finished { name } => TracksEvent::Finished {
+				name: name.into_owned().into(),
+			},
+			TracksEvent::Synced => TracksEvent::Synced,
+		}
 	}
 
 	#[test]
@@ -131,7 +163,7 @@ mod test {
 			priority: 3,
 			max_age: Some(Duration::from_secs(2)),
 			timescale: Some(Timescale::MICRO),
-			compress: true,
+			compression: crate::track::Compression::Deflate,
 		};
 		let TracksEvent::Added { name, info: got } = roundtrip(&TracksEvent::Added {
 			name: "video".into(),
@@ -144,8 +176,12 @@ mod test {
 		assert_eq!(got.priority, 3);
 		assert_eq!(got.max_age, Some(Duration::from_secs(2)));
 		assert_eq!(got.timescale, Some(Timescale::MICRO));
-		assert!(got.compress);
+		assert_eq!(got.compression, crate::track::Compression::Deflate);
 
+		let TracksEvent::Finished { name } = roundtrip(&TracksEvent::Finished { name: "audio".into() }) else {
+			panic!("expected TRACKS_FINISH");
+		};
+		assert_eq!(name, "audio");
 		let TracksEvent::Removed { name } = roundtrip(&TracksEvent::Removed { name: "video".into() }) else {
 			panic!("expected a removal");
 		};
@@ -164,7 +200,7 @@ mod test {
 	#[test]
 	fn an_unknown_event_is_refused() {
 		assert!(matches!(
-			TracksEvent::decode_slice(&[0x02, 0x00], Version::Lite07),
+			TracksEvent::decode_slice(&[0x03, 0x00], Version::Lite07),
 			Err(DecodeError::InvalidValue)
 		));
 	}
@@ -179,22 +215,25 @@ mod test {
 
 	#[test]
 	fn the_request_roundtrips() {
-		let epoch: crate::Epoch = "01900000-0000-7000-8000-000000000001".parse().unwrap();
+		let instance: crate::Instance = "alice".parse().unwrap();
 		let msg = Tracks {
-			broadcast: Path::new("room/alice").to_owned(),
-			epoch: Some(epoch.clone()),
+			broadcast: Path::from_static("room/alice"),
+			instance: Some(instance.clone()),
+			node: 0x7a3f,
 		};
 		let buf = msg.encode_bytes(Version::Lite07).unwrap();
 		let (got, _) = Tracks::decode_slice(&buf, Version::Lite07).unwrap();
-		assert_eq!(got.broadcast, Path::new("room/alice"));
-		assert_eq!(got.epoch, Some(epoch));
+		assert_eq!(got.broadcast, Path::from_static("room/alice"));
+		assert_eq!(got.instance, Some(instance));
+		assert_eq!(got.node, 0x7a3f);
 	}
 
 	#[test]
 	fn older_versions_have_no_tracks_stream() {
 		let msg = Tracks {
-			broadcast: Path::new("room").to_owned(),
-			epoch: None,
+			broadcast: Path::from_static("room"),
+			instance: None,
+			node: 0,
 		};
 		assert!(msg.encode_bytes(Version::Lite06).is_err());
 		assert!(TracksEvent::Synced.encode_bytes(Version::Lite06).is_err());

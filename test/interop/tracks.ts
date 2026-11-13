@@ -1,7 +1,7 @@
 // moq-lite-07 TRACKS both ways. `answer`: the JS publisher answers a Rust-encoded TRACKS request
 // with its listing, through a removal and the broadcast's end. `echo`: JS decodes Rust-encoded
 // listing events and encodes them back.
-import { Milli } from "@moq/clock";
+import { Duration } from "@moq/clock";
 import { randomHop } from "../../js/net/src/hop.ts";
 import { Publisher } from "../../js/net/src/lite/publisher.ts";
 import { decodeTracksEventMaybe, encodeTracksEvent, Tracks } from "../../js/net/src/lite/tracks.ts";
@@ -23,9 +23,9 @@ const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 if (input.mode === "answer") {
 	const origin = new OriginProducer();
-	const broadcast = origin.createBroadcast(Path.from("room"));
-	broadcast.announce();
-	broadcast.createTrack("a", { timescale: Timescale.MILLI, maxAge: Milli(3000), priority: 9, refresh: 4 });
+	const broadcastRoute = origin.route(Path.from("room"));
+	const broadcast = broadcastRoute.broadcast;
+	broadcast.createTrack("a", { timescale: Timescale.MILLI, maxAge: Duration.millis(3000), priority: 9, refresh: 4 });
 	broadcast.createTrack("b");
 
 	const publisher = new Publisher(createMockTransportPair().server, version, randomHop(), origin.consume());

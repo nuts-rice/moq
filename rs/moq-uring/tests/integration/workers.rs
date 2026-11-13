@@ -7,9 +7,9 @@
 //! continuation included) on that worker; a wrong prefix stalls the
 //! handshake, so every dial being accepted is what proves the steering.
 //!
-//! Unsupported local kernels skip loudly; MOQ_STRICT makes CI refuse them.
+//! Unsupported local kernels skip loudly; CI_STRICT makes CI refuse them.
 
-#![cfg(all(target_os = "linux", feature = "quic"))]
+#![cfg(feature = "quic")]
 
 use crate::support;
 
@@ -23,7 +23,7 @@ use moq_uring::{Config, Error, Worker, quic, udp};
 fn worker() -> Option<Worker> {
 	match Worker::new(Config::default()) {
 		Ok(worker) => Some(worker),
-		Err(Error::Unsupported(reason)) if std::env::var_os("MOQ_STRICT").is_none() => {
+		Err(Error::Unsupported(reason)) if std::env::var_os("CI_STRICT").is_none() => {
 			eprintln!("skipping io_uring workers test: {reason}");
 			None
 		}
@@ -98,8 +98,7 @@ fn a_steered_group_serves_a_shared_port() {
 		.map(|(member, stop)| {
 			let accepted = accepted.clone();
 			let stop = stop.clone();
-			let cert = certs.cert.clone();
-			let key = certs.key.clone();
+			let tls = certs.server(&[ALPN]);
 			let ready = ready.clone();
 			std::thread::spawn(move || {
 				let shard = member.shard();
@@ -109,21 +108,16 @@ fn a_steered_group_serves_a_shared_port() {
 				// steers with, and there is no other way to hand one over.
 				let socket = handle.udp(member, udp::Config::default()).expect("socket");
 
-				let server = quic::server::Config::new(
-					quic::Identity::open(cert, key)
-						.expect("identity")
-						.server(&[ALPN], quic::server::ClientAuth::None)
-						.expect("tls"),
-				);
-				let endpoint = quic::Endpoint::new(socket, quic::endpoint::Config::default().with_server(server))
+				let server = quic::server::Config::new(tls);
+				let endpoint = quic::Endpoint::new(quic::endpoint::Config::default().with_server(server), socket)
 					.expect("endpoint");
 
 				handle.spawn(async move {
 					// Each accepted connection is counted, then closed: that
 					// close is how the client learns this side accepted it.
-					while let Ok(mut conn) = endpoint.accept().await {
+					while let Ok(conn) = endpoint.accept().await {
 						accepted[usize::from(shard.index())].fetch_add(1, Ordering::AcqRel);
-						web_transport_trait::poll::Session::close(&mut conn, 0, "done");
+						conn.close(moq_uring::quic::VarInt::from_u32(0), "done");
 					}
 				});
 				ready.send(()).expect("test alive");
@@ -140,9 +134,7 @@ fn a_steered_group_serves_a_shared_port() {
 	// accepted is the steering assertion (see the module docs).
 	let mut client_worker = client_worker;
 	let handle = client_worker.handle();
-	let mut dial = quic::client::Config::new(addr, "localhost");
-	dial.alpn = vec![ALPN.to_string()];
-	dial.verify = false;
+	let dial = quic::client::Config::new(support::client_tls(&[ALPN]));
 
 	client_worker
 		.block_on(async {
@@ -150,17 +142,15 @@ fn a_steered_group_serves_a_shared_port() {
 				let socket = handle
 					.udp(UdpSocket::bind("127.0.0.1:0").expect("bind"), udp::Config::default())
 					.expect("client socket");
-				let mut conn = quic::client::connect(socket, &dial).await.expect("connect");
-				assert_eq!(
-					web_transport_trait::poll::Session::protocol(&conn),
-					Some(ALPN),
-					"negotiated ALPN"
-				);
+				let conn = quic::client::connect(socket, &dial, addr, "localhost")
+					.await
+					.expect("connect");
+				assert_eq!(conn.protocol(), Some(ALPN), "negotiated ALPN");
 				// The client's handshake completes a flight before the
 				// server's, so closing here could discard the client's Finished
 				// (still behind the pacer, say) and the server would never
 				// accept. The server's close is the proof it did.
-				match std::future::poll_fn(|cx| web_transport_trait::poll::Session::poll_closed(&mut conn, cx)).await {
+				match conn.closed().await {
 					quic::Error::App { code: 0, .. } => {}
 					other => panic!("the client saw {other:?} instead of the server's close"),
 				}

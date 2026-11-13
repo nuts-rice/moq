@@ -3,11 +3,10 @@ use crate::generate::generate;
 use crate::{Algorithm, Claims};
 use base64::Engine;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header};
-use p256::elliptic_curve::SecretKey;
-use p256::elliptic_curve::pkcs8::EncodePrivateKey;
-use rsa::BigUint;
-use rsa::pkcs1::EncodeRsaPrivateKey;
-use serde::{Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned};
+use pkcs1::der::Encode;
+use rind::signature::{EcdsaKeyPair, Ed25519KeyPair, sign};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::str::FromStr;
 use std::sync::OnceLock;
 use std::{collections::HashSet, fmt, path::Path as StdPath};
 
@@ -55,7 +54,11 @@ pub enum KeyMaterial {
 		#[serde(flatten)]
 		public: RsaPublicKey,
 		/// The private parameters, absent for a public key.
-		#[serde(flatten, skip_serializing_if = "Option::is_none")]
+		#[serde(
+			flatten,
+			skip_serializing_if = "Option::is_none",
+			deserialize_with = "deserialize_rsa_private"
+		)]
 		private: Option<RsaPrivateKey>,
 	},
 	/// <https://datatracker.ietf.org/doc/html/rfc7518#section-6.4>
@@ -144,9 +147,52 @@ pub struct RsaPrivateKey {
 	/// The first CRT coefficient.
 	#[serde(serialize_with = "serialize_base64url", deserialize_with = "deserialize_base64url")]
 	pub qi: Vec<u8>,
-	/// Other prime information, for keys with more than two primes.
+	/// Other prime information. Multi-prime RSA is refused on import.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub oth: Option<Vec<RsaAdditionalPrime>>,
+}
+
+// Flattening Option<RsaPrivateKey> otherwise swallows missing-field errors and turns
+// malformed private keys into public keys. Decide whether private material exists first.
+fn deserialize_rsa_private<'de, D>(deserializer: D) -> Result<Option<RsaPrivateKey>, D::Error>
+where
+	D: Deserializer<'de>,
+{
+	let fields = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+	if fields.contains_key("oth") {
+		return Err(serde::de::Error::custom("multi-prime RSA (oth) is unsupported"));
+	}
+	if ["d", "p", "q", "dp", "dq", "qi"]
+		.iter()
+		.any(|field| fields.contains_key(*field))
+	{
+		serde_json::from_value(serde_json::Value::Object(fields))
+			.map(Some)
+			.map_err(serde::de::Error::custom)
+	} else {
+		Ok(None)
+	}
+}
+
+impl RsaPrivateKey {
+	fn to_der(&self, public: &RsaPublicKey) -> crate::Result<Vec<u8>> {
+		use pkcs1::UintRef;
+		let encode = || -> Result<_, pkcs1::der::Error> {
+			pkcs1::RsaPrivateKey {
+				modulus: UintRef::new(&public.n)?,
+				public_exponent: UintRef::new(&public.e)?,
+				private_exponent: UintRef::new(&self.d)?,
+				prime1: UintRef::new(&self.p)?,
+				prime2: UintRef::new(&self.q)?,
+				exponent1: UintRef::new(&self.dp)?,
+				exponent2: UintRef::new(&self.dq)?,
+				coefficient: UintRef::new(&self.qi)?,
+				other_prime_infos: None,
+			}
+			.to_der()
+		};
+		encode().map_err(|e| crate::Error::Crypto(e.to_string()))
+	}
 }
 
 /// Additional prime information for multi-prime RSA keys.
@@ -224,6 +270,8 @@ impl Jwk {
 	/// is discoverable from here, and `import`/`export` rather than `validate` because the
 	/// `validate` methods elsewhere in this crate check without converting.
 	pub fn import(self) -> crate::Result<Key> {
+		crate::crypto::init()?;
+
 		if let Some(scope) = &self.scope {
 			scope.validate()?;
 		}
@@ -232,6 +280,14 @@ impl Jwk {
 			&& secret.len() < MIN_OCT_SECRET_BYTES
 		{
 			return Err(KeyError::SecretTooShort(MIN_OCT_SECRET_BYTES).into());
+		}
+
+		if let KeyMaterial::RSA {
+			private: Some(private), ..
+		} = &self.material
+			&& private.oth.is_some()
+		{
+			return Err(crate::Error::Crypto("multi-prime RSA (oth) is unsupported".into()));
 		}
 
 		Ok(Key {
@@ -246,7 +302,7 @@ impl Jwk {
 ///
 /// The fields are fixed at construction: derived crypto material is cached on first use, so a key
 /// that could be mutated would sign with stale material. Build one from a [`Jwk`], from
-/// [`Key::generate`], or by parsing with [`Key::from_str`], then use the builders to derive a new
+/// [`Key::generate`], or by parsing a string with [`str::parse`], then use the builders to derive a new
 /// key rather than editing an existing one.
 #[derive(Clone)]
 pub struct Key {
@@ -313,18 +369,11 @@ impl fmt::Debug for Key {
 	}
 }
 
-impl Key {
-	/// The serializable [`Jwk`] behind this key, cloned so editing it can't reach the original.
-	///
-	/// The inverse of [`Jwk::import`]. Use it to derive a variant: export, edit, import again.
-	/// Reading a single field needs no clone, since a [`Key`] derefs to its [`Jwk`].
-	pub fn export(&self) -> Jwk {
-		self.jwk.clone()
-	}
+impl FromStr for Key {
+	type Err = crate::Error;
 
 	/// Parse a key from a string, auto-detecting JSON or base64url encoding.
-	#[allow(clippy::should_implement_trait)]
-	pub fn from_str(s: &str) -> crate::Result<Self> {
+	fn from_str(s: &str) -> crate::Result<Self> {
 		let s = s.trim();
 		if s.starts_with('{') {
 			Ok(serde_json::from_str(s)?)
@@ -334,18 +383,20 @@ impl Key {
 			Ok(serde_json::from_str(&json)?)
 		}
 	}
+}
+
+impl Key {
+	/// The serializable [`Jwk`] behind this key, cloned so editing it can't reach the original.
+	///
+	/// The inverse of [`Jwk::import`]. Use it to derive a variant: export, edit, import again.
+	/// Reading a single field needs no clone, since a [`Key`] derefs to its [`Jwk`].
+	pub fn export(&self) -> Jwk {
+		self.jwk.clone()
+	}
 
 	/// Load a key from a file, auto-detecting JSON or base64url encoding.
 	pub fn from_file<P: AsRef<StdPath>>(path: P) -> crate::Result<Self> {
-		let contents = std::fs::read_to_string(&path)?;
-		Self::from_str(&contents)
-	}
-
-	/// Async version of [`from_file`](Self::from_file), using `tokio::fs`.
-	#[cfg(feature = "tokio")]
-	pub async fn from_file_async<P: AsRef<StdPath>>(path: P) -> crate::Result<Self> {
-		let contents = tokio::fs::read_to_string(path).await?;
-		Self::from_str(&contents)
+		std::fs::read_to_string(&path)?.parse()
 	}
 
 	/// Encode the key as base64url-encoded JSON.
@@ -487,7 +538,7 @@ impl Key {
 		Ok(self.decode.get_or_init(|| decoding_key))
 	}
 
-	fn to_encoding_key(&self) -> crate::Result<&EncodingKey> {
+	pub(crate) fn to_encoding_key(&self) -> crate::Result<&EncodingKey> {
 		if let Some(key) = self.encode.get() {
 			return Ok(key);
 		}
@@ -497,22 +548,24 @@ impl Key {
 				Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => EncodingKey::from_secret(secret),
 				_ => return Err(KeyError::InvalidAlgorithm.into()),
 			},
-			KeyMaterial::EC { ref curve, ref d, .. } => {
+			KeyMaterial::EC {
+				ref curve,
+				ref x,
+				ref y,
+				ref d,
+			} => {
 				let d = d.as_ref().ok_or(KeyError::MissingPrivateKey)?;
-
-				match curve {
-					EllipticCurve::P256 => {
-						let secret_key = SecretKey::<p256::NistP256>::from_slice(d)?;
-						let doc = secret_key.to_pkcs8_der()?;
-						EncodingKey::from_ec_der(doc.as_bytes())
-					}
-					EllipticCurve::P384 => {
-						let secret_key = SecretKey::<p384::NistP384>::from_slice(d)?;
-						let doc = secret_key.to_pkcs8_der()?;
-						EncodingKey::from_ec_der(doc.as_bytes())
-					}
+				let algorithm = match curve {
+					EllipticCurve::P256 => &sign::ECDSA_P256_SHA256_FIXED,
+					EllipticCurve::P384 => &sign::ECDSA_P384_SHA384_FIXED,
 					_ => return Err(KeyError::InvalidCurve("EC").into()),
-				}
+				};
+
+				// rind refuses a `d` whose public key is not this `x` and `y`.
+				let point = [&[0x04][..], x.as_slice(), y.as_slice()].concat();
+				let pair =
+					EcdsaKeyPair::from_scalar_and_public_key(algorithm, d, &point).map_err(crate::Error::crypto)?;
+				EncodingKey::from_ec_der(pair.to_pkcs8().as_ref())
 			}
 			KeyMaterial::OKP {
 				ref curve,
@@ -520,58 +573,23 @@ impl Key {
 				ref x,
 			} => {
 				let d = d.as_ref().ok_or(KeyError::MissingPrivateKey)?;
-
-				let key_pair =
-					aws_lc_rs::signature::Ed25519KeyPair::from_seed_and_public_key(d.as_slice(), x.as_slice())?;
-
-				match curve {
-					EllipticCurve::Ed25519 => EncodingKey::from_ed_der(key_pair.to_pkcs8()?.as_ref()),
-					_ => return Err(KeyError::InvalidCurve("OKP").into()),
+				if *curve != EllipticCurve::Ed25519 {
+					return Err(KeyError::InvalidCurve("OKP").into());
 				}
+
+				let pair = Ed25519KeyPair::from_seed_and_public_key(d, x).map_err(crate::Error::crypto)?;
+				EncodingKey::from_ed_der(pair.to_pkcs8().as_ref())
 			}
 			KeyMaterial::RSA {
 				ref public,
 				ref private,
 			} => {
-				let n = BigUint::from_bytes_be(&public.n);
-				let e = BigUint::from_bytes_be(&public.e);
 				let private = private.as_ref().ok_or(KeyError::MissingPrivateKey)?;
-				let d = BigUint::from_bytes_be(&private.d);
-				let p = BigUint::from_bytes_be(&private.p);
-				let q = BigUint::from_bytes_be(&private.q);
-
-				let rsa = rsa::RsaPrivateKey::from_components(n, e, d, vec![p, q]);
-				let pem = rsa?.to_pkcs1_pem(rsa::pkcs1::LineEnding::LF);
-
-				EncodingKey::from_rsa_pem(pem?.as_bytes())?
+				EncodingKey::from_rsa_der(&private.to_der(public)?)
 			}
 		};
 
 		Ok(self.encode.get_or_init(|| encoding_key))
-	}
-
-	/// Decode a signed token into any payload, checking only signature, algorithm, and key ID.
-	///
-	/// The caller validates payload fields and expiry. Use [`verify`](Self::verify) for
-	/// this crate's strict [`Claims`] contract.
-	pub fn decode<C: DeserializeOwned>(&self, token: &str) -> crate::Result<C> {
-		if !self.operations.contains(&KeyOperation::Verify) {
-			return Err(KeyError::VerifyUnsupported.into());
-		}
-		let header = jsonwebtoken::decode_header(token)?;
-		match (self.kid.as_ref(), header.kid.as_deref()) {
-			(Some(expected), Some(actual)) if expected.encode() == actual => {}
-			(Some(_), None) => return Err(KeyError::MissingKid.into()),
-			(_, Some(actual)) => return Err(KeyError::KeyNotFound(actual.to_string()).into()),
-			(None, None) => {}
-		}
-
-		let mut validation = jsonwebtoken::Validation::new(self.algorithm.into());
-		validation.required_spec_claims = Default::default();
-		validation.validate_exp = false;
-		validation.validate_nbf = false;
-		validation.validate_aud = false;
-		Ok(jsonwebtoken::decode::<C>(token, self.to_decoding_key()?, &validation)?.claims)
 	}
 
 	/// Verify a token's signature and this crate's strict claims, expiry, not-before, and key scope.
@@ -580,25 +598,51 @@ impl Key {
 	/// [`Claims::authorize`].
 	pub fn verify(&self, token: &str) -> crate::Result<Claims> {
 		let claims = self.verify_claims(token)?;
-		validate_times(&claims, moq_clock::wall().into())?;
+		validate_times(&claims, kio::clock::wall())?;
 		Ok(claims)
 	}
 
 	/// Verify the signature, claims, and key scope but not the times, so an expired
 	/// token's root is still known to be genuine.
 	pub(crate) fn verify_claims(&self, token: &str) -> crate::Result<Claims> {
-		let claims: Claims = self.decode(token)?;
+		self.check_kid(token)?;
+
+		let mut validation = jsonwebtoken::Validation::new(self.algorithm.into());
+		validation.required_spec_claims = Default::default();
+		validation.validate_exp = false;
+		validation.validate_nbf = false;
+		validation.validate_aud = false;
+		let claims: Claims = jsonwebtoken::decode(token, self.to_decoding_key()?, &validation)?.claims;
 		claims.validate()?;
 		self.validate_scope(&claims)?;
 		Ok(claims)
 	}
 
+	/// Refuse a key that cannot verify, or a token whose `kid` header names another key.
+	fn check_kid(&self, token: &str) -> crate::Result<()> {
+		if !self.operations.contains(&KeyOperation::Verify) {
+			return Err(KeyError::VerifyUnsupported.into());
+		}
+		let header = jsonwebtoken::decode_header(token)?;
+		match (self.kid.as_ref(), header.kid.as_deref()) {
+			(Some(expected), Some(actual)) if expected.encode() == actual => Ok(()),
+			(Some(_), None) => Err(KeyError::MissingKid.into()),
+			(_, Some(actual)) => Err(KeyError::KeyNotFound(actual.to_string()).into()),
+			(None, None) => Ok(()),
+		}
+	}
+
 	/// Sign the claims with this key, returning the encoded token.
+	///
+	/// Fails with [`Error::InvalidRoot`](crate::Error::InvalidRoot) on a root spelled with an
+	/// empty segment, a `\` escaping anything but `\` or `/`, or more than 4096 bytes.
+	/// Verifying stays lenient on the empty segments, so tokens minted before stay valid.
 	pub fn sign(&self, payload: &Claims) -> crate::Result<String> {
 		if !self.operations.contains(&KeyOperation::Sign) {
 			return Err(KeyError::SignUnsupported.into());
 		}
 
+		crate::path::validate(&payload.root)?;
 		payload.validate()?;
 		self.validate_scope(payload)?;
 
@@ -618,7 +662,7 @@ impl Key {
 	/// Derive a key with an authorization scope attached, capping what its tokens may grant.
 	///
 	/// The scope is validated here, and it is the only way to set one, so a key can never carry a
-	/// scope that permits nothing.
+	/// scope that permits nothing, nor a root [`sign`](Self::sign) would refuse.
 	pub fn with_scope(mut self, scope: crate::Scope) -> crate::Result<Self> {
 		scope.validate()?;
 		self.jwk.scope = Some(scope);
@@ -643,7 +687,7 @@ impl Key {
 }
 
 /// Refuse claims expired at `now` (`exp <= now`) or not yet valid (`nbf > now`), as `jose` does.
-pub(crate) fn validate_times(claims: &Claims, now: std::time::SystemTime) -> crate::Result<()> {
+pub(crate) fn validate_times(claims: &Claims, now: kio::clock::Wall) -> crate::Result<()> {
 	if claims.expires.is_some_and(|exp| exp <= now) {
 		return Err(crate::Error::TokenExpired);
 	}
@@ -707,14 +751,14 @@ where
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
 	use super::*;
 
 	fn patterns(texts: &[&str]) -> crate::Patterns {
 		texts.iter().map(|text| text.parse().unwrap()).collect()
 	}
-	use std::time::{Duration, SystemTime};
+	use kio::clock::Wall;
+	use std::time::Duration;
 
 	fn create_test_key() -> Key {
 		let mut jwk = Jwk::new(
@@ -729,37 +773,37 @@ mod tests {
 
 	fn create_test_claims() -> Claims {
 		Claims {
+			publish_rate: None,
+			subscribe_rate: None,
 			root: "test-path".to_string(),
-			publish: patterns(&["test-pub/**"]).into(),
-			subscribe: patterns(&["test-sub/**"]).into(),
-			expires: Some(SystemTime::now() + Duration::from_secs(3600)),
-			issued: Some(SystemTime::now()),
+			publish: patterns(&["test-pub/**"]),
+			subscribe: patterns(&["test-sub/**"]),
+			expires: Some(kio::clock::wall() + Duration::from_secs(3600)),
+			issued: Some(kio::clock::wall()),
 			not_before: None,
 		}
 	}
 
 	#[test]
-	fn decode_accepts_other_payloads_but_checks_kid_and_algorithm() {
+	fn verify_refuses_custom_payloads_and_checks_kid_and_algorithm() {
 		let key = create_test_key();
 		let mut header = Header::new(Algorithm::HS256.into());
 		header.kid = key.kid.as_ref().map(ToString::to_string);
 		let payload = serde_json::json!({"custom": "accepted", "exp": 1, "aud": "other-service"});
 		let token = jsonwebtoken::encode(&header, &payload, key.to_encoding_key().unwrap()).unwrap();
-		let decoded: serde_json::Value = key.decode(&token).unwrap();
-		assert_eq!(decoded, payload);
 		assert!(key.verify(&token).is_err(), "strict claims reject the custom payload");
 
 		header.kid = Some("someone-else".into());
 		let wrong_kid = jsonwebtoken::encode(&header, &payload, key.to_encoding_key().unwrap()).unwrap();
 		assert!(matches!(
-			key.decode::<serde_json::Value>(&wrong_kid),
+			key.verify(&wrong_kid),
 			Err(crate::Error::Key(KeyError::KeyNotFound(_)))
 		));
 
 		header.kid = key.kid.as_ref().map(ToString::to_string);
 		header.alg = jsonwebtoken::Algorithm::HS384;
 		let wrong_algorithm = jsonwebtoken::encode(&header, &payload, key.to_encoding_key().unwrap()).unwrap();
-		assert!(key.decode::<serde_json::Value>(&wrong_algorithm).is_err());
+		assert!(key.verify(&wrong_algorithm).is_err());
 	}
 
 	#[test]
@@ -892,12 +936,12 @@ mod tests {
 			.unwrap();
 		let allowed = Claims {
 			root: "test-path".into(),
-			publish: patterns(&["allowed/room/**"]).into(),
+			publish: patterns(&["allowed/room/**"]),
 			..Default::default()
 		};
 		let denied = Claims {
 			root: "test-path".into(),
-			publish: patterns(&["other/**"]).into(),
+			publish: patterns(&["other/**"]),
 			..Default::default()
 		};
 
@@ -908,13 +952,47 @@ mod tests {
 		assert!(matches!(scoped.verify(&forged), Err(crate::Error::ScopeExceeded)));
 	}
 
+	/// A token or key scope never names a root no peer can spell, though one already minted
+	/// with boundary slashes still verifies.
+	#[test]
+	fn test_key_mints_only_strict_roots() {
+		let key = create_test_key();
+		let claims = |root: &str| Claims {
+			root: root.into(),
+			publish: patterns(&["**"]),
+			..Default::default()
+		};
+		let scope = |root: &str| crate::Scope {
+			root: root.into(),
+			publish: patterns(&["**"]),
+			subscribe: patterns(&[]),
+		};
+
+		for root in ["/room", "room/", "a//b", r"a\b"] {
+			assert!(
+				matches!(key.sign(&claims(root)), Err(crate::Error::InvalidRoot(_))),
+				"{root:?}"
+			);
+			assert!(
+				matches!(key.clone().with_scope(scope(root)), Err(crate::Error::InvalidRoot(_))),
+				"{root:?}"
+			);
+		}
+
+		let legacy = sign_raw(&key, serde_json::json!({"root": "/room/", "publish": ["**"]}));
+		assert_eq!(
+			key.verify(&legacy).unwrap().authorize("room").unwrap().publish,
+			patterns(&["**"])
+		);
+	}
+
 	/// A key's crypto material is derived once and cached, so the fields it was derived from must
 	/// stay fixed. Changing the algorithm means building a new key, which derives fresh material.
 	#[test]
 	fn test_key_derived_material_never_stale() {
 		let claims = Claims {
 			root: "test-path".into(),
-			publish: patterns(&["test-pub/**"]).into(),
+			publish: patterns(&["test-pub/**"]),
 			..Default::default()
 		};
 
@@ -976,9 +1054,11 @@ mod tests {
 	fn test_key_sign_invalid_claims() {
 		let key = create_test_key();
 		let invalid_claims = Claims {
+			publish_rate: None,
+			subscribe_rate: None,
 			root: "test-path".to_string(),
-			publish: patterns(&[]).into(),
-			subscribe: patterns(&[]).into(),
+			publish: patterns(&[]),
+			subscribe: patterns(&[]),
 			expires: None,
 			issued: None,
 			not_before: None,
@@ -1051,8 +1131,8 @@ mod tests {
 	#[test]
 	fn test_key_verify_only_registered_claims() {
 		let key = create_test_key();
-		let now = SystemTime::now()
-			.duration_since(SystemTime::UNIX_EPOCH)
+		let now = kio::clock::wall()
+			.checked_duration_since(Wall::UNIX_EPOCH)
 			.unwrap()
 			.as_secs();
 
@@ -1089,8 +1169,8 @@ mod tests {
 	fn test_key_verify_enforces_not_before() {
 		let key = create_test_key();
 		let at = |offset: i64| {
-			let now = SystemTime::now()
-				.duration_since(SystemTime::UNIX_EPOCH)
+			let now = kio::clock::wall()
+				.checked_duration_since(Wall::UNIX_EPOCH)
 				.unwrap()
 				.as_secs() as i64;
 			sign_raw(
@@ -1105,10 +1185,10 @@ mod tests {
 	/// `exp` is refused at the instant itself and `nbf` accepted at it, matching `jose`.
 	#[test]
 	fn validate_times_at_the_boundary() {
-		let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+		let now = Wall::UNIX_EPOCH + Duration::from_secs(1_000);
 		let second = Duration::from_secs(1);
 
-		let at = |expires: Option<SystemTime>, not_before: Option<SystemTime>| {
+		let at = |expires: Option<Wall>, not_before: Option<Wall>| {
 			let mut claims = create_test_claims();
 			claims.expires = expires;
 			claims.not_before = not_before;
@@ -1131,22 +1211,22 @@ mod tests {
 	fn test_key_verify_expired_token() {
 		let key = create_test_key();
 		let mut claims = create_test_claims();
-		claims.expires = Some(SystemTime::now() - Duration::from_secs(3600)); // 1 hour ago
+		claims.expires = Some(kio::clock::wall() - Duration::from_secs(3600)); // 1 hour ago
 		let token = key.sign(&claims).unwrap();
 
 		let result = key.verify(&token);
 		assert!(result.is_err());
 	}
 
-	#[moq_clock::test]
+	#[kio::test]
 	async fn token_validity_uses_the_ambient_wall() {
 		let key = create_test_key();
 		let mut claims = create_test_claims();
-		claims.issued = Some(moq_clock::wall().into());
-		claims.expires = Some((moq_clock::wall() + Duration::from_secs(10)).into());
+		claims.issued = Some(kio::clock::wall());
+		claims.expires = Some(kio::clock::wall() + Duration::from_secs(10));
 		let token = key.sign(&claims).unwrap();
 		key.verify(&token).unwrap();
-		moq_clock::sleep(Duration::from_secs(10)).await;
+		kio::clock::sleep(Duration::from_secs(10)).await;
 		assert!(matches!(key.verify(&token), Err(crate::Error::TokenExpired)));
 	}
 
@@ -1154,9 +1234,11 @@ mod tests {
 	fn test_key_verify_token_without_exp() {
 		let key = create_test_key();
 		let claims = Claims {
+			publish_rate: None,
+			subscribe_rate: None,
 			root: "test-path".to_string(),
-			publish: patterns(&["**"]).into(),
-			subscribe: patterns(&["**"]).into(),
+			publish: patterns(&["**"]),
+			subscribe: patterns(&["**"]),
 			expires: None,
 			issued: None,
 			not_before: None,
@@ -1174,11 +1256,13 @@ mod tests {
 	fn test_key_round_trip() {
 		let key = create_test_key();
 		let original_claims = Claims {
+			publish_rate: None,
+			subscribe_rate: None,
 			root: "test-path".to_string(),
-			publish: patterns(&["test-pub/**"]).into(),
-			subscribe: patterns(&["test-sub/**"]).into(),
-			expires: Some(SystemTime::now() + Duration::from_secs(3600)),
-			issued: Some(SystemTime::now()),
+			publish: patterns(&["test-pub/**"]),
+			subscribe: patterns(&["test-sub/**"]),
+			expires: Some(kio::clock::wall() + Duration::from_secs(3600)),
+			issued: Some(kio::clock::wall()),
 			not_before: None,
 		};
 
@@ -1431,6 +1515,61 @@ mod tests {
 	}
 
 	#[test]
+	fn private_rsa_requires_complete_components() {
+		let key = Key::generate(Algorithm::RS256, None).unwrap();
+		let original = serde_json::to_value(&key).unwrap();
+		for field in ["d", "p", "q", "dp", "dq", "qi"] {
+			let mut incomplete = original.clone();
+			incomplete.as_object_mut().unwrap().remove(field);
+			// A verify-only import must not silently discard malformed private material.
+			incomplete["key_ops"] = serde_json::json!(["verify"]);
+			let error = serde_json::from_value::<Key>(incomplete).expect_err(field);
+			assert!(error.to_string().contains(field), "{field}: {error}");
+		}
+	}
+
+	#[test]
+	fn private_rsa_rejects_other_primes() {
+		let key = Key::generate(Algorithm::RS256, None).unwrap();
+		let mut jwk = key.export();
+		let KeyMaterial::RSA {
+			private: Some(private), ..
+		} = &mut jwk.material
+		else {
+			unreachable!();
+		};
+		private.oth = Some(vec![]);
+		assert!(
+			jwk.clone()
+				.import()
+				.expect_err("oth must be refused")
+				.to_string()
+				.contains("oth")
+		);
+		let json = serde_json::to_value(jwk).unwrap();
+		assert!(
+			serde_json::from_value::<Key>(json)
+				.expect_err("oth must be refused")
+				.to_string()
+				.contains("oth")
+		);
+	}
+
+	#[test]
+	fn private_rsa_uses_supplied_crt_parameters() {
+		let key = Key::generate(Algorithm::RS256, None).unwrap();
+		for field in ["dp", "dq", "qi"] {
+			let mut json = serde_json::to_value(&key).unwrap();
+			json[field] = serde_json::json!("AQ");
+			let invalid: Key = serde_json::from_value(json).unwrap();
+			assert!(
+				invalid.sign(&create_test_claims()).is_err(),
+				"{field} was silently recomputed"
+			);
+		}
+	}
+
+	#[test]
 	fn test_rsa_pkcs1_asymmetric_algorithms() {
 		let key_rs256 = Key::generate(Algorithm::RS256, Some(crate::KeyId::decode("test-id").unwrap()));
 		let key_rs384 = Key::generate(Algorithm::RS384, Some(crate::KeyId::decode("test-id").unwrap()));
@@ -1460,6 +1599,22 @@ mod tests {
 		for key in [key_es256, key_es384] {
 			test_asymmetric_key(key);
 		}
+	}
+
+	#[test]
+	fn ec_private_key_must_match_its_public_point() {
+		let other = Key::generate(Algorithm::ES256, None).unwrap();
+		let KeyMaterial::EC { d: other_d, .. } = &other.material else {
+			unreachable!("ES256 keys are EC");
+		};
+		let mut jwk = Key::generate(Algorithm::ES256, None).unwrap().export();
+		let KeyMaterial::EC { d, .. } = &mut jwk.material else {
+			unreachable!("ES256 keys are EC");
+		};
+		d.clone_from(other_d);
+
+		// Its tokens would verify under neither key's published half.
+		assert!(jwk.import().unwrap().sign(&create_test_claims()).is_err());
 	}
 
 	#[test]
@@ -1657,55 +1812,6 @@ mod tests {
 		}
 	}
 
-	// Tests that Rust can load keys generated by the JS @moq/auth package
-	// and verify tokens signed by JS.
-	//
-	// Generated with: bun -e 'import { generate } from "./js/auth/src/generate.ts"; ...'
-	// See js/auth/src/interop.test.ts for the JS-side counterpart.
-
-	/// JS-generated HS256 key (from @moq/auth generate("HS256", "js-test-key"))
-	const JS_HS256_KEY: &str = r#"{"kty":"oct","alg":"HS256","k":"xm6xsSkfFqzPU3KfcbAcF2_h0OkStxQ_nNqVPYl0ync","kid":"js-test-key","key_ops":["sign","verify"],"guest":[],"guest_sub":[],"guest_pub":[]}"#;
-
-	/// JS-generated HS256 token (from @moq/auth sign(key, {root:"live", publish:["camera1"], subscribe:["camera1","camera2"]}))
-	const JS_HS256_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImpzLXRlc3Qta2V5In0.eyJyb290IjoibGl2ZSIsInB1Ymxpc2giOlsiY2FtZXJhMSJdLCJzdWJzY3JpYmUiOlsiY2FtZXJhMSIsImNhbWVyYTIiXSwiaWF0IjoxNzc1MTc2NzU0fQ.DxrRkpYDd7Cc215qstY4RfnB7hRvc8RG61YWO4UwyWg";
-
-	/// A token @moq/token minted before patterns, with `put` and `get` prefix lists.
-	const JS_HS256_LEGACY_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImpzLXRlc3Qta2V5In0.eyJyb290IjoibGl2ZSIsInB1dCI6WyJjYW1lcmExIl0sImdldCI6WyJjYW1lcmExIiwiY2FtZXJhMiJdLCJpYXQiOjE3NzUxNzY3NTR9.tHNQtHh_HCIKxXOexDCM7AkjqWzbULLZzjEckfOGRfY";
-
-	/// JS-generated EdDSA private key (from @moq/auth generate("EdDSA", "js-eddsa-key"))
-	const JS_EDDSA_PRIVATE_KEY: &str = r#"{"kty":"OKP","alg":"EdDSA","crv":"Ed25519","x":"UiU9fT_SdBBpkFtJPRCY0gX1jK_Dr9syYLFuEz4QUM4","d":"lm-L_PV3ksuQ-KrFBgFMDJqAZC3_Z6Z5UC4ZQY5OoDQ","kid":"js-eddsa-key","key_ops":["sign","verify"],"guest":[],"guest_sub":[],"guest_pub":[]}"#;
-
-	/// JS-generated EdDSA public key (from @moq/auth toPublicKey(key))
-	const JS_EDDSA_PUBLIC_KEY: &str = r#"{"kty":"OKP","alg":"EdDSA","crv":"Ed25519","x":"UiU9fT_SdBBpkFtJPRCY0gX1jK_Dr9syYLFuEz4QUM4","kid":"js-eddsa-key","guest":[],"guest_sub":[],"guest_pub":[],"key_ops":["verify"]}"#;
-
-	/// JS-generated EdDSA token (from @moq/auth sign(key, {root:"stream", publish:["video/**"]}))
-	const JS_EDDSA_TOKEN: &str = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsImtpZCI6ImpzLWVkZHNhLWtleSJ9.eyJyb290Ijoic3RyZWFtIiwicHVibGlzaCI6WyJ2aWRlby8qKiJdLCJpYXQiOjE3NzUxNzY3NTZ9.Vq00rznemlwxsGLdAR8EJs1J8cgXhaiuEiCysmCxnWbDemIFxS6kTNv3kp6LKnokp-mpHiRpO24Nv7b47jcIAQ";
-
-	#[test]
-	fn test_js_hs256_key_load() {
-		let key = Key::from_str(JS_HS256_KEY).unwrap();
-		assert_eq!(key.algorithm, Algorithm::HS256);
-		assert_eq!(key.kid, Some(crate::KeyId::decode("js-test-key").unwrap()));
-	}
-
-	#[test]
-	fn test_js_hs256_token_verify() {
-		let key = Key::from_str(JS_HS256_KEY).unwrap();
-		let claims = key.verify(JS_HS256_TOKEN).unwrap();
-		assert_eq!(claims.root, "live");
-		assert_eq!(claims.publish, patterns(&["camera1"]).into());
-		assert_eq!(claims.subscribe, patterns(&["camera1", "camera2"]).into());
-	}
-
-	#[test]
-	fn test_js_legacy_prefix_token_verifies_as_subtrees() {
-		let key = Key::from_str(JS_HS256_KEY).unwrap();
-		let claims = key.verify(JS_HS256_LEGACY_TOKEN).unwrap();
-		assert_eq!(claims.root, "live");
-		assert_eq!(claims.publish, patterns(&["camera1/**"]).into());
-		assert_eq!(claims.subscribe, patterns(&["camera1/**", "camera2/**"]).into());
-	}
-
 	#[test]
 	fn test_legacy_scoped_key_signs_within_its_prefixes() {
 		// A key minted by moq-token-cli with `--root demo --put room`.
@@ -1715,12 +1821,12 @@ mod tests {
 
 		let inside = Claims {
 			root: "demo/room".into(),
-			publish: patterns(&["alice"]).into(),
+			publish: patterns(&["alice"]),
 			..Default::default()
 		};
 		let outside = Claims {
 			root: "demo".into(),
-			publish: patterns(&["lobby/**"]).into(),
+			publish: patterns(&["lobby/**"]),
 			..Default::default()
 		};
 		assert!(key.verify(&key.sign(&inside).unwrap()).is_ok());
@@ -1735,67 +1841,10 @@ mod tests {
 	}
 
 	#[test]
-	fn test_js_hs256_sign_and_roundtrip() {
-		let key = Key::from_str(JS_HS256_KEY).unwrap();
-		let claims = Claims {
-			root: "rust-test".to_string(),
-			publish: patterns(&["pub1/**"]).into(),
-			subscribe: patterns(&["sub1/**"]).into(),
-			..Default::default()
-		};
-		let token = key.sign(&claims).unwrap();
-		let verified = key.verify(&token).unwrap();
-		assert_eq!(verified.root, "rust-test");
-		assert_eq!(verified.publish, patterns(&["pub1/**"]).into());
-	}
-
-	#[test]
-	fn test_js_eddsa_key_load() {
-		let private_key = Key::from_str(JS_EDDSA_PRIVATE_KEY).unwrap();
-		assert_eq!(private_key.algorithm, Algorithm::EdDSA);
-		assert!(matches!(private_key.material, KeyMaterial::OKP { .. }));
-
-		let public_key = Key::from_str(JS_EDDSA_PUBLIC_KEY).unwrap();
-		assert_eq!(public_key.algorithm, Algorithm::EdDSA);
-	}
-
-	#[test]
-	fn test_js_eddsa_token_verify_with_private_key() {
-		let key = Key::from_str(JS_EDDSA_PRIVATE_KEY).unwrap();
-		let claims = key.verify(JS_EDDSA_TOKEN).unwrap();
-		assert_eq!(claims.root, "stream");
-		assert_eq!(claims.publish, patterns(&["video/**"]).into());
-	}
-
-	#[test]
-	fn test_js_eddsa_token_verify_with_public_key() {
-		let key = Key::from_str(JS_EDDSA_PUBLIC_KEY).unwrap();
-		let claims = key.verify(JS_EDDSA_TOKEN).unwrap();
-		assert_eq!(claims.root, "stream");
-		assert_eq!(claims.publish, patterns(&["video/**"]).into());
-	}
-
-	#[test]
-	fn test_js_token_wrong_key_fails() {
-		// Generate a different HS256 key
-		let wrong_key = Key::generate(Algorithm::HS256, None).unwrap();
-		let result = wrong_key.verify(JS_HS256_TOKEN);
-		assert!(result.is_err());
-	}
-
-	#[test]
-	fn test_js_eddsa_token_wrong_key_fails() {
-		// Try verifying EdDSA token with the HS256 key
-		let wrong_key = Key::from_str(JS_HS256_KEY).unwrap();
-		let result = wrong_key.verify(JS_EDDSA_TOKEN);
-		assert!(result.is_err());
-	}
-
-	#[test]
 	fn test_file_io_base64url() {
 		let key = create_test_key();
-		let temp_dir = std::env::temp_dir();
-		let temp_path = temp_dir.join("test_jwk.key");
+		let temp_dir = tempfile::tempdir().unwrap();
+		let temp_path = temp_dir.path().join("test_jwk.key");
 
 		// Write key to file as base64url
 		key.to_file(&temp_path).unwrap();
@@ -1832,16 +1881,13 @@ mod tests {
 		} else {
 			panic!("Expected both keys to be OCT variant");
 		}
-
-		// Clean up
-		std::fs::remove_file(temp_path).ok();
 	}
 
 	#[test]
 	fn test_file_io_raw_json() {
 		let key = create_test_key();
-		let temp_dir = std::env::temp_dir();
-		let temp_path = temp_dir.join("test_jwk_raw_json.key");
+		let temp_dir = tempfile::tempdir().unwrap();
+		let temp_path = temp_dir.path().join("test_jwk_raw_json.key");
 
 		// Write key as raw JSON (backwards compat format)
 		let json = serde_json::to_string(&key).unwrap();
@@ -1867,9 +1913,6 @@ mod tests {
 		} else {
 			panic!("Expected both keys to be OCT variant");
 		}
-
-		// Clean up
-		std::fs::remove_file(temp_path).ok();
 	}
 
 	#[cfg(unix)]
@@ -1878,8 +1921,8 @@ mod tests {
 		use std::os::unix::fs::PermissionsExt;
 
 		fn temp_path(name: &str) -> std::path::PathBuf {
-			let unique = SystemTime::now()
-				.duration_since(SystemTime::UNIX_EPOCH)
+			let unique = kio::clock::wall()
+				.checked_duration_since(Wall::UNIX_EPOCH)
 				.unwrap()
 				.as_nanos();
 			std::env::temp_dir().join(format!("test_perms_{name}_{unique}.jwk"))

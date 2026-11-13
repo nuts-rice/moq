@@ -5,9 +5,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use base64::Engine;
-use hang::moq_net;
-use moq_clock::Instant;
-use moq_clock::timeout_at;
+use kio::clock::Instant;
+use kio::clock::timeout_at;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::args::MoqSide;
@@ -45,7 +44,7 @@ struct Frame {
 /// Fetch the group `args` names from the broadcast `--broadcast` names and write it to stdout.
 pub async fn run(moq: MoqSide, args: Args, net: crate::Net) -> anyhow::Result<()> {
 	let mut stdout = tokio::io::stdout();
-	fetch(&moq, &args, &net, Instant::now() + TIMEOUT, &mut stdout).await
+	fetch(&moq, &args, &net, Instant::now().saturating_add(TIMEOUT), &mut stdout).await
 }
 
 async fn fetch(
@@ -119,9 +118,11 @@ async fn fetch_from<C>(
 		// is still in flight right after connecting.
 		let broadcast = origin
 			.consume()
-			.routed_broadcast(path)
+			.follow(path, None)?
+			.available()
 			.await
-			.with_context(|| format!("broadcast `{}` not found", crate::display_name(path)))?;
+			.with_context(|| format!("broadcast `{}` not found", crate::display_name(path)))?
+			.context("went offline before serving")?;
 		let track = broadcast.track(&args.track)?;
 		let mut group = moq_relay::fetch_group(&track, args.group)
 			.await
@@ -164,11 +165,13 @@ async fn fetch_from<C>(
 mod tests {
 	use super::*;
 	use crate::args::{Command, Invocation};
-	use crate::test_env::EnvGuard;
 
-	/// A millisecond track: the frames written here carry timestamps.
+	/// A millisecond track: the frames written here carry timestamps. It sets no publisher max
+	/// age, so a fetch still reaches its superseded groups.
 	fn timed() -> moq_net::track::Info {
-		moq_net::track::Info::default().with_timescale(moq_net::Timescale::MILLI)
+		moq_net::track::Info::default()
+			.with_timescale(moq_net::Timescale::MILLI)
+			.with_max_age(None)
 	}
 
 	/// The frames of each finished group on the `data` track.
@@ -183,7 +186,7 @@ mod tests {
 	struct Fixture {
 		origin: moq_net::origin::Producer,
 		_keep: (
-			moq_net::broadcast::Producer,
+			moq_net::origin::Route,
 			Vec<moq_net::track::Producer>,
 			moq_net::group::Producer,
 		),
@@ -192,10 +195,11 @@ mod tests {
 	impl Fixture {
 		async fn new() -> Self {
 			let origin = moq_tokio::origin::spawn();
-			let broadcast = origin.create_broadcast("demo").expect("broadcast");
-			broadcast.announce(Default::default()).expect("announce");
+			let broadcast = origin
+				.route("demo", moq_net::origin::RouteOptions::default())
+				.expect("broadcast");
 
-			let data = broadcast.create_track("data", timed()).expect("data track");
+			let data = broadcast.broadcast().create_track("data", timed()).expect("data track");
 			for sequence in 0..3 {
 				let mut group = data.append_group().expect("group");
 				for frame in frames(sequence) {
@@ -203,8 +207,11 @@ mod tests {
 				}
 				group.finish().expect("finish");
 			}
-			let empty = broadcast.create_track("empty", timed()).expect("empty track");
-			let live = broadcast.create_track("live", timed()).expect("live track");
+			let empty = broadcast
+				.broadcast()
+				.create_track("empty", timed())
+				.expect("empty track");
+			let live = broadcast.broadcast().create_track("live", timed()).expect("live track");
 			let mut open = live.append_group().expect("open group");
 			open.write_frame(moq_net::Timestamp::ZERO, b"first".as_ref())
 				.expect("frame");
@@ -222,7 +229,7 @@ mod tests {
 				Request {
 					args: &args,
 					path: "demo",
-					deadline: Instant::now() + timeout,
+					deadline: Instant::now().saturating_add(timeout),
 				},
 				std::future::ready(Ok((self.origin.clone(), ()))),
 				&mut out,
@@ -241,13 +248,13 @@ mod tests {
 		/// Kept so the published broadcast, its tracks, and the open group stay live.
 		_publisher: (moq_tokio::Connection, Fixture),
 		/// Kept so the relay's hidden broadcast and its track stay live.
-		_hidden: (moq_net::broadcast::Producer, moq_net::track::Producer),
+		_hidden: (moq_net::origin::Route, moq_net::track::Producer),
 	}
 
 	impl NetworkFixture {
 		/// Publish [`Fixture`]'s `demo` through a relay that also holds `.hidden`.
 		async fn new() -> Self {
-			let _ = moq_tokio::crypto::install_default();
+			moq_tokio::crypto::install_default().unwrap();
 			let fixture = moq_relay::test_relay().await.expect("test relay");
 			// A dot-prefixed broadcast on the relay itself, like its `.stats`, which
 			// announce listings hide unless asked for by name.
@@ -255,10 +262,9 @@ mod tests {
 				.relay
 				.cluster()
 				.origin
-				.create_broadcast(".hidden")
+				.route(".hidden", moq_net::origin::RouteOptions::default())
 				.expect("hidden broadcast");
-			hidden.announce(Default::default()).expect("announce hidden");
-			let secret = hidden.create_track("data", timed()).expect("hidden track");
+			let secret = hidden.broadcast().create_track("data", timed()).expect("hidden track");
 			let mut group = secret.append_group().expect("group");
 			group
 				.write_frame(moq_net::Timestamp::ZERO, b"secret".as_ref())
@@ -302,7 +308,7 @@ mod tests {
 		async fn fetch(&self, broadcast: &str, args: &[&str], timeout: Duration) -> (anyhow::Result<()>, Vec<u8>) {
 			let (moq, args) = parse(&self.connect, broadcast, args);
 			let mut out = Vec::new();
-			let result = super::fetch(&moq, &args, &net(), Instant::now() + timeout, &mut out).await;
+			let result = super::fetch(&moq, &args, &net(), Instant::now().saturating_add(timeout), &mut out).await;
 			(result, out)
 		}
 
@@ -335,8 +341,6 @@ mod tests {
 	fn net() -> crate::Net {
 		crate::Net {
 			quic: Default::default(),
-			#[cfg(feature = "iroh")]
-			iroh: None,
 		}
 	}
 
@@ -345,7 +349,9 @@ mod tests {
 	/// A known sequence prints its frames back to back, the same bytes as `/fetch`.
 	#[tokio::test(start_paused = true)]
 	async fn a_sequence_prints_its_exact_bytes() {
-		let _env = EnvGuard::clear(ENV);
+		if !test_env::Env::without(ENV).isolate() {
+			return;
+		}
 		let fixture = Fixture::new().await;
 
 		let (result, out) = fixture.fetch(&["data", "--group", "1"], TIMEOUT).await;
@@ -356,7 +362,9 @@ mod tests {
 	/// No `--group` reads the newest group, as `/fetch` does by default.
 	#[tokio::test(start_paused = true)]
 	async fn the_default_is_the_newest_group() {
-		let _env = EnvGuard::clear(ENV);
+		if !test_env::Env::without(ENV).isolate() {
+			return;
+		}
 		let fixture = Fixture::new().await;
 
 		let (result, out) = fixture.fetch(&["data"], TIMEOUT).await;
@@ -368,7 +376,9 @@ mod tests {
 	/// `/fetch` serves it: the relay's announce scoping is what hides it.
 	#[tokio::test]
 	async fn a_hidden_broadcast_is_fetched_by_name() {
-		let _env = EnvGuard::clear(ENV);
+		if !test_env::Env::without(ENV).isolate() {
+			return;
+		}
 		let fixture = NetworkFixture::new().await;
 
 		let (result, out) = fixture.fetch(".hidden", &["data"], Duration::from_secs(5)).await;
@@ -380,7 +390,9 @@ mod tests {
 	/// answers 404 rather than starting a body.
 	#[tokio::test(start_paused = true)]
 	async fn a_missing_sequence_fails() {
-		let _env = EnvGuard::clear(ENV);
+		if !test_env::Env::without(ENV).isolate() {
+			return;
+		}
 		let fixture = Fixture::new().await;
 
 		let (result, out) = fixture.fetch(&["data", "--group", "99"], TIMEOUT).await;
@@ -392,7 +404,9 @@ mod tests {
 	/// A track with no group never resolves "newest", so the deadline ends it.
 	#[tokio::test(start_paused = true)]
 	async fn a_lookup_times_out() {
-		let _env = EnvGuard::clear(ENV);
+		if !test_env::Env::without(ENV).isolate() {
+			return;
+		}
 		let fixture = Fixture::new().await;
 
 		let (result, out) = fixture.fetch(&["empty"], TIMEOUT).await;
@@ -405,7 +419,9 @@ mod tests {
 	/// that did arrive.
 	#[tokio::test(start_paused = true)]
 	async fn a_frame_read_times_out() {
-		let _env = EnvGuard::clear(ENV);
+		if !test_env::Env::without(ENV).isolate() {
+			return;
+		}
 		let fixture = Fixture::new().await;
 
 		let (result, out) = fixture.fetch(&["live", "--group", "0"], TIMEOUT).await;
@@ -417,7 +433,9 @@ mod tests {
 	/// Discovery and reads share the deadline; setup cannot grant a fresh budget.
 	#[tokio::test(start_paused = true)]
 	async fn setup_and_reads_share_one_deadline() {
-		let _env = EnvGuard::clear(ENV);
+		if !test_env::Env::without(ENV).isolate() {
+			return;
+		}
 		let fixture = Fixture::new().await;
 		let (_, args) = parse(&[], "demo", &["live", "--group", "0"]);
 		let started = Instant::now();
@@ -426,7 +444,7 @@ mod tests {
 			Request {
 				args: &args,
 				path: "demo",
-				deadline: started + TIMEOUT,
+				deadline: started.saturating_add(TIMEOUT),
 			},
 			async {
 				// Advance simulated discovery time before handing back the ready origin.
@@ -444,14 +462,16 @@ mod tests {
 	/// A setup that never establishes is bounded by that same deadline.
 	#[tokio::test(start_paused = true)]
 	async fn setup_is_bounded() {
-		let _env = EnvGuard::clear(ENV);
+		if !test_env::Env::without(ENV).isolate() {
+			return;
+		}
 		let (_, args) = parse(&[], "demo", &["data"]);
 		let started = Instant::now();
 		let result = fetch_from::<()>(
 			Request {
 				args: &args,
 				path: "demo",
-				deadline: started + TIMEOUT,
+				deadline: started.saturating_add(TIMEOUT),
 			},
 			std::future::pending(),
 			&mut Vec::new(),
@@ -464,7 +484,9 @@ mod tests {
 	/// The real HTTP endpoint agrees with the deterministic operation tests.
 	#[tokio::test]
 	async fn real_relay_matches_http_fetch() {
-		let _env = EnvGuard::clear(ENV);
+		if !test_env::Env::without(ENV).isolate() {
+			return;
+		}
 		for (query, expected) in [
 			("?group=1", (200, frames(1).concat())),
 			("", (200, frames(2).concat())),
@@ -478,7 +500,9 @@ mod tests {
 	/// Each `--json` line is the whole record and decodes to the frame's bytes.
 	#[tokio::test(start_paused = true)]
 	async fn json_lines_decode_to_the_frames() {
-		let _env = EnvGuard::clear(ENV);
+		if !test_env::Env::without(ENV).isolate() {
+			return;
+		}
 		let fixture = Fixture::new().await;
 
 		let (result, out) = fixture.fetch(&["data", "--group", "1", "--json"], TIMEOUT).await;
@@ -510,7 +534,9 @@ mod tests {
 	/// A listener or cluster flag is refused rather than silently never served.
 	#[test]
 	fn only_the_dial_is_accepted() {
-		let _env = EnvGuard::clear(ENV);
+		if !test_env::Env::without(ENV).isolate() {
+			return;
+		}
 		let cli = Invocation::try_parse_from([
 			"moq",
 			"--connect",

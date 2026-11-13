@@ -1,7 +1,7 @@
 /** A ponyfill for the WHATWG [`WebSocketStream`][spec] API.
  *
- * `WebSocketStream` exposes a WebSocket as a pair of streams —
- * `{ readable, writable }` — with backpressure on the writable. It currently
+ * `WebSocketStream` exposes a WebSocket as a pair of streams -
+ * `{ readable, writable }` - with backpressure on the writable. It currently
  * ships only in Chromium. This module wraps a plain `WebSocket` to present the
  * same surface (`opened`, `closed`, `close()`), applying write backpressure by
  * polling `bufferedAmount` against a configurable high-water mark.
@@ -13,40 +13,51 @@
  * [spec]: https://github.com/ricea/websocketstream-explainer
  */
 
-import { Milli, Nano, sleep } from "@moq/clock";
+import { Duration, sleep } from "@moq/clock";
 
 /** The data yielded by the readable / accepted by the writable. */
 export type WebSocketStreamData = Uint8Array | string;
 
 /** Resolved value of {@link WebSocketStreamLike.opened}. */
 export interface WebSocketStreamOpenEvent {
+	/** The messages the peer sends. */
 	readable: ReadableStream<WebSocketStreamData>;
+	/** The messages to send to the peer. */
 	writable: WritableStream<WebSocketStreamData>;
+	/** The extensions the server selected. */
 	extensions: string;
+	/** The subprotocol the server selected, or empty. */
 	protocol: string;
 }
 
 /** Resolved value of {@link WebSocketStreamLike.closed}. */
 export interface WebSocketStreamCloseEvent {
+	/** The close code the connection ended with. */
 	closeCode: number;
+	/** The close reason the connection ended with. */
 	reason: string;
 }
 
 /** Argument to {@link WebSocketStreamLike.close}. */
 export interface WebSocketStreamCloseInfo {
+	/** The close code to send. */
 	closeCode?: number;
+	/** The close reason to send. */
 	reason?: string;
 }
 
 /** The common shape implemented by both the native API and this ponyfill. */
 export interface WebSocketStreamLike {
+	/** The URL the socket connected to. */
 	readonly url: string;
+	/** Resolves with the streams once the handshake completes. */
 	readonly opened: Promise<WebSocketStreamOpenEvent>;
+	/** Resolves once the connection closes. */
 	readonly closed: Promise<WebSocketStreamCloseEvent>;
+	/** Close the connection, with an optional code and reason. */
 	close(closeInfo?: WebSocketStreamCloseInfo): void;
-	/** Ponyfill-only: resize the write-backpressure high-water mark at runtime
-	 *  (see {@link WebSocketStream.setHighWaterMark}). Absent on the native API,
-	 *  which sizes its own send buffer — callers should treat it as optional. */
+	/** Ponyfill-only: resize the write-backpressure high-water mark at runtime.
+	 *  Absent on the native API, which sizes its own send buffer - callers should treat it as optional. */
 	setHighWaterMark?(bytes: number): void;
 }
 
@@ -77,19 +88,30 @@ type NativeWebSocketStreamConstructor = new (
 /** The slice of the `WebSocket` API this ponyfill relies on. Both the browser
  *  `WebSocket` and Node's `ws` satisfy it. */
 export interface WebSocketLike {
+	/** How binary messages arrive; set to `arraybuffer`. */
 	binaryType: string;
 	/** Absent on some server-side implementations; only used to report
 	 *  {@link WebSocketStreamLike.url} for an adopted socket. */
 	readonly url?: string;
+	/** Bytes queued to send but not yet sent. */
 	readonly bufferedAmount: number;
+	/** The connection state, as the `WebSocket` constants number it. */
 	readonly readyState: number;
+	/** The subprotocol the server selected, or empty. */
 	readonly protocol: string;
+	/** The extensions the server selected. */
 	readonly extensions: string;
+	/** Queue a message to send. */
 	send(data: string | ArrayBufferLike | ArrayBufferView): void;
+	/** Close the connection, with an optional code and reason. */
 	close(code?: number, reason?: string): void;
+	/** Called once the handshake completes. */
 	onopen: ((ev: unknown) => void) | null;
+	/** Called with each message received. */
 	onmessage: ((ev: { data: unknown }) => void) | null;
+	/** Called when the connection fails. */
 	onerror: ((ev: unknown) => void) | null;
+	/** Called once the connection closes. */
 	onclose: ((ev: { code?: number; reason?: string }) => void) | null;
 }
 
@@ -109,8 +131,8 @@ export interface WebSocketStreamOptions {
 	highWaterMark?: number;
 }
 
-const CONNECTING = 0;
 const OPEN = 1;
+const CLOSED = 3;
 const DEFAULT_HIGH_WATER_MARK = 64 * 1024;
 
 /** WebSocket close codes outside 1000 / 3000–4999 are rejected by `close()`. */
@@ -121,8 +143,8 @@ function validCloseCode(code: number | undefined): code is number {
 /** Resolve once `bufferedAmount` drains below the mark (write backpressure).
  *  The mark is read live via `highWaterMark()` on every check, so a runtime
  *  resize (see {@link WebSocketStream.setHighWaterMark}) takes effect mid-drain.
- *  Returns `undefined` synchronously when there's already room — no microtask
- *  on the hot path, so `writer.ready` stays resolved when the socket is keeping up. */
+ *  Returns `undefined` synchronously when there's already room - no microtask
+ *  on the hot path. */
 function drain(ws: WebSocketLike, highWaterMark: () => number): Promise<void> | undefined {
 	if (ws.bufferedAmount <= highWaterMark()) return undefined;
 	return (async () => {
@@ -130,9 +152,14 @@ function drain(ws: WebSocketLike, highWaterMark: () => number): Promise<void> | 
 			// The socket closed mid-write: reject so the failure propagates rather
 			// than resolving the write as if it had succeeded.
 			if (ws.readyState > OPEN) throw new Error("WebSocket is closing");
-			await sleep(Nano.fromMilli(Milli(10)));
+			await sleep(Duration.millis(10));
 		}
 	})();
+}
+
+/** The bytes `chunk` adds to `bufferedAmount`. */
+function byteLength(chunk: WebSocketStreamData): number {
+	return typeof chunk === "string" ? new TextEncoder().encode(chunk).byteLength : chunk.byteLength;
 }
 
 /** A `WebSocketStream` implemented over a plain `WebSocket`. */
@@ -168,7 +195,14 @@ export class WebSocketStream implements WebSocketStreamLike {
 		// Avoid unhandled-rejection noise if a caller only awaits `closed`.
 		this.opened.catch(() => {});
 
+		// The socket's lifecycle: once `closed`, every half has been settled with `error`.
+		let state: { kind: "live" } | { kind: "closed"; error: Error } = { kind: "live" };
+		// Removes the abort listener once the socket ends, so a long-lived signal
+		// doesn't keep every closed socket reachable.
+		const cleanup = new AbortController();
+
 		let controller: ReadableStreamDefaultController<WebSocketStreamData> | undefined;
+		let writer: WritableStreamDefaultController | undefined;
 		const readable = new ReadableStream<WebSocketStreamData>({
 			start: (c) => {
 				controller = c;
@@ -176,16 +210,42 @@ export class WebSocketStream implements WebSocketStreamLike {
 			cancel: () => ws.close(),
 		});
 
-		const writable = new WritableStream<WebSocketStreamData>({
-			write: (chunk) => {
-				ws.send(chunk);
-				return drain(ws, () => this.#highWaterMark);
+		// Bytes written to the writable but not yet handed to the socket, and each queued
+		// chunk's size as measured on entry, since a resizable buffer can change it later.
+		let queued = 0;
+		const sizes: number[] = [];
+		const writable = new WritableStream<WebSocketStreamData>(
+			{
+				start: (c) => {
+					writer = c;
+				},
+				write: (chunk) => {
+					queued -= sizes.shift() ?? 0;
+					// A closed socket discards sends while growing `bufferedAmount`.
+					if (state.kind === "closed") throw state.error;
+					ws.send(chunk);
+					return drain(ws, () => this.#highWaterMark);
+				},
+				// A WebSocket has no half-close, so closing/aborting the writable closes
+				// the whole socket. Without this, `writer.close()` would leave it open.
+				close: () => ws.close(),
+				abort: () => ws.close(),
 			},
-			// A WebSocket has no half-close, so closing/aborting the writable closes
-			// the whole socket. Without this, `writer.close()` would leave it open.
-			close: () => ws.close(),
-			abort: () => ws.close(),
-		});
+			{
+				// A chunk counts only when it takes the backlog past the mark, so `desiredSize`
+				// reaches 0 only once the socket is behind. Counting every chunk would report
+				// backpressure for each write in flight, however small the backlog.
+				highWaterMark: 1,
+				// The DOM typing admits `undefined`, which a WebSocket can't send.
+				size: (chunk) => {
+					if (chunk === undefined) throw new TypeError("WebSocketStream cannot send undefined");
+					const size = byteLength(chunk);
+					sizes.push(size);
+					queued += size;
+					return ws.bufferedAmount + queued > this.#highWaterMark ? 1 : 0;
+				},
+			},
+		);
 
 		ws.onopen = () => {
 			opened.resolve({ readable, writable, extensions: ws.extensions, protocol: ws.protocol });
@@ -201,49 +261,54 @@ export class WebSocketStream implements WebSocketStreamLike {
 				controller?.enqueue(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
 			}
 		};
-		ws.onerror = () => {
-			const err = new Error("WebSocket connection error");
-			opened.reject(err);
-			try {
-				controller?.error(err);
-			} catch {}
+		// Settle every half at once. `error` errors the readable; a clean close ends it.
+		// `closed` resolves only from a close event, which follows any error.
+		const finish = (error: Error, clean: boolean, close?: WebSocketStreamCloseEvent) => {
+			const first = state.kind === "live";
+			if (first) {
+				state = { kind: "closed", error };
+				cleanup.abort();
+				opened.reject(error);
+				try {
+					if (clean) controller?.close();
+					else controller?.error(error);
+				} catch {}
+			}
+			// `closed` settles before the writable errors, so a consumer racing both
+			// sees the close code and reason first.
+			if (close) closed.resolve(close);
+			if (first) writer?.error(error);
 		};
+
+		ws.onerror = () => finish(new Error("WebSocket connection error"), false);
 		ws.onclose = (event) => {
-			opened.reject(new Error("WebSocket closed before opening"));
-			try {
-				controller?.close();
-			} catch {}
-			closed.resolve({ closeCode: event.code ?? 1006, reason: event.reason ?? "" });
+			finish(new Error("WebSocket closed"), true, { closeCode: event.code ?? 1006, reason: event.reason ?? "" });
 		};
 
 		// An adopted socket may already have finished (or missed) its handshake, in
-		// which case `onopen`/`onclose` will never fire — settle from readyState.
-		if (ws.readyState !== CONNECTING) {
-			if (ws.readyState === OPEN) {
-				opened.resolve({ readable, writable, extensions: ws.extensions, protocol: ws.protocol });
-			} else {
-				opened.reject(new Error("WebSocket is already closed"));
-				try {
-					controller?.close();
-				} catch {}
-				closed.resolve({ closeCode: 1006, reason: "" });
-			}
+		// which case `onopen`/`onclose` will never fire - settle from readyState.
+		// A CLOSING socket still fires `onclose`, which carries the real code and reason.
+		if (ws.readyState === OPEN) {
+			opened.resolve({ readable, writable, extensions: ws.extensions, protocol: ws.protocol });
+		} else if (ws.readyState === CLOSED) {
+			finish(new Error("WebSocket is already closed"), true, { closeCode: 1006, reason: "" });
 		}
 
 		const { signal } = options;
 		if (signal) {
 			if (signal.aborted) ws.close();
-			else signal.addEventListener("abort", () => ws.close(), { once: true });
+			else if (state.kind === "live")
+				signal.addEventListener("abort", () => ws.close(), { signal: cleanup.signal });
 		}
 	}
 
-	/** Wrap a socket that already exists — typically one a server accepted from an
+	/** Wrap a socket that already exists - typically one a server accepted from an
 	 *  HTTP upgrade (`Deno.upgradeWebSocket`, `ws`, ...), where there is no URL to
 	 *  dial and the handshake (including subprotocol selection) is already done.
 	 *
 	 *  Ownership transfers: this overwrites the socket's `onopen`/`onmessage`/
 	 *  `onerror`/`onclose` handlers, so adopt it before anything else reads from
-	 *  it — messages delivered before adoption are dropped by the platform, not
+	 *  it - messages delivered before adoption are dropped by the platform, not
 	 *  buffered. A socket that is already open resolves {@link opened} without
 	 *  waiting for an `onopen` that has already fired (or was never going to).
 	 *

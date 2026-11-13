@@ -9,11 +9,12 @@
 
 #![cfg(feature = "_quic")]
 
-use std::net::{SocketAddr, TcpListener};
+#[cfg(not(target_os = "linux"))]
+use std::net::SocketAddr;
+use std::net::TcpListener;
 use std::time::Duration;
 
 use moq_relay::{Config, Relay};
-use moq_tokio::moq_net;
 
 /// A millisecond track: the frames written here carry timestamps.
 fn timed() -> moq_net::track::Info {
@@ -23,13 +24,22 @@ fn timed() -> moq_net::track::Info {
 const TIMEOUT: Duration = Duration::from_secs(10);
 
 fn certificate(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
-	let key = rcgen::KeyPair::generate().expect("keypair");
-	let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).expect("cert params");
+	let key = rind_rcgen::KeyPair::generate(&rcgen::PKCS_ECDSA_P256_SHA256).expect("keypair");
+	let params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+		.map(|mut params| {
+			params.serial_number = Some(1u64.into());
+			params
+		})
+		.expect("cert params");
 	let cert = params.self_signed(&key).expect("self-signed cert");
 	let cert_path = dir.join("cert.pem");
 	let key_path = dir.join("key.pem");
 	std::fs::write(&cert_path, cert.pem()).expect("write cert");
-	std::fs::write(&key_path, key.serialize_pem()).expect("write key");
+	std::fs::write(
+		&key_path,
+		pem::encode(&pem::Pem::new("PRIVATE KEY", key.to_pkcs8().secret_pkcs8_der())),
+	)
+	.expect("write key");
 	(cert_path, key_path)
 }
 
@@ -40,21 +50,23 @@ fn public_auth(config: &mut Config) {
 fn client() -> moq_tokio::Client {
 	let mut config = moq_tokio::connect::Config::default();
 	config.tls.insecure = Some(true);
-	config.once = Some(true);
 	config.bind = Some("127.0.0.1:0".parse().expect("parse bind"));
-	config.init(Default::default()).expect("client init")
+	config
+		.init(Default::default())
+		.expect("client init")
+		.with_reconnect(false)
 }
 
+#[cfg(not(target_os = "linux"))]
 async fn assert_owner_stopped(quic: SocketAddr, http: SocketAddr) {
 	assert!(
 		tokio::net::TcpStream::connect(http).await.is_err(),
 		"HTTP still accepted after the owner stopped"
 	);
-	// A closed UDP port never answers, so this only ends at the timeout. A live
-	// listener answers a loopback handshake well inside it, and on Linux the
-	// socket check before this is what proves the port closed.
+	// Without the Linux socket-inode proof, probe the listeners. A closed UDP
+	// port never answers, so this only ends at the timeout.
 	let url: url::Url = format!("https://{quic}/").parse().expect("parse url");
-	let after = tokio::time::timeout(
+	let after = kio::clock::timeout(
 		Duration::from_millis(500),
 		client().with_reconnect(false).connect(url).established(),
 	)
@@ -65,15 +77,17 @@ async fn assert_owner_stopped(quic: SocketAddr, http: SocketAddr) {
 	);
 }
 
-/// The socket inodes this process holds bound to `port`: every UDP socket, but
-/// only a TCP listener, since accepted connections are not the owner's to close.
+/// The socket inodes this process holds bound to `port` of type `kind`: every
+/// UDP socket, but only a TCP listener, since accepted connections are not the
+/// owner's to close. The type matters because UDP and TCP number ports
+/// separately: the test's own QUIC client can hold the HTTP port's number.
 ///
 /// Asked of this process's own descriptors, for two reasons. Rebinding the port
 /// races any concurrent process's ephemeral bind, which may take a freed port.
 /// And `/proc/net/udp` is served in chunks that skip entries while other
 /// processes churn sockets.
 #[cfg(target_os = "linux")]
-fn bound(port: u16) -> std::collections::HashSet<u64> {
+fn bound(kind: socket2::Type, port: u16) -> std::collections::HashSet<u64> {
 	use std::os::fd::FromRawFd;
 	use std::os::unix::fs::{FileTypeExt, MetadataExt};
 
@@ -98,8 +112,8 @@ fn bound(port: u16) -> std::collections::HashSet<u64> {
 		}
 		let socket = socket2::SockRef::from(&file);
 		let owned = match socket.r#type() {
-			Ok(socket2::Type::DGRAM) => true,
-			Ok(socket2::Type::STREAM) => socket.is_listener().unwrap_or(false),
+			Ok(socket2::Type::DGRAM) => kind == socket2::Type::DGRAM,
+			Ok(socket2::Type::STREAM) => kind == socket2::Type::STREAM && socket.is_listener().unwrap_or(false),
 			_ => false,
 		};
 		let on_port = socket
@@ -137,7 +151,7 @@ fn open_sockets() -> std::collections::HashSet<u64> {
 /// worker thread and listener goes through, as opposed to aborting the task.
 async fn stop(trigger: moq_relay::shutdown::Trigger, running: tokio::task::JoinHandle<anyhow::Result<()>>) {
 	trigger.start();
-	tokio::time::timeout(TIMEOUT, running)
+	kio::clock::timeout(TIMEOUT, running)
 		.await
 		.expect("run did not return after the shutdown trigger")
 		.expect("run panicked")
@@ -147,26 +161,25 @@ async fn stop(trigger: moq_relay::shutdown::Trigger, running: tokio::task::JoinH
 /// Load, mount a custom route, clone the origin, run the owner, prove QUIC
 /// plus HTTP, then stop it through the trigger and prove its sockets closed.
 async fn embed_and_stop(mut config: Config) {
-	let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+	let _ = rind_rustls::default_provider().unwrap().install_default();
 
 	// No drain window: the sessions are already gone by the time the owner
 	// stops, and the test should not wait out the default.
-	config.drain_timeout = Duration::ZERO;
-	let relay = Relay::load(config).await.expect("load relay");
+	config.drain_timeout = Some((Duration::ZERO).into());
+	let relay = Relay::load(config).await.expect("load relay").with_signals(false);
 	let quic = relay.quic_addr().expect("quic listener bound");
 	let http = relay.web_addrs().http.expect("http listener bound");
 	assert_eq!(
 		relay.config().quic.max_streams,
 		Some(moq_tokio::quic::DEFAULT_MAX_STREAMS)
 	);
-	assert_eq!(relay.cluster().id(), relay.cluster().origin.hop().id());
+	assert_eq!(relay.cluster().id(), relay.cluster().origin.hop().get());
 
 	// The application handles: in-process workers publish into the origin the
 	// QUIC sessions see, and the trigger stops the owner from any task. Both
 	// are cloned before `run` consumes the relay.
 	let origin = relay.cluster().origin.clone();
 	let trigger = relay.shutdown_trigger().clone();
-	let ready = relay.ready();
 	let web = relay
 		.web()
 		.routes()
@@ -176,6 +189,7 @@ async fn embed_and_stop(mut config: Config) {
 			axum::routing::post(|| async { ([("access-control-allow-origin", "https://trusted.example")], "private") }),
 		)
 		.route("/plain-post", axum::routing::post(|| async { "plain" }));
+	let ready = relay.ready();
 	let running = tokio::spawn(relay.with_web(web).run());
 	ready.wait().await.expect("relay ready");
 	assert!(!running.is_finished(), "the relay stopped while serving");
@@ -260,9 +274,13 @@ async fn embed_and_stop(mut config: Config) {
 		"authorization"
 	);
 
-	let broadcast = origin.create_broadcast("test").expect("create broadcast");
-	broadcast.announce(Default::default()).expect("announce");
-	let track = broadcast.create_track("video", timed()).expect("create track");
+	let broadcast = origin
+		.route("test", moq_net::origin::RouteOptions::default())
+		.expect("create broadcast");
+	let track = broadcast
+		.broadcast()
+		.create_track("video", timed())
+		.expect("create track");
 	let mut group = track.append_group().expect("append group");
 	group
 		.write_frame(moq_net::Timestamp::ZERO, b"hello".as_ref())
@@ -272,8 +290,8 @@ async fn embed_and_stop(mut config: Config) {
 	let url: url::Url = format!("https://{quic}/").parse().expect("parse url");
 	let subscriber_origin = moq_tokio::origin::spawn();
 	let consumer = subscriber_origin.consume();
-	let mut announced = consumer.announced();
-	let subscriber = tokio::time::timeout(
+	let mut announced = consumer.routes();
+	let subscriber = kio::clock::timeout(
 		TIMEOUT,
 		client()
 			.with_reconnect(false)
@@ -285,13 +303,13 @@ async fn embed_and_stop(mut config: Config) {
 	.expect("connect timeout")
 	.expect("connect failed");
 
-	let (update, active) = tokio::time::timeout(TIMEOUT, next_update(&mut announced))
+	let (update, active) = kio::clock::timeout(TIMEOUT, next_update(&mut announced))
 		.await
 		.expect("announcement timeout")
 		.expect("origin closed");
 	assert_eq!(update.prefix.as_str(), "test");
 	assert!(active, "expected announce, got retraction");
-	let announced = tokio::time::timeout(TIMEOUT, consumer.request_broadcast("test", None))
+	let announced = kio::clock::timeout(TIMEOUT, consumer.request("test", None))
 		.await
 		.expect("request timeout")
 		.expect("announced broadcast resolves");
@@ -301,12 +319,12 @@ async fn embed_and_stop(mut config: Config) {
 		.subscribe(None)
 		.await
 		.expect("subscribe");
-	let mut group = tokio::time::timeout(TIMEOUT, subscription.recv_group())
+	let mut group = kio::clock::timeout(TIMEOUT, subscription.recv_group())
 		.await
 		.expect("recv_group timeout")
 		.expect("recv_group failed")
 		.expect("track closed prematurely");
-	let frame = tokio::time::timeout(TIMEOUT, group.read_frame())
+	let frame = kio::clock::timeout(TIMEOUT, group.read_frame())
 		.await
 		.expect("read_frame timeout")
 		.expect("read_frame failed")
@@ -319,8 +337,8 @@ async fn embed_and_stop(mut config: Config) {
 
 	#[cfg(target_os = "linux")]
 	let owned = {
-		let quic_sockets = bound(quic.port());
-		let http_sockets = bound(http.port());
+		let quic_sockets = bound(socket2::Type::DGRAM, quic.port());
+		let http_sockets = bound(socket2::Type::STREAM, http.port());
 		assert!(!quic_sockets.is_empty(), "no QUIC socket found on {quic}");
 		assert!(!http_sockets.is_empty(), "no HTTP listener found on {http}");
 		&quic_sockets | &http_sockets
@@ -332,6 +350,9 @@ async fn embed_and_stop(mut config: Config) {
 	// owner's sockets are still open.
 	#[cfg(target_os = "linux")]
 	assert!(owned.is_disjoint(&open_sockets()), "the owner's sockets outlived `run`");
+	// A freed port can already belong to another test. Linux checks the owner's
+	// socket identities instead; probe only where that proof is unavailable.
+	#[cfg(not(target_os = "linux"))]
 	assert_owner_stopped(quic, http).await;
 }
 
@@ -394,19 +415,20 @@ async fn worker_tokio_custom_route_and_quic() {
 	let dir = tempfile::tempdir().expect("tempdir");
 	let (cert, key) = certificate(dir.path());
 	let mut config = http_and_quic(&cert, &key, "127.0.0.1:0".into());
-	config.runtime.workers = Some(2);
+	config.runtime.workers = moq_relay::runtime::Workers::Count(std::num::NonZeroU16::new(2).unwrap());
 	config.runtime.pin = false;
 	embed_and_stop(config).await;
 }
 
-/// io_uring workers. Off the default feature set; `just rs uring` and nightly
-/// `--all-features` compile it. Skips below the 6.12 floor unless MOQ_STRICT.
+/// io_uring workers. Off the default feature set; the Linux gate's test build,
+/// `just rs uring`, and nightly `--all-features` compile it. Skips below the
+/// 6.12 floor unless CI_STRICT.
 #[cfg(all(target_os = "linux", feature = "_uring"))]
 #[tokio::test]
 async fn uring_custom_route_and_quic() {
 	match moq_uring::Worker::new(Default::default()) {
 		Ok(_) => {}
-		Err(moq_uring::Error::Unsupported(reason)) if std::env::var_os("MOQ_STRICT").is_none() => {
+		Err(moq_uring::Error::Unsupported(reason)) if std::env::var_os("CI_STRICT").is_none() => {
 			eprintln!("skipping io_uring embed test: {reason}");
 			return;
 		}
@@ -416,25 +438,94 @@ async fn uring_custom_route_and_quic() {
 	let dir = tempfile::tempdir().expect("tempdir");
 	let (cert, key) = certificate(dir.path());
 	let mut config = http_and_quic(&cert, &key, "127.0.0.1:0".into());
-	config.runtime.workers = Some(2);
+	config.runtime.workers = moq_relay::runtime::Workers::Count(std::num::NonZeroU16::new(2).unwrap());
 	config.runtime.pin = false;
 	config.runtime.io_uring = true;
 	embed_and_stop(config).await;
 }
 
+/// The WebRTC media path on the QUIC port reaches the embedder's feed, whichever
+/// worker read it, and the feed's reply leaves from the QUIC port.
+async fn webrtc_feed(mut config: Config) {
+	let _ = rind_rustls::default_provider().unwrap().install_default();
+	config.drain_timeout = Some((Duration::ZERO).into());
+	let mut relay = Relay::load(config).await.expect("load relay").with_signals(false);
+	let quic = relay.quic_addr().expect("quic listener bound");
+	let feed = relay.webrtc().expect("tokio serves QUIC");
+	let trigger = relay.shutdown_trigger().clone();
+	let running = tokio::spawn(relay.run());
+
+	// Enough sources that a reuseport group's 4-tuple hash spreads them over every member.
+	let mut peers = Vec::new();
+	for i in 0..16u8 {
+		let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
+		peer.send_to(&[0x16, 0xfe, 0xfd, i], quic).await.expect("send DTLS");
+		peers.push(peer);
+	}
+	let mut seen = std::collections::HashSet::new();
+	kio::clock::timeout(TIMEOUT, async {
+		while seen.len() < peers.len() {
+			let datagram = feed.recv().await.expect("feed open");
+			assert_eq!(datagram.data[..3], [0x16, 0xfe, 0xfd]);
+			seen.insert(datagram.remote);
+		}
+	})
+	.await
+	.expect("every peer's datagram reached the feed");
+
+	let peer = &peers[0];
+	feed.send(&moq_tokio::quic::demux::Transmit {
+		destination: peer.local_addr().expect("peer addr"),
+		ecn: None,
+		contents: b"reply",
+		segment_size: None,
+		src_ip: None,
+	})
+	.await
+	.expect("send reply");
+	let mut buf = [0; 16];
+	let (len, from) = kio::clock::timeout(TIMEOUT, peer.recv_from(&mut buf))
+		.await
+		.expect("reply arrived")
+		.expect("recv reply");
+	assert_eq!(&buf[..len], b"reply");
+	assert_eq!(from.port(), quic.port());
+
+	stop(trigger, running).await;
+}
+
+#[tokio::test]
+async fn shared_tokio_webrtc_feed() {
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (cert, key) = certificate(dir.path());
+	webrtc_feed(http_and_quic(&cert, &key, "127.0.0.1:0".into())).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn worker_tokio_webrtc_feed() {
+	let dir = tempfile::tempdir().expect("tempdir");
+	let (cert, key) = certificate(dir.path());
+	let mut config = http_and_quic(&cert, &key, "127.0.0.1:0".into());
+	config.runtime.workers = moq_relay::runtime::Workers::Count(std::num::NonZeroU16::new(2).unwrap());
+	config.runtime.pin = false;
+	webrtc_feed(config).await;
+}
+
 /// An embedder-owned accept loop joins the relay's own /metrics exposition.
 #[tokio::test]
 async fn embedded_listener_health_reaches_metrics() {
+	moq_tokio::crypto::install_default().unwrap();
 	let dir = tempfile::tempdir().expect("tempdir");
 	let (cert, key) = certificate(dir.path());
 	let mut config = http_and_quic(&cert, &key, "127.0.0.1:0".into());
 	config.internal.listen = Some("127.0.0.1:0".parse().unwrap());
-	config.drain_timeout = Duration::ZERO;
-	let relay = Relay::load(config).await.expect("load relay");
+	config.drain_timeout = Some((Duration::ZERO).into());
+	let relay = Relay::load(config).await.expect("load relay").with_signals(false);
 	let internal = relay.internal().addr().expect("internal listener bound");
-	let ready = relay.ready();
 	let trigger = relay.shutdown_trigger().clone();
 	let health = moq_tokio::accept::Health::new("embedded");
+	let ready = relay.ready();
 	let running = tokio::spawn(relay.with_listeners([health]).run());
 	ready.wait().await.expect("relay ready");
 	let body = reqwest::get(format!("http://{internal}/metrics"))
@@ -466,32 +557,56 @@ struct EmbeddedConfig {
 /// A flattened relay merges its settings without resetting the embedder's flags.
 #[test]
 fn embedded_cli_merges_only_relay_settings() {
+	let dir = tempfile::tempdir().unwrap();
+	let path = dir.path().join("relay.toml");
+	std::fs::write(&path, "[cluster]\nmax_hops = 7\n[stats]\nenabled = false\n").unwrap();
 	let (mut parsed, cli) = EmbeddedConfig::parse_from_with_settings(&[
+		path.as_os_str(),
 		std::ffi::OsStr::new("--worker-name"),
 		std::ffi::OsStr::new("recorder"),
-		std::ffi::OsStr::new("--cluster-id"),
+		std::ffi::OsStr::new("--cluster-max-hops"),
 		std::ffi::OsStr::new("9"),
 	])
 	.expect("parse embedding CLI");
-	let file = toml::from_str::<toml::Value>("[cluster]\nid = 7\n").unwrap();
-	let source = moq_tokio::cli::FileSource {
-		path: std::path::Path::new("relay.toml"),
-		value: &file,
-	};
-	parsed
-		.relay
-		.merge_into(&cli, &usage_rs::config::EnvLayer::from_process(), Some(source))
-		.unwrap();
+	parsed.relay.merge(&cli).unwrap();
 	assert_eq!(parsed.worker_name.as_deref(), Some("recorder"));
-	assert_eq!(parsed.relay.cluster.id, Some(9));
+	assert_eq!(parsed.relay.cluster.max_hops, Some(9));
+	assert_eq!(parsed.relay.source("cluster.max_hops"), Some("--cluster-max-hops"));
+	assert!(!parsed.relay.stats.enabled);
+	assert!(parsed.relay.source("stats.enabled").unwrap().contains("enabled"));
+	// The explicit file value equals the runtime default but still has file provenance.
+	let (mut defaults, cli) = EmbeddedConfig::parse_from_with_settings(&[]).unwrap();
+	defaults.relay.merge(&cli).unwrap();
+	assert_eq!(defaults.relay.stats.enabled, parsed.relay.stats.enabled);
+	assert_ne!(
+		defaults.relay.source("stats.enabled"),
+		parsed.relay.source("stats.enabled")
+	);
+}
+
+/// A composed CLI refuses obsolete file keys before constructing a relay or initializing logging.
+#[test]
+fn embedded_loader_refuses_obsolete_file_settings() {
+	let dir = tempfile::tempdir().unwrap();
+	let path = dir.path().join("relay.toml");
+	std::fs::write(&path, "[server]\nbind = \"127.0.0.1:0\"\n").unwrap();
+	let (mut parsed, cli) = EmbeddedConfig::parse_from_with_settings(&[path.as_os_str()]).unwrap();
+	let error = parsed.relay.merge(&cli).unwrap_err();
+	assert!(error.to_string().contains("[server]"), "{error}");
+	assert!(error.to_string().contains("[listen]"), "{error}");
 }
 
 /// The next route and whether it is active.
-async fn next_update(announced: &mut moq_net::announce::Consumer) -> Option<(moq_net::announce::Announce, bool)> {
+async fn next_update(announced: &mut moq_net::origin::Routes) -> Option<(moq_net::announce::Announce, bool)> {
 	match announced.next().await? {
-		moq_net::announce::Event::Start(route)
-		| moq_net::announce::Event::Update(route)
-		| moq_net::announce::Event::Restart(route) => Some((route, true)),
-		moq_net::announce::Event::End(route) => Some((route, false)),
+		moq_net::origin::RouteEvent {
+			kind:
+				moq_net::origin::RouteKind::Start | moq_net::origin::RouteKind::Update | moq_net::origin::RouteKind::Restart,
+			announce: route,
+		} => Some((route, true)),
+		moq_net::origin::RouteEvent {
+			kind: moq_net::origin::RouteKind::End | moq_net::origin::RouteKind::Offline,
+			announce: route,
+		} => Some((route, false)),
 	}
 }

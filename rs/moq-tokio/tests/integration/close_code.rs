@@ -7,8 +7,6 @@
 
 use std::time::Duration;
 
-use moq_tokio::moq_net;
-
 const CODE: u16 = 4011;
 const RUNS: usize = 5;
 
@@ -48,14 +46,14 @@ async fn serve(case: Case) -> Server {
 	};
 
 	tokio::spawn(async move {
-		while let Some(request) = listener.accept().await {
+		while let Ok(request) = listener.accept().await {
 			tokio::spawn(async move {
 				match case {
 					Case::Reject => {
-						request.reject(moq_tokio::server::Reject::App(CODE)).await.ok();
+						request.reject(moq_net::SessionError::App(CODE)).await.ok();
 					}
 					Case::Abort | Case::AbortThenDrop => {
-						let Ok((session, _driver)) = request.ok().await else {
+						let Ok(session) = request.ok().await else {
 							return;
 						};
 						session.abort(moq_net::Error::App(CODE));
@@ -81,7 +79,7 @@ async fn client_error(url: &str, websocket: bool) -> moq_tokio::Error {
 	let client = config.init(Default::default()).expect("failed to init client");
 
 	let connection = client.with_reconnect(false).connect(url.parse::<url::Url>().unwrap());
-	tokio::time::timeout(Duration::from_secs(10), async {
+	kio::clock::timeout(Duration::from_secs(10), async {
 		match connection.established().await {
 			Ok(connection) => connection.closed().await.expect_err("closed without an error"),
 			Err(err) => err,

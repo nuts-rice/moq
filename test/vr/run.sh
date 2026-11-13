@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Publish a stereo 360 picture with VR catalog flags and check demo/vr paints each eye the right way round.
 set -euo pipefail
+
+if [[ "${GITHUB_ACTIONS:-}" != true && "${LOCAL_SUPERVISED:-}" != 1 ]]; then
+    exec bash "$(dirname "$0")/../../sh/local.sh" bash "$0" "$@"
+fi
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 WORKSPACE=$(cd "$DIR/../.." && pwd)
 # shellcheck source-path=SCRIPTDIR source=../lib/harness.sh
@@ -8,11 +12,10 @@ source "$DIR/../lib/harness.sh"
 harness_begin vr 'just test vr'
 cd "$WORKSPACE"
 cargo build --locked -p moq-relay -p moq-cli
-bun install --frozen-lockfile
+uv run --no-project python sh/js/install.py frozen
 (cd demo/vr && bunx vite build --outDir "$HARNESS_RUN/vr-dist" --emptyOutDir)
 # The ambisonic decoder alone, so the driver can render it offline without a stream.
 bun build demo/vr/src/audio.ts --format esm --outfile "$HARNESS_RUN/vr-dist/audio-check.js"
-(cd test/interop/clients/js && bunx playwright install chromium)
 harness_port relay
 URL="http://127.0.0.1:$HARNESS_PORT"
 sed "s/4443/$HARNESS_PORT/g" "$DIR/relay.toml" >"$HARNESS_RUN/relay.toml"

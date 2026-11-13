@@ -16,12 +16,15 @@ runtimes (`moq-tokio` and `moq-uring`).
   carries (`moq_quic::RandomConnectionIdGenerator::set_shard`). Anything else
   on the port, including other protocols, keeps the kernel's 4-tuple hash.
 - **`cpu`**: pinning worker threads to cores.
+- **`demux`**: classifying each datagram on a shared port by its first byte
+  (RFC 7983), so QUIC and the WebRTC media path (ICE, DTLS, RTP) share
+  one socket, plus the pin table and per-source queue the listeners divert
+  through. Every QUIC endpoint behind it turns QUIC-bit greasing off.
 - **`udp`**: sending and receiving with GSO, GRO, and ECN, a hard fork of
   [quinn-udp](https://github.com/quinn-rs/quinn). All credit for it goes to
   the quinn developers; it stays under quinn's MIT or Apache-2.0 license. See
   [moq-quic](../moq-quic/README.md) for the upstream commit, carried changes,
-  and how fixes are ported. The `fast-apple-datapath` feature enables its
-  batched path on Apple's private `sendmsg_x`/`recvmsg_x`.
+  and how fixes are ported.
 
 This is infrastructure, not an entry point: build against `moq-tokio` or
 `moq-uring`, which own the worker groups formed from these pieces.

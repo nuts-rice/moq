@@ -6,8 +6,6 @@
 //! machine and container framing on top of the same wire path.
 //!
 //! Run it with `just rs bench-session` on a Linux 6.12+ kernel.
-// Benchmarks measure themselves on the host clock.
-#![allow(clippy::disallowed_methods)]
 
 use criterion::{criterion_group, criterion_main};
 
@@ -16,6 +14,11 @@ use criterion::{criterion_group, criterion_main};
 mod support;
 
 #[cfg(all(target_os = "linux", feature = "quic"))]
+#[expect(
+	clippy::disallowed_methods,
+	clippy::disallowed_types,
+	reason = "benchmarks measure themselves on the host clock"
+)]
 mod linux {
 	use std::net::UdpSocket;
 	use std::time::Instant;
@@ -35,7 +38,9 @@ mod linux {
 
 	/// A millisecond track: the frames written here carry timestamps.
 	fn timed() -> moq_net::track::Info {
-		moq_net::track::Info::default().with_timescale(moq_net::Timescale::MILLI)
+		moq_net::track::Info::default()
+			.with_max_age(None)
+			.with_timescale(moq_net::Timescale::MILLI)
 	}
 
 	struct Ablation {
@@ -110,17 +115,16 @@ mod linux {
 				});
 			});
 
-			let broadcast = pub_origin.create_broadcast("bench").expect("create broadcast");
-			broadcast.announce(Default::default()).expect("create broadcast");
-			let track = broadcast.create_track("data", timed()).expect("create track");
+			let broadcast = pub_origin
+				.route("bench", moq_net::origin::RouteOptions::default())
+				.expect("create broadcast");
+			let track = broadcast
+				.broadcast()
+				.create_track("data", timed())
+				.expect("create track");
 
 			let certs = support::certs().expect("certificates");
-			let server_config = quic::server::Config::new(
-				quic::Identity::open(&certs.cert, &certs.key)
-					.expect("identity")
-					.server(&[ALPN], quic::server::ClientAuth::None)
-					.expect("tls"),
-			);
+			let server_config = quic::server::Config::new(certs.server(&[ALPN]));
 
 			let server_sock = handle
 				.udp(UdpSocket::bind("127.0.0.1:0").expect("bind"), ablation.config.clone())
@@ -129,9 +133,7 @@ mod linux {
 			let client_sock = handle
 				.udp(UdpSocket::bind("127.0.0.1:0").expect("bind"), ablation.config.clone())
 				.expect("client socket");
-			let mut dial = quic::client::Config::new(server_addr, "localhost");
-			dial.alpn = vec![ALPN.to_string()];
-			dial.verify = false;
+			let dial = quic::client::Config::new(support::client_tls(&[ALPN]));
 
 			let server_handle = handle.clone();
 			handle.spawn(async move {
@@ -140,15 +142,12 @@ mod linux {
 					.expect("quic accept");
 				let (session, driver) = moq_net::Server::new()
 					.with_publisher(&pub_origin)
-					.accept_lite(
-						moq_net::time::now(),
-						moq_uring::transport::Session::new(
-							quic::web::Session::raw(conn),
-							moq_net::transport::Binding::InBand,
-						),
+					.accept(
+						moq_net::time::Instant::now(),
+						moq_uring::transport::Local::new(quic::web::Session::raw(conn)),
 					)
 					.await
-					.expect("accept_lite");
+					.expect("accept");
 				let _ = server_handle.run(driver).await;
 				session.closed().await;
 			});
@@ -156,29 +155,30 @@ mod linux {
 			// Establish and subscribe once; iterations measure steady state.
 			let (_session, mut sub) = worker
 				.block_on(async {
-					let conn = quic::client::connect(client_sock, &dial).await.expect("quic connect");
+					let conn = quic::client::connect(client_sock, &dial, server_addr, "localhost")
+						.await
+						.expect("quic connect");
 					let (session, driver) = moq_net::Client::new()
 						.with_subscriber(sub_origin.clone())
-						.connect_lite(
-							moq_net::time::now(),
-							moq_uring::transport::Session::new(
-								quic::web::Session::raw(conn),
-								moq_net::transport::Binding::InBand,
-							),
+						.connect(
+							moq_net::time::Instant::now(),
+							moq_uring::transport::Local::new(quic::web::Session::raw(conn)),
 						)
 						.await
-						.expect("connect_lite");
+						.expect("connect");
 					let task_handle = handle.clone();
 					handle.spawn(async move {
 						let _ = task_handle.run(driver).await;
 					});
 					let bc = {
 						let consumer = sub_origin.consume();
-						consumer.routed("bench").await.expect("broadcast announced");
 						consumer
-							.request_broadcast("bench", None)
+							.follow("bench", None)
+							.unwrap()
+							.available()
 							.await
 							.expect("broadcast resolves")
+							.unwrap()
 					};
 					let sub = bc
 						.track("data")

@@ -23,19 +23,22 @@
 //! demultiplexing cannot carry (TS-level scrambling, PSI and SI as authored), and
 //! [`Release`] writes that track back out on a fixed delay.
 
-mod adts;
+use crate::codec::aac::adts;
 mod damage;
+mod demux;
 mod export;
 mod follower;
 mod health;
 mod import;
-mod lane;
 mod mux_rate;
-mod programs;
+pub mod passthrough;
+pub mod programs;
 mod psi;
 mod release;
 mod schedule;
 mod si;
+mod step;
+mod unclaimed;
 
 // The `mpegts` catalog section (per-track PID + descriptors plus verbatim carriage
 // of undecoded elementary streams) and the `Catalog` capability, re-exported flat so
@@ -49,8 +52,8 @@ pub use import::*;
 pub use passthrough::Passthrough;
 pub use programs::Programs;
 pub use release::Release;
+pub use step::{Restart, Step};
 
-pub mod passthrough;
 pub mod stats;
 
 #[cfg(test)]
@@ -71,3 +74,9 @@ mod pes_packet_test;
 mod recovery_test;
 #[cfg(test)]
 mod release_test;
+#[cfg(test)]
+mod revision_test;
+#[cfg(test)]
+mod routes_test;
+#[cfg(test)]
+mod step_test;

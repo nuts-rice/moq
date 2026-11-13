@@ -2,7 +2,7 @@
 //! against it, and fill the output catalog with rung + passthrough entries.
 
 use hang::catalog::{AV1, Container, Video, VideoCodec, VideoConfig};
-use moq_net::path::RelativeOwned;
+use moq_net::path::Relative;
 use moq_video::decode::Codec;
 
 use crate::{Error, Ladder};
@@ -20,7 +20,7 @@ pub(crate) struct Resolved {
 	/// The output resolution, derived from the source aspect ratio.
 	pub size: moq_video::Size,
 	pub bitrate: moq_net::bandwidth::Rate,
-	pub framerate: Option<moq_video::Rate>,
+	pub framerate: Option<moq_video::FrameRate>,
 }
 
 impl Resolved {
@@ -35,12 +35,9 @@ impl Resolved {
 
 /// The track names a ladder has handed out, so it never hands one out twice.
 ///
-/// A retired rung ends its track for good, and a clean end is terminal: a relay
-/// keeps the finished logical track (`broadcast::Consumer::track_inner` only
-/// drops an *aborted* one) and serves its EOF to every later subscriber, so a
-/// request for that name never reaches the transcoder again. A rung re-resolved
-/// under a new picture is therefore published under a name the ladder has never
-/// used, rather than reusing the one it just finished.
+/// A name always means the same content, so a rung re-resolved under a new
+/// picture is published under a name the ladder has never used, rather than
+/// reusing the one it just retired: a relay may still cache that name's groups.
 #[derive(Default)]
 pub(crate) struct Names {
 	/// The revision last issued per configured short side. The first is the bare
@@ -284,11 +281,11 @@ pub(crate) fn resolve_rungs(ladder: &Ladder, source_name: &str, source: &VideoCo
 	let Some((source_width, source_height)) = dimensions(source) else {
 		return Err(Error::SourceDimensions(source_name.to_string()));
 	};
-	let framerate = source.framerate.map(moq_video::Rate::from_f64).transpose()?;
+	let framerate = source.framerate.map(moq_video::FrameRate::from_f64).transpose()?;
 
 	let mut resolved: Vec<Resolved> = Vec::new();
 	for rung in ladder.rungs() {
-		let side = u64::from(rung.size);
+		let side = u64::from(rung.short_side);
 		let source_side = source_width.min(source_height);
 		if side > source_side {
 			continue;
@@ -307,8 +304,8 @@ pub(crate) fn resolve_rungs(ladder: &Ladder, source_name: &str, source: &VideoCo
 			continue;
 		}
 		resolved.push(Resolved {
-			name: format!("video/{}p", rung.size),
-			short_side: rung.size,
+			name: format!("video/{}p", rung.short_side),
+			short_side: rung.short_side,
 			size: moq_video::Size::new(width as u32, height as u32),
 			bitrate: rung.bitrate,
 			framerate,
@@ -326,15 +323,14 @@ pub(crate) fn resolve_rungs(ladder: &Ladder, source_name: &str, source: &VideoCo
 pub(crate) async fn rung_entry(
 	rung: &Resolved,
 	source: &VideoConfig,
-	encoder: &moq_video::encode::Kind,
+	transcode: &crate::Config,
 ) -> Result<VideoConfig, Error> {
-	let encode_rate = rung.framerate.unwrap_or(moq_video::Rate::new(30, 1).unwrap());
-	let mut config = moq_video::encode::Config::new(rung.size.width, rung.size.height, encode_rate);
+	let encode_rate = rung.framerate.unwrap_or(moq_video::FrameRate::new(30, 1).unwrap());
+	let mut config = transcode.encoder(rung.size, encode_rate);
 	config.bitrate = Some(rung.bitrate);
-	config.kind = encoder.clone();
 
 	let mut entry = config.probe().await?;
-	entry.framerate = rung.framerate.map(moq_video::Rate::as_f64);
+	entry.framerate = rung.framerate.map(moq_video::FrameRate::as_f64);
 	// A property of the source rather than the ladder: every rung shows the same picture.
 	entry.optimize_for_latency = source.optimize_for_latency;
 	Ok(entry)
@@ -358,16 +354,13 @@ pub(crate) fn populate(
 	out: &mut moq_mux::catalog::hang::Catalog,
 	source: &moq_mux::catalog::hang::Catalog,
 	rungs: &[Published],
-	source_rel: Option<&RelativeOwned>,
+	source_rel: Option<&Relative>,
 ) -> Result<(), Error> {
 	out.video = Video::default();
 	out.audio = hang::catalog::Audio::default();
-	// A derivative does not synthesize its own archive: keep the child's, including a
-	// live-only timeline, so replay/store discovery survives composition. The clock goes with
-	// it: the derivative republishes the child's timeline, so its timestamps only mean
-	// something under the child's wall mapping.
-	out.archive = source.archive.clone();
-	out.clock = source.clock;
+	// The derivative republishes the child's timeline, so its timestamps only mean something under
+	// the child's wall mapping.
+	out.media.clock = source.media.clock;
 
 	// Display metadata applies to the rungs too (same picture, smaller).
 	out.video.display = source.video.display.clone();
@@ -381,6 +374,12 @@ pub(crate) fn populate(
 	let Some(rel) = source_rel else {
 		return Ok(());
 	};
+
+	// The source's renditions are listed too, and they promise only the source's join interval,
+	// so the derivative joins on it unless its own tracks already declared one. Fixed once set.
+	if out.media.join.is_none() {
+		out.media.join = source.media.join;
+	}
 
 	for (name, config) in &source.video.renditions {
 		if config.broadcast.is_some() {
@@ -410,7 +409,6 @@ pub(crate) fn populate(
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
 	use hang::catalog::H264;
 
@@ -444,7 +442,7 @@ mod tests {
 				short_side: 360,
 				size: moq_video::Size::new(640, 360),
 				bitrate: moq_net::bandwidth::Rate::from_bps(600_000),
-				framerate: Some(moq_video::Rate::new(30, 1).unwrap()),
+				framerate: Some(moq_video::FrameRate::new(30, 1).unwrap()),
 			},
 			entry: source(640, 360, Some(600_000)),
 		}];
@@ -475,7 +473,7 @@ mod tests {
 				short_side: 360,
 				size: moq_video::Size::new(640, 360),
 				bitrate: moq_net::bandwidth::Rate::from_bps(600_000),
-				framerate: Some(moq_video::Rate::new(30, 1).unwrap()),
+				framerate: Some(moq_video::FrameRate::new(30, 1).unwrap()),
 			},
 			entry: source(640, 360, Some(600_000)),
 		}];
@@ -510,7 +508,7 @@ mod tests {
 		let resolved = resolve_rungs(&ladder, "video", &fractional).unwrap();
 		assert_eq!(
 			resolved[0].framerate,
-			Some(moq_video::Rate::new(30_000, 1_001).unwrap())
+			Some(moq_video::FrameRate::new(30_000, 1_001).unwrap())
 		);
 
 		fractional.framerate = None;
@@ -700,6 +698,14 @@ mod tests {
 	/// A rung's entry describes the rung, not the source: the codec string's level and every
 	/// dimension come from what this rung will encode, since a player picks between rungs on
 	/// exactly those fields before a single frame exists.
+	/// A transcode on openh264, so a probe is deterministic and never touches a hardware backend.
+	fn software() -> crate::Config {
+		crate::Config {
+			encoder: moq_video::encode::Kind::Software,
+			..Default::default()
+		}
+	}
+
 	#[tokio::test]
 	async fn rung_entry_describes_the_rung() {
 		let rung = Resolved {
@@ -707,15 +713,12 @@ mod tests {
 			short_side: 360,
 			size: moq_video::Size::new(640, 360),
 			bitrate: moq_net::bandwidth::Rate::from_bps(600_000),
-			framerate: Some(moq_video::Rate::new(30, 1).unwrap()),
+			framerate: Some(moq_video::FrameRate::new(30, 1).unwrap()),
 		};
 		let mut source = source(1920, 1080, Some(6_000_000));
 		source.optimize_for_latency = Some(true);
 
-		// Software (openh264) so the probe is deterministic and never touches a hardware backend.
-		let entry = rung_entry(&rung, &source, &moq_video::encode::Kind::Software)
-			.await
-			.unwrap();
+		let entry = rung_entry(&rung, &source, &software()).await.unwrap();
 
 		// Read out of the encoder that will serve this rung, so the entry describes the rung rather
 		// than the source: a player picks between rungs on exactly these fields, before a single
@@ -741,19 +744,15 @@ mod tests {
 			bitrate: moq_net::bandwidth::Rate::from_bps(600_000),
 			framerate: None,
 		};
-		let entry = rung_entry(
-			&rung,
-			&source(1920, 1080, Some(6_000_000)),
-			&moq_video::encode::Kind::Software,
-		)
-		.await
-		.unwrap();
+		let entry = rung_entry(&rung, &source(1920, 1080, Some(6_000_000)), &software())
+			.await
+			.unwrap();
 		assert_eq!(entry.framerate, None);
 	}
 
-	/// A name is handed out once and never again: a retired rung's track ends for
-	/// good, so its replacement has to be a name no subscriber can already hold a
-	/// finished copy of.
+	/// A name is handed out once and never again: a retired rung's replacement
+	/// carries different content, so it needs a name no cache already holds groups
+	/// of.
 	#[test]
 	fn names_are_never_reused() {
 		let mut names = Names::default();
@@ -770,7 +769,7 @@ mod tests {
 		video.insert("low", source(640, 360, None)).unwrap();
 		video.insert("high", source(1920, 1080, None)).unwrap();
 		let mut remote = source(3840, 2160, None);
-		remote.broadcast = Some(RelativeOwned::from("./other".to_string()));
+		remote.broadcast = Some(Relative::new("./other").unwrap());
 		video.insert("remote", remote).unwrap();
 
 		let (name, config) = choose_source(&video, &mut decodes_all()).await.unwrap();
@@ -966,44 +965,91 @@ mod tests {
 		assert_eq!(decoders.probed, [(Codec::H265, false)]);
 	}
 
+	/// The ladder transcodes video alone: audio is referenced in the source, with every field kept,
+	/// so a player decodes exactly what the source published.
 	#[test]
-	fn populate_preserves_the_child_archive() {
+	fn populate_passes_audio_through_untouched() {
+		let mut child = moq_mux::catalog::hang::Catalog::<()>::default();
+		let mut audio = hang::catalog::AudioConfig::new(hang::catalog::AudioCodec::Opus, 48_000, 2);
+		audio.description = Some(
+			moq_mux::codec::opus::Config::new(48_000, 2)
+				.with_pre_skip(312)
+				.encode()
+				.unwrap(),
+		);
+		audio.bitrate = Some(128_000);
+		audio.track = Some("1.m4s".to_string());
+		audio.jitter = Some(std::time::Duration::from_millis(20));
+		child.audio.insert("audio", audio.clone()).unwrap();
+
+		let rel = Relative::new(".").unwrap();
+		let mut out = moq_mux::catalog::hang::Catalog::<()>::default();
+		populate(&mut out, &child, &[], Some(&rel)).unwrap();
+
+		let mut expected = audio;
+		expected.broadcast = Some(rel);
+		assert_eq!(out.audio.renditions.get("audio"), Some(&expected));
+		assert_eq!(out.audio.renditions.len(), 1);
+	}
+
+	#[test]
+	fn populate_preserves_the_child_clock() {
 		let mut child = moq_mux::catalog::hang::Catalog::<()>::default();
 		child
 			.video
 			.insert("video", source(1920, 1080, Some(6_000_000)))
 			.unwrap();
-		let mut archive = hang::catalog::Archive::new();
-		archive.timelines.insert(
-			"video".to_string(),
-			hang::catalog::Timeline::new("video.timeline.z", 4_000),
-		);
-		archive.replay = Some(RelativeOwned::from("./recordings/clip".to_string()));
-		archive.version = Some(hang::catalog::Archive::VERSION);
-		child.archive = Some(archive.clone());
 		let clock = hang::catalog::Clock::new(moq_net::Timestamp::from_micros(1_751_846_400_000_000).unwrap()).unwrap();
-		child.clock = Some(clock);
+		child.media.clock = Some(clock);
 
 		let mut out = moq_mux::catalog::hang::Catalog::<()>::default();
 		populate(&mut out, &child, &[], None).unwrap();
-		assert_eq!(out.archive, Some(archive), "a derivative keeps the child's archive");
-		assert_eq!(out.clock, Some(clock), "a derivative keeps the child's clock");
+		assert_eq!(out.media.clock, Some(clock), "a derivative keeps the child's clock");
 	}
 
-	/// A derivative runs on its source's mapping: `populate` writes the source's root clock through
+	/// A derivative listing the source's renditions joins on the source's interval, unless its own
+	/// tracks already declared one; one listing only its rungs declares its own.
+	#[test]
+	fn populate_carries_the_source_interval_with_its_renditions() {
+		let interval = |secs| hang::catalog::Join::new(std::time::Duration::from_secs(secs));
+		let mut child = moq_mux::catalog::hang::Catalog::<()>::default();
+		child.media.join = interval(4);
+		let rel = Relative::new(".").unwrap();
+
+		let mut out = moq_mux::catalog::hang::Catalog::<()>::default();
+		populate(&mut out, &child, &[], None).unwrap();
+		assert_eq!(out.media.join, None, "only rungs: the derivative measures its own");
+
+		populate(&mut out, &child, &[], Some(&rel)).unwrap();
+		assert_eq!(out.media.join, interval(4));
+
+		let mut out = moq_mux::catalog::hang::Catalog::<()>::default();
+		out.media.join = interval(2);
+		populate(&mut out, &child, &[], Some(&rel)).unwrap();
+		assert_eq!(out.media.join, interval(2), "fixed once declared");
+	}
+
+	/// A derivative runs on its source's mapping: `populate` writes the source's `media.clock` through
 	/// `modify()`, so the derivative's clock carries that mapping and its data is stamped on it.
 	#[tokio::test(start_paused = true)]
 	async fn a_derivative_stamps_on_its_source_clock() {
-		use std::time::{Duration, SystemTime};
+		use std::time::Duration;
 
 		// A minute in, the source's mapping is far from the one a fresh clock would advertise.
 		let ago = Duration::from_secs(60);
-		let _ = moq_net::time::now();
+		let _ = moq_net::time::Instant::now();
 		tokio::time::advance(ago).await;
-		let clock = moq_mux::Clock::at(moq_net::time::now() - ago, SystemTime::now() - ago).unwrap();
+		let clock = moq_mux::Clock::at(
+			moq_net::time::Instant::now().saturating_sub(ago),
+			kio::clock::wall() - ago,
+		)
+		.unwrap();
 		let mut input = moq_net::broadcast::Info::default().produce();
-		let source =
-			moq_mux::catalog::Producer::new(&mut input, moq_mux::catalog::Config::default().with_clock(clock)).unwrap();
+		let source = moq_mux::catalog::Producer::new(
+			&mut input,
+			moq_mux::catalog::Config::default().with_clock(clock.clone()),
+		)
+		.unwrap();
 
 		let mut output = moq_net::broadcast::Info::default().produce();
 		let mut derived = moq_mux::catalog::Producer::new(&mut output, moq_mux::catalog::Config::default()).unwrap();
@@ -1018,11 +1064,12 @@ mod tests {
 			.json_snapshot::<u32>(
 				output.create_track("status", info).unwrap(),
 				moq_mux::json::Config::default(),
+				moq_mux::json::Options::default(),
 			)
 			.unwrap();
 		let mut subscriber = status.consume();
 		tokio::time::advance(Duration::from_secs(3)).await;
-		status.update(moq_net::Timed::from(&1).at(adopted.now())).unwrap();
+		status.update(&1, adopted.now()).unwrap();
 
 		let waiter = kio::Waiter::noop();
 		let std::task::Poll::Ready(Ok(Some(mut group))) = subscriber.poll_recv_group(&waiter) else {

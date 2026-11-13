@@ -3,7 +3,7 @@ package moq_test
 import (
 	"context"
 	"errors"
-	"fmt"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +14,8 @@ import (
 // reconnectTimeout bounds the relay-restart test; its backoff floor is 50ms, so
 // even a slow CI machine reconnects well inside this.
 const reconnectTimeout = 30 * time.Second
+
+func ptr[T any](v T) *T { return &v }
 
 // relay is a local MoQ server plus the sessions it accepted, so a test can drop
 // both the way a fleet deploy does and bring a replacement up on the same port.
@@ -77,14 +79,14 @@ func (r *relay) restart(t *testing.T, ctx context.Context) *relay {
 func dialWorker(t *testing.T, ctx context.Context, url string) *moq.Client {
 	t.Helper()
 
-	client, err := moq.Dial(ctx, url,
-		moq.WithTLSVerify(false),
-		moq.WithBackoff(moq.Backoff{
+	client, err := moq.Dial(ctx, url, moq.ClientConfig{
+		TLS: moq.ClientTLS{Insecure: true},
+		Backoff: moq.Backoff{
 			Initial: 50 * time.Millisecond,
 			Max:     time.Second,
 			Timeout: moq.RetryForever,
-		}),
-	)
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,16 +98,17 @@ func dialWorker(t *testing.T, ctx context.Context, url string) *moq.Client {
 func waitConnects(t *testing.T, ctx context.Context, session *moq.Session, want uint64) {
 	t.Helper()
 
-	for session.Connects() < want {
-		select {
-		case <-ctx.Done():
-			t.Fatalf("connects = %d, want >= %d", session.Connects(), want)
-		case <-time.After(10 * time.Millisecond):
+	state := session.State()
+	for state.Connects < want {
+		var err error
+		state, err = session.StateChanged(ctx, state.Revision)
+		if err != nil {
+			t.Fatalf("wait connects: %v", err)
 		}
 	}
 }
 
-// awaitAnnouncement drains announcements until an active one names path.
+// awaitAnnouncement drains announcements until path is present.
 func awaitAnnouncement(t *testing.T, ctx context.Context, announced *moq.AnnounceConsumer, path string) {
 	t.Helper()
 
@@ -117,7 +120,7 @@ func awaitAnnouncement(t *testing.T, ctx context.Context, announced *moq.Announc
 		if event == nil {
 			t.Fatalf("announcement stream ended before %q", path)
 		}
-		if ann, ok := event.(moq.AnnounceEventStart); ok && ann.Announce.Prefix == path {
+		if ann, ok := event.(moq.AnnounceEventPresent); ok && ann.Announce.Prefix == path {
 			return
 		}
 	}
@@ -180,10 +183,12 @@ func TestReconnectAcrossRelayRestart(t *testing.T) {
 	publisher := dialWorker(t, ctx, url)
 	defer publisher.Close()
 
-	broadcast, err := publisher.CreateBroadcast("live")
+	route, err := publisher.Route("live", moq.RouteOptions{Hidden: true})
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer route.Cancel()
+	broadcast := route.Broadcast()
 	defer broadcast.Close()
 
 	track, err := broadcast.PublishTrack("data", timedInfo())
@@ -191,23 +196,9 @@ func TestReconnectAcrossRelayRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer track.Finish()
-	if err := broadcast.Announce(moq.Route{}); err != nil {
+	if err := route.Announce(); err != nil {
 		t.Fatal(err)
 	}
-
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		for i := 0; ; i++ {
-			select {
-			case <-stop:
-				return
-			default:
-			}
-			_ = track.WriteFrame(moq.Frame{Payload: fmt.Appendf(nil, "frame-%d", i), Timestamp: ts(0)})
-			time.Sleep(10 * time.Millisecond)
-		}
-	}()
 
 	// Subscriber: finds the broadcast and reads a frame before the restart, so
 	// the post-restart read proves delivery resumed rather than never started.
@@ -222,7 +213,7 @@ func TestReconnectAcrossRelayRestart(t *testing.T) {
 
 	awaitAnnouncement(t, ctx, announced, "live")
 
-	before, err := subscriber.RequestBroadcast(ctx, "live")
+	before, err := subscriber.Request(ctx, "live", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,11 +223,15 @@ func TestReconnectAcrossRelayRestart(t *testing.T) {
 	}
 	defer trackConsumer.Cancel()
 
+	// Each write starts a new group, which a live subscription receives as the latest.
+	if err := track.WriteFrame(moq.Frame{Payload: []byte("before"), Timestamp: ts(0)}); err != nil {
+		t.Fatal(err)
+	}
 	if frame, err := trackConsumer.ReadFrame(ctx); err != nil || frame == nil {
 		t.Fatalf("frame before restart: frame=%+v err=%v", frame, err)
 	}
-	if err := subscriber.Session().Failure(); err != nil {
-		t.Fatalf("failure before any drop: %v", err)
+	if state := subscriber.Session().State(); !isConnected(state) {
+		t.Fatalf("not serving before any drop: %+v", state)
 	}
 	if version := subscriber.Session().Stats().Version; version == nil || *version == "" {
 		t.Fatal("a live session must report its negotiated version")
@@ -250,9 +245,9 @@ func TestReconnectAcrossRelayRestart(t *testing.T) {
 	// Both workers observe the reconnect and advance their connect count past the first.
 	waitConnects(t, ctx, publisher.Session(), 2)
 	waitConnects(t, ctx, subscriber.Session(), 2)
-	// The connect that advanced the count also cleared the drop's reason.
-	if err := subscriber.Session().Failure(); err != nil {
-		t.Fatalf("failure after reconnect: %v", err)
+	// The connect that advanced the count also left the drop's reason behind.
+	if state := subscriber.Session().State(); !isConnected(state) {
+		t.Fatalf("not serving after reconnect: %+v", state)
 	}
 
 	// The publisher re-announces the broadcast the fresh relay never saw.
@@ -261,7 +256,7 @@ func TestReconnectAcrossRelayRestart(t *testing.T) {
 	// The subscriber resolves the re-announced broadcast again and receives
 	// frames, which is how a worker follows a relay restart: the old handle's
 	// broadcast closed with its source, and the announcement is what re-anchors.
-	after, err := subscriber.RequestBroadcast(ctx, "live")
+	after, err := subscriber.Request(ctx, "live", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,6 +266,9 @@ func TestReconnectAcrossRelayRestart(t *testing.T) {
 	}
 	defer resumed.Cancel()
 
+	if err := track.WriteFrame(moq.Frame{Payload: []byte("after"), Timestamp: ts(1)}); err != nil {
+		t.Fatal(err)
+	}
 	frame, err := resumed.ReadFrame(ctx)
 	if err != nil {
 		t.Fatalf("frame after restart: %v", err)
@@ -291,17 +289,16 @@ func TestDialWebSocketOptions(t *testing.T) {
 	defer r.server.Close()
 
 	url := "https://" + r.addr
-	client, err := moq.Dial(ctx, url,
-		moq.WithTLSVerify(false),
-		moq.WithWebSocketEnabled(false),
-		moq.WithWebSocketDelay(0),
-	)
+	client, err := moq.Dial(ctx, url, moq.ClientConfig{
+		TLS:       moq.ClientTLS{Insecure: true},
+		WebSocket: moq.WebSocketConfig{Enabled: ptr(false), Delay: ptr(time.Duration(0))},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = client.Close()
 
-	if _, err := moq.Dial(ctx, url, moq.WithWebSocketDelay(-time.Millisecond)); err == nil {
+	if _, err := moq.Dial(ctx, url, moq.ClientConfig{WebSocket: moq.WebSocketConfig{Delay: ptr(-time.Millisecond)}}); err == nil {
 		t.Fatal("negative websocket delay dialed")
 	}
 }
@@ -320,27 +317,81 @@ func TestDialConnectionOptions(t *testing.T) {
 	}
 
 	url := "https://" + r.addr
-	client, err := moq.Dial(ctx, url,
-		moq.WithTLSVerify(false),
-		moq.WithTLSHostName("localhost"),
-		moq.WithVersions(moq.Versions()...),
-		moq.WithConnectTimeout(5*time.Second),
-		moq.WithRace(0),
-		moq.WithResolutionDelay(0),
-		moq.WithQUICIdleTimeout(5*time.Second),
-		moq.WithQUICKeepAlive(0),
-		moq.WithQUICGSO(false),
-		moq.WithQUICMTUDiscovery(true),
-		moq.WithQUICCongestionControl(moq.CongestionControlLoss),
-		moq.WithQUICKeylog(false),
-		moq.WithWebSocketEnabled(false),
-	)
+	client, err := moq.Dial(ctx, url, moq.ClientConfig{
+		TLS:             moq.ClientTLS{Insecure: true, HostName: "localhost"},
+		Versions:        moq.Versions(),
+		Timeout:         ptr(5 * time.Second),
+		Race:            ptr(time.Duration(0)),
+		ResolutionDelay: ptr(time.Duration(0)),
+		QUIC: moq.QUICConfig{
+			IdleTimeout:       ptr(5 * time.Second),
+			KeepAlive:         ptr(time.Duration(0)),
+			GSO:               ptr(false),
+			MTUDiscovery:      ptr(true),
+			CongestionControl: ptr(moq.CongestionControlLoss),
+		},
+		WebSocket: moq.WebSocketConfig{Enabled: ptr(false)},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	_ = client.Close()
 
-	if _, err := moq.Dial(ctx, url, moq.WithQUICIdleTimeout(-time.Millisecond)); err == nil {
+	if _, err := moq.Dial(ctx, url, moq.ClientConfig{QUIC: moq.QUICConfig{IdleTimeout: ptr(-time.Millisecond)}}); err == nil {
 		t.Fatal("negative idle timeout dialed")
 	}
+}
+
+// A public wrapper owns its first dial through Session and observes it fail: a first dial
+// that reaches no session ends the session with its error rather than retrying.
+func TestFirstDialState(t *testing.T) {
+	silent, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer silent.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), reconnectTimeout)
+	defer cancel()
+	client, err := moq.Dial(ctx, "https://"+silent.LocalAddr().String(), moq.ClientConfig{
+		Bind:      "127.0.0.1:0",
+		Timeout:   ptr(100 * time.Millisecond),
+		TLS:       moq.ClientTLS{Insecure: true},
+		WebSocket: moq.WebSocketConfig{Enabled: ptr(false)},
+		Backoff:   moq.Backoff{Initial: 50 * time.Millisecond, Max: 50 * time.Millisecond, Timeout: moq.RetryForever},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := client.Session()
+	defer session.Cancel(0)
+	initial := session.State()
+	if _, ok := initial.Phase.(moq.ConnectionPhaseConnecting); !ok || initial.Connects != 0 {
+		t.Fatalf("initial state: %+v", initial)
+	}
+	// A canceled waiter must leave both the session and another observer live.
+	canceled, stop := context.WithCancel(ctx)
+	stop()
+	if _, err := session.StateChanged(canceled, initial.Revision); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled waiter: %v", err)
+	}
+	state, err := session.StateChanged(ctx, initial.Revision)
+	if err != nil {
+		t.Fatalf("independent waiter: %v", err)
+	}
+	if phase, ok := state.Phase.(moq.ConnectionPhaseClosed); !ok || !errors.Is(phase.Failure, moq.ErrConnect) || state.Connects != 0 {
+		t.Fatalf("failed dial state: %+v", state)
+	}
+	// The terminal revision never changes again, so a wait there reports the failure.
+	if _, err := session.StateChanged(ctx, state.Revision); !errors.Is(err, moq.ErrConnect) {
+		t.Fatalf("terminal waiter: %v", err)
+	}
+	if err := session.Closed(ctx); !errors.Is(err, moq.ErrConnect) {
+		t.Fatalf("closed: %v", err)
+	}
+}
+
+// isConnected reports whether a session serves with a negotiated version.
+func isConnected(state moq.ConnectionState) bool {
+	phase, ok := state.Phase.(moq.ConnectionPhaseConnected)
+	return ok && phase.Version != ""
 }

@@ -1,5 +1,5 @@
 // Sweep armed timers x timers made ready, with independent and shared abort scopes.
-import { Manual, Nano, sleep } from "../src/index.ts";
+import { Duration, Manual, sleep } from "../src/index.ts";
 
 console.log("mode,scope,armed,ready,arm_us,advance_us,cancel_us");
 for (const mode of ["jump", "advance"]) {
@@ -9,18 +9,18 @@ for (const mode of ["jump", "advance"]) {
 				const samples: number[][] = [[], [], []];
 				for (let round = 0; round < 6; round++) {
 					const clock = new Manual();
-					const restore = clock.install();
+					const installed = clock.install();
 					const aborts = Array.from({ length: scope === "shared" ? 1 : armed }, () => new AbortController());
 					try {
 						const start = performance.now();
 						const timers = Array.from({ length: armed }, (_, index) =>
-							sleep(Nano(index < ready ? index + 1 : armed + 1), {
+							sleep(Duration.nanos(index < ready ? index + 1 : armed + 1), {
 								signal: aborts[index % aborts.length].signal,
 							}).catch(() => {}),
 						);
 						const armedAt = performance.now();
-						if (mode === "jump") clock.jump(Nano(ready));
-						else await clock.advance(Nano(ready));
+						if (mode === "jump") clock.jump(Duration.nanos(ready));
+						else await clock.advance(Duration.nanos(ready));
 						const advancedAt = performance.now();
 						for (const abort of aborts) abort.abort();
 						const cancelledAt = performance.now();
@@ -31,7 +31,7 @@ for (const mode of ["jump", "advance"]) {
 							samples[2].push((cancelledAt - advancedAt) * 1000);
 						}
 					} finally {
-						restore();
+						installed.close();
 					}
 				}
 				console.log(

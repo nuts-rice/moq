@@ -2,7 +2,7 @@
 //!
 //! Shared by [`encode::Sink`](crate::encode::Sink) and
 //! [`decode::Sink`](crate::decode::Sink), which differ only in the requests they
-//! serve. The reason both need it is the same: on Windows a Media Foundation
+//! serve and the outputs they queue. The reason both need it is the same: on Windows a Media Foundation
 //! transform's COM apartment is per-thread, so the codec has to be created,
 //! driven, and dropped on one thread, and a `!Send`-in-practice handle cannot be
 //! left to migrate between executor workers or FFI callers.
@@ -11,11 +11,44 @@
 //! the cancellation poison, joining on drop). Each codec supplies its own
 //! request type and serve loop.
 
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
 use tokio::sync::{mpsc, oneshot};
 
 use crate::Error;
+
+/// Outputs the codec thread readied and the caller has not popped yet.
+///
+/// The thread fills it before replying to the call that readied them, so a
+/// caller that awaited that call pops synchronously. Reused, so it stops
+/// allocating once it has held one call's worth.
+pub(crate) struct Queue<T>(Arc<Mutex<VecDeque<T>>>);
+
+impl<T> Queue<T> {
+	/// Lock the queue. A thread that panicked holding it left only whole items.
+	pub(crate) fn lock(&self) -> MutexGuard<'_, VecDeque<T>> {
+		self.0.lock().unwrap_or_else(|err| err.into_inner())
+	}
+
+	/// Pop the oldest output.
+	pub(crate) fn pop(&self) -> Option<T> {
+		self.lock().pop_front()
+	}
+}
+
+impl<T> Default for Queue<T> {
+	fn default() -> Self {
+		Self(Arc::default())
+	}
+}
+
+impl<T> Clone for Queue<T> {
+	fn clone(&self) -> Self {
+		Self(self.0.clone())
+	}
+}
 
 /// The reply channel a worker thread uses to report that its codec is built.
 ///
@@ -71,7 +104,7 @@ impl<R: Send + 'static, I: Send + 'static> Worker<R, I> {
 		let handle = std::thread::Builder::new()
 			.name(thread_name.into())
 			.spawn(move || run(Ready(ready_tx), req_rx))
-			.map_err(|err| Error::Codec(anyhow::anyhow!("failed to spawn the {thread_name} thread: {err}")))?;
+			.map_err(|err| Error::CodecGone(format!("failed to spawn the {thread_name} thread: {err}")))?;
 
 		match ready_rx.await {
 			Ok(Ok(info)) => Ok(Self {
@@ -83,9 +116,7 @@ impl<R: Send + 'static, I: Send + 'static> Worker<R, I> {
 			Ok(Err(err)) => Err(err),
 			Err(_) => {
 				let _ = handle.join();
-				Err(Error::Codec(anyhow::anyhow!(
-					"{thread_name} thread exited before opening"
-				)))
+				Err(Error::CodecGone(format!("{thread_name} thread exited before opening")))
 			}
 		}
 	}
@@ -148,4 +179,15 @@ fn gone() -> Error {
 
 fn abandoned() -> Error {
 	Error::CodecGone("a cancelled call left the codec ahead of this stream".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn an_init_that_drops_its_reply_is_a_worker_failure() {
+		let result = Worker::<(), ()>::open("test-codec", |_, _| {}).await;
+		assert!(matches!(result, Err(Error::CodecGone(_))));
+	}
 }

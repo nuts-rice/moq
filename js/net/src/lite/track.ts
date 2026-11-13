@@ -1,9 +1,9 @@
-import type * as Epoch from "../epoch.ts";
 import { ProtocolViolation } from "../error.ts";
+import type * as Instance from "../instance.ts";
 import * as Path from "../path.ts";
 import type { Reader, Writer } from "../stream.ts";
 import { Timescale } from "../time.ts";
-import { decodeEpoch, encodeEpoch } from "./epoch.ts";
+import { decodeNode, decodePin, encodeNode, encodePin } from "./instance.ts";
 import * as Message from "./message.ts";
 import { fromWire, toWire } from "./priority.ts";
 import { hasCompression, hasGroupOrder, hasRefresh, hasTrackStream, Version, wireTimescale } from "./version.ts";
@@ -36,25 +36,30 @@ export class Track {
 	broadcast: Path.Valid;
 	track: string;
 	/** The publisher instance the subscriber expects. Lite-07+. */
-	epoch?: Epoch.Valid;
+	instance?: Instance.Valid;
+	/** The origin node that serves the request, 0 for whichever the publisher selects. Lite-07+. */
+	node: bigint;
 
-	constructor(broadcast: Path.Valid, track: string, epoch?: Epoch.Valid) {
+	constructor(broadcast: Path.Valid, track: string, instance?: Instance.Valid, node = 0n) {
 		this.broadcast = broadcast;
 		this.track = track;
-		this.epoch = epoch;
+		this.instance = instance;
+		this.node = node;
 	}
 
 	async #encode(w: Writer, version: Version) {
 		await w.string(Path.encode(this.broadcast));
-		await encodeEpoch(w, version, this.epoch);
+		await encodePin(w, version, this.instance);
+		await encodeNode(w, version, this.node);
 		await w.string(this.track);
 	}
 
 	static async #decode(r: Reader, version: Version): Promise<Track> {
 		const broadcast = Path.decode(await r.string());
-		const epoch = await decodeEpoch(r, version);
+		const instance = await decodePin(r, version);
+		const node = await decodeNode(r, version);
 		const track = await r.string();
-		return new Track(broadcast, track, epoch);
+		return new Track(broadcast, track, instance, node);
 	}
 
 	async encode(w: Writer, version: Version): Promise<void> {

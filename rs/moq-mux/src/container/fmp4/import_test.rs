@@ -4,15 +4,15 @@ use mp4_atom::{Atom, Decode, Encode};
 
 /// A drift budget no test timeline comes close to, so every group is read.
 ///
-/// The media track's full retention window, so a reader started after publishing can
-/// still read every retained group. These tests write every group up front, which the
+/// The media track's full max age, so a reader started after publishing can
+/// still read every fresh group. These tests write every group up front, which the
 /// default [`std::time::Duration::ZERO`](std::time::Duration::ZERO) budget collapses to the live
 /// edge: completeness has to be asked for.
 const RECORDING_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A replay window with that budget, for a test asserting every group is delivered.
 fn replay() -> moq_net::track::Subscription {
-	moq_net::track::Subscription::default().with_max_delay(RECORDING_MAX_DELAY)
+	moq_net::track::Subscription::default().with_delay(moq_net::track::Delay::default().with_max(RECORDING_MAX_DELAY))
 }
 
 /// Drain every group currently buffered on the consumer without waiting for new ones.
@@ -39,7 +39,7 @@ fn run_fmp4_with(data: &[u8], passthrough: bool) -> crate::catalog::hang::Catalo
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 
-	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_passthrough(passthrough);
+	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
 
 	let buf = bytes::BytesMut::from(data);
 	// Ignore errors from incomplete/malformed trailing fragments in test files.
@@ -94,7 +94,7 @@ fn video_config_result(codec: mp4_atom::Codec) -> crate::Result<hang::catalog::V
 	let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
 	let mut import = super::Import::new(broadcast, catalog.reserve());
 	import.decode(&init)?;
-	import.finish()?;
+	let _finished = import.finish()?;
 	Ok(catalog.snapshot().video.renditions.values().next().unwrap().clone())
 }
 
@@ -373,6 +373,160 @@ fn container_aspect_pasp_rejects_invalid_ratios() {
 	);
 }
 
+fn with_spatial(mut codec: mp4_atom::Codec, spatial: mp4_atom::Spatial) -> mp4_atom::Codec {
+	let spatial = Some(Box::new(spatial));
+	match &mut codec {
+		mp4_atom::Codec::Avc1(c) => c.spatial = spatial,
+		mp4_atom::Codec::Avc3(c) => c.spatial = spatial,
+		mp4_atom::Codec::Hvc1(c) => c.spatial = spatial,
+		mp4_atom::Codec::Hev1(c) => c.spatial = spatial,
+		mp4_atom::Codec::Av01(c) => c.spatial = spatial,
+		mp4_atom::Codec::Vp08(c) => c.spatial = spatial,
+		mp4_atom::Codec::Vp09(c) => c.spatial = spatial,
+		_ => unreachable!(),
+	}
+	codec
+}
+
+/// Spherical Video V2 boxes: an `st3d` with `stereo_mode`, and an `sv3d` projecting with `kind`.
+fn spherical(stereo_mode: Option<u8>, kind: Option<mp4_atom::ProjKind>) -> mp4_atom::Spatial {
+	mp4_atom::Spatial {
+		st3d: stereo_mode.map(|stereo_mode| mp4_atom::St3d { stereo_mode }),
+		sv3d: kind.map(|kind| mp4_atom::Sv3d {
+			svhd: Some(mp4_atom::Svhd {
+				metadata_source: "moq".into(),
+			}),
+			proj: Some(mp4_atom::Proj {
+				prhd: Some(mp4_atom::Prhd::default()),
+				kind: Some(kind),
+				unknown: vec![],
+			}),
+			unknown: vec![],
+		}),
+		..Default::default()
+	}
+}
+
+fn equi(top: u32, bottom: u32, left: u32, right: u32) -> Option<mp4_atom::ProjKind> {
+	Some(mp4_atom::ProjKind::Equi(mp4_atom::Equi {
+		projection_bounds_top: top,
+		projection_bounds_bottom: bottom,
+		projection_bounds_left: left,
+		projection_bounds_right: right,
+	}))
+}
+
+#[test]
+fn spherical_boxes_fill_projection_and_stereo() {
+	use hang::catalog::{Projection, Stereo};
+	let quarter = 1 << 30;
+	for (spatial, projection, stereo) in [
+		// Monoscopic 360.
+		(
+			spherical(Some(mp4_atom::St3d::MONO), equi(0, 0, 0, 0)),
+			Some(Projection::Equirectangular { fov: None }),
+			None,
+		),
+		// VR180: half the longitude, side by side.
+		(
+			spherical(Some(mp4_atom::St3d::LEFT_RIGHT), equi(0, 0, quarter, quarter)),
+			Some(Projection::Equirectangular { fov: Some(180.0) }),
+			Some(Stereo::LeftRight),
+		),
+		// Flat stereo, with no sv3d.
+		(
+			spherical(Some(mp4_atom::St3d::TOP_BOTTOM), None),
+			None,
+			Some(Stereo::TopBottom),
+		),
+	] {
+		for codec in aspect_entries(false) {
+			let config = video_config(with_spatial(codec, spatial.clone()));
+			assert_eq!(
+				(&config.projection, &config.stereo),
+				(&projection, &stereo),
+				"{}",
+				config.codec
+			);
+		}
+	}
+	// Without the boxes, the video stays flat and mono.
+	let config = video_config(aspect_entries(false).remove(0));
+	assert_eq!((config.projection, config.stereo), (None, None));
+}
+
+#[test]
+fn spherical_boxes_the_catalog_cannot_describe_are_refused() {
+	let quarter = 1 << 30;
+	let posed = |pose: mp4_atom::Prhd| {
+		let mut spatial = spherical(None, equi(0, 0, 0, 0));
+		spatial.sv3d.as_mut().unwrap().proj.as_mut().unwrap().prhd = Some(pose);
+		spatial
+	};
+	let mut repeated = spherical(Some(mp4_atom::St3d::MONO), None);
+	let mut st3d = Vec::new();
+	mp4_atom::St3d {
+		stereo_mode: mp4_atom::St3d::LEFT_RIGHT,
+	}
+	.encode(&mut st3d)
+	.unwrap();
+	// The body after the 8-byte header; mp4-atom keeps the second st3d it decodes as unknown.
+	repeated.unknown = vec![mp4_atom::Any::Unknown(mp4_atom::St3d::KIND, st3d[8..].to_vec())];
+	let mut unprojected = spherical(None, equi(0, 0, 0, 0));
+	unprojected.sv3d.as_mut().unwrap().proj = None;
+
+	for (name, spatial) in [
+		(
+			"cubemap",
+			spherical(None, Some(mp4_atom::ProjKind::Cbmp(mp4_atom::Cbmp::default()))),
+		),
+		(
+			"mesh VR180",
+			spherical(
+				Some(mp4_atom::St3d::LEFT_RIGHT),
+				Some(mp4_atom::ProjKind::Mshp(mp4_atom::Mshp {
+					crc: 0,
+					encoding_four_cc: b"raw ".into(),
+					data: vec![],
+				})),
+			),
+		),
+		("asymmetric bounds", spherical(None, equi(0, 0, quarter, 0))),
+		("vertical crop", spherical(None, equi(quarter, quarter, 0, 0))),
+		("no picture left", spherical(None, equi(0, 0, 1 << 31, 1 << 31))),
+		(
+			"yawed",
+			posed(mp4_atom::Prhd {
+				pose_yaw_degrees: 90 << 16,
+				..Default::default()
+			}),
+		),
+		(
+			"rolled",
+			posed(mp4_atom::Prhd {
+				pose_roll_degrees: 1,
+				..Default::default()
+			}),
+		),
+		("right-left", spherical(Some(mp4_atom::St3d::RIGHT_LEFT), None)),
+		("custom stereo", spherical(Some(mp4_atom::St3d::STEREO_CUSTOM), None)),
+		("unknown stereo", spherical(Some(5), None)),
+		("repeated st3d", repeated),
+		("sv3d without proj", unprojected),
+	] {
+		for codec in aspect_entries(false) {
+			let err = video_config_result(with_spatial(codec, spatial.clone())).unwrap_err();
+			assert!(
+				matches!(
+					err,
+					crate::Error::Cmaf(crate::container::fmp4::Error::UnsupportedSpatial(_))
+				),
+				"{name}: {err:?}"
+			);
+		}
+	}
+}
+
 #[test]
 fn test_bbb_catalog() {
 	let data = include_bytes!("test_data/bbb.mp4");
@@ -471,6 +625,35 @@ fn dropping_import_retires_catalog_renditions() {
 	assert!(snapshot.audio.renditions.is_empty());
 }
 
+/// A source that re-initializes (an HLS rendition switching `EXT-X-MAP`) replaces its importer on
+/// the same catalog each time. Every dropped generation retires its HLS records along with its
+/// renditions, finished or not, so the catalog holds only the live generation's state.
+#[test]
+fn repeated_reinit_keeps_flat_state() {
+	// The init segment and its complete fragments; the fixture ends on a truncated one.
+	let data = &include_bytes!("test_data/bbb.mp4")[..2035];
+	for passthrough in [false, true] {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+		for generation in 0..50 {
+			let label = format!("passthrough={passthrough} generation={generation}");
+			let mut fmp4 =
+				crate::container::fmp4::Import::new(broadcast.clone(), catalog.reserve()).with_cmaf(passthrough);
+			fmp4.decode(&bytes::BytesMut::from(data)).unwrap();
+			let snapshot = catalog.snapshot();
+			assert_eq!(snapshot.video.renditions.len(), 1, "{label}");
+			assert_eq!(snapshot.audio.renditions.len(), 1, "{label}");
+			match generation % 2 == 1 {
+				true => drop(fmp4.finish().unwrap()),
+				false => drop(fmp4),
+			}
+			let snapshot = catalog.snapshot();
+			assert!(snapshot.video.renditions.is_empty(), "{label}");
+			assert!(snapshot.audio.renditions.is_empty(), "{label}");
+		}
+	}
+}
+
 #[test]
 fn select_video_only() {
 	use crate::select::{Broadcast, Video};
@@ -509,11 +692,18 @@ async fn bbb_samples(passthrough: bool) -> [Vec<(u128, bool, bytes::Bytes)>; 2] 
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
 	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
-	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_passthrough(passthrough);
+	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
 	// The file ends on a malformed fragment, after every whole one has published.
 	let _ = fmp4.decode(include_bytes!("test_data/bbb.mp4"));
-	fmp4.finish().unwrap();
+	let _finished = fmp4.finish().unwrap();
+	published(&consumer, &catalog).await
+}
 
+/// Every sample the broadcast published, per role (video, audio), as a consumer reads it back.
+async fn published(
+	consumer: &moq_net::broadcast::Consumer,
+	catalog: &crate::catalog::Producer,
+) -> [Vec<(u128, bool, bytes::Bytes)>; 2] {
 	let snapshot = catalog.snapshot();
 	let video = snapshot.video.renditions.iter().next().unwrap();
 	let audio = snapshot.audio.renditions.iter().next().unwrap();
@@ -542,6 +732,299 @@ async fn unwrapped_samples_match_the_passthrough_fragments() {
 	assert!(!video.is_empty() && !audio.is_empty(), "bbb carries both roles");
 	assert_eq!(video, cmaf_video, "video");
 	assert_eq!(audio, cmaf_audio, "audio");
+}
+
+/// A fragment whose runs are separated by padding and by another track's run publishes each
+/// sample's own bytes at its own time, passthrough or unwrapped, whether a run's offset is explicit
+/// or continues the run before it, and whether its sizes come from the table or the tfhd defaults.
+#[tokio::test]
+async fn separated_runs_keep_their_samples() {
+	let (init, (video_id, video_scale), (audio_id, audio_scale)) = bbb_init();
+	let video_tick = video_scale.as_u64() / 24;
+	let non_sync = 0x0001_0000;
+
+	// The mdat: video V1 V2, a gap, audio A1 A2, a gap, video V3, then V4 V5 continuing it.
+	let layout: [(&str, &[u8]); 6] = [
+		("v", &[0xA1; 3]),
+		("v", &[0xA2; 3]),
+		("gap", &[0xEE; 5]),
+		("a", &[0xB1, 0xB1, 0xB2, 0xB2, 0xB2, 0xB2]),
+		("gap", &[0xEF; 2]),
+		("v", &[0xA3, 0xA3, 0xA3, 0xA4, 0xA4, 0xA4, 0xA5, 0xA5, 0xA5]),
+	];
+	let at = |index: usize| layout[..index].iter().map(|(_, bytes)| bytes.len()).sum::<usize>();
+
+	// Video sizes and durations come from the tfhd defaults; audio's from its table.
+	let video_entry = |flags| mp4_atom::TrunEntry {
+		flags: Some(flags),
+		..Default::default()
+	};
+	let audio_entry = |size| mp4_atom::TrunEntry {
+		duration: Some(1024),
+		size: Some(size),
+		..Default::default()
+	};
+	let mut moof = mp4_atom::Moof {
+		mfhd: mp4_atom::Mfhd { sequence_number: 1 },
+		traf: vec![
+			mp4_atom::Traf {
+				tfhd: mp4_atom::Tfhd {
+					track_id: video_id,
+					default_sample_duration: Some(video_tick as u32),
+					default_sample_size: Some(3),
+					..Default::default()
+				},
+				tfdt: Some(mp4_atom::Tfdt {
+					base_media_decode_time: video_scale.as_u64(),
+				}),
+				trun: vec![
+					mp4_atom::Trun {
+						data_offset: Some(0),
+						samples: vec![video_entry(0), video_entry(non_sync)].into(),
+					},
+					mp4_atom::Trun {
+						data_offset: Some(0),
+						samples: vec![video_entry(non_sync)].into(),
+					},
+					// No data_offset: it starts where the run before it ended.
+					mp4_atom::Trun {
+						data_offset: None,
+						samples: vec![video_entry(non_sync), video_entry(non_sync)].into(),
+					},
+				],
+				..Default::default()
+			},
+			mp4_atom::Traf {
+				tfhd: mp4_atom::Tfhd {
+					track_id: audio_id,
+					..Default::default()
+				},
+				tfdt: Some(mp4_atom::Tfdt {
+					base_media_decode_time: audio_scale.as_u64(),
+				}),
+				trun: vec![mp4_atom::Trun {
+					data_offset: Some(0),
+					samples: vec![audio_entry(2), audio_entry(4)].into(),
+				}],
+				..Default::default()
+			},
+		],
+	};
+	// Offsets count from the moof's first byte, so measure it with every offset present.
+	let mut buf = Vec::new();
+	moof.encode(&mut buf).unwrap();
+	let padding = mp4_atom::Any::Unknown(mp4_atom::FourCC::new(b"free"), vec![0; 16]);
+	let mut padding_bytes = Vec::new();
+	padding.encode(&mut padding_bytes).unwrap();
+	let data = (buf.len() + padding_bytes.len() + 8) as i32;
+	moof.traf[0].trun[0].data_offset = Some(data + at(0) as i32);
+	moof.traf[0].trun[1].data_offset = Some(data + at(5) as i32);
+	moof.traf[1].trun[0].data_offset = Some(data + at(3) as i32);
+	let mut fragment = Vec::new();
+	moof.encode(&mut fragment).unwrap();
+	fragment.extend_from_slice(&padding_bytes);
+	mp4_atom::Mdat {
+		data: layout.iter().flat_map(|(_, bytes)| bytes.iter().copied()).collect(),
+	}
+	.encode(&mut fragment)
+	.unwrap();
+
+	let micros = |ticks: u64, scale: moq_net::Timescale| u128::from(ticks) * 1_000_000 / u128::from(scale.as_u64());
+	let video: Vec<_> = (0..5u64)
+		.map(|i| {
+			let timestamp = micros(video_scale.as_u64() + i * video_tick, video_scale);
+			(timestamp, i == 0, bytes::Bytes::from(vec![0xA1 + i as u8; 3]))
+		})
+		.collect();
+	// Audio marks only the frame that opens its group.
+	let audio = vec![
+		(1_000_000, true, bytes::Bytes::from_static(&[0xB1; 2])),
+		(
+			micros(audio_scale.as_u64() + 1024, audio_scale),
+			false,
+			bytes::Bytes::from_static(&[0xB2; 4]),
+		),
+	];
+
+	for passthrough in [false, true] {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let consumer = broadcast.consume();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+		let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
+		fmp4.decode(&init).unwrap();
+		for chunk in fragment.chunks(7) {
+			fmp4.decode(chunk).unwrap();
+		}
+		let _finished = fmp4.finish().unwrap();
+		let [got_video, got_audio] = published(&consumer, &catalog).await;
+		assert_eq!(got_video, video, "video, passthrough {passthrough}");
+		assert_eq!(got_audio, audio, "audio, passthrough {passthrough}");
+	}
+}
+
+/// A sample must own input bytes even when its size comes from a default.
+#[test]
+fn empty_samples_are_refused() {
+	let (init, (video_id, timescale), _) = bbb_init();
+	for explicit in [false, true] {
+		let moof = mp4_atom::Moof {
+			mfhd: mp4_atom::Mfhd { sequence_number: 1 },
+			traf: vec![mp4_atom::Traf {
+				tfhd: mp4_atom::Tfhd {
+					track_id: video_id,
+					default_sample_size: Some(0),
+					default_sample_duration: Some(1),
+					..Default::default()
+				},
+				tfdt: Some(mp4_atom::Tfdt {
+					base_media_decode_time: 0,
+				}),
+				trun: vec![mp4_atom::Trun {
+					data_offset: None,
+					samples: vec![
+						mp4_atom::TrunEntry {
+							size: explicit.then_some(0),
+							..Default::default()
+						};
+						4
+					]
+					.into(),
+				}],
+				..Default::default()
+			}],
+		};
+		let mut fragment = Vec::new();
+		moof.encode(&mut fragment).unwrap();
+		mp4_atom::Mdat { data: vec![] }.encode(&mut fragment).unwrap();
+		for passthrough in [false, true] {
+			let mut broadcast = moq_net::broadcast::Info::new().produce();
+			let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
+			let mut import = super::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
+			import.decode(&init).unwrap();
+			assert!(
+				matches!(
+					import.decode(&fragment),
+					Err(crate::Error::Cmaf(super::Error::EmptySample))
+				),
+				"empty import: explicit={explicit}, passthrough={passthrough}"
+			);
+		}
+		assert!(matches!(
+			super::decode(fragment.into(), None, super::Track::new(timescale, super::Kind::Video)),
+			Err(super::Error::EmptySample)
+		));
+	}
+}
+
+/// A file-relative base is explicitly unsupported on both input paths.
+#[test]
+fn absolute_sample_bases_are_refused() {
+	let (init, (video_id, timescale), _) = bbb_init();
+	for base in [0, 1024, u64::MAX] {
+		let moof = mp4_atom::Moof {
+			mfhd: mp4_atom::Mfhd { sequence_number: 1 },
+			traf: vec![mp4_atom::Traf {
+				tfhd: mp4_atom::Tfhd {
+					track_id: video_id,
+					base_data_offset: Some(base),
+					default_sample_size: Some(1),
+					..Default::default()
+				},
+				tfdt: Some(mp4_atom::Tfdt {
+					base_media_decode_time: 0,
+				}),
+				trun: vec![mp4_atom::Trun {
+					samples: vec![Default::default()].into(),
+					..Default::default()
+				}],
+				..Default::default()
+			}],
+		};
+		let mut fragment = Vec::new();
+		moof.encode(&mut fragment).unwrap();
+		mp4_atom::Mdat { data: vec![1] }.encode(&mut fragment).unwrap();
+		for passthrough in [false, true] {
+			let mut broadcast = moq_net::broadcast::Info::new().produce();
+			let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
+			let mut import = super::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
+			import.decode(&init).unwrap();
+			assert!(matches!(
+				import.decode(&fragment),
+				Err(crate::Error::Cmaf(super::Error::UnsupportedBaseDataOffset))
+			));
+		}
+		assert!(matches!(
+			super::decode(fragment.into(), None, super::Track::new(timescale, super::Kind::Video)),
+			Err(super::Error::UnsupportedBaseDataOffset)
+		));
+	}
+}
+
+/// A run pointing at bytes an earlier sample took is refused, passthrough or unwrapped, whether
+/// that sample is in the same track or another, rather than copying or publishing those bytes once
+/// per run: a moof of many such runs would multiply its mdat.
+#[tokio::test]
+async fn shared_sample_bytes_are_refused() {
+	let (init, (video_id, video_scale), (audio_id, audio_scale)) = bbb_init();
+	let traf = |track_id, scale: moq_net::Timescale, runs| mp4_atom::Traf {
+		tfhd: mp4_atom::Tfhd {
+			track_id,
+			default_sample_duration: Some(1024),
+			default_sample_size: Some(4),
+			..Default::default()
+		},
+		tfdt: Some(mp4_atom::Tfdt {
+			base_media_decode_time: scale.as_u64(),
+		}),
+		trun: (0..runs)
+			.map(|_| mp4_atom::Trun {
+				data_offset: Some(0),
+				samples: vec![Default::default()].into(),
+			})
+			.collect(),
+		..Default::default()
+	};
+
+	// Each traf with its runs' offsets into an 8-byte mdat of 4-byte samples.
+	let cases = [
+		vec![(traf(video_id, video_scale, 2), vec![0, 0])],
+		vec![
+			(traf(video_id, video_scale, 1), vec![0]),
+			(traf(audio_id, audio_scale, 1), vec![2]),
+		],
+	];
+	for trafs in cases {
+		let mut moof = mp4_atom::Moof {
+			mfhd: mp4_atom::Mfhd { sequence_number: 1 },
+			traf: trafs.iter().map(|(traf, _)| traf.clone()).collect(),
+		};
+		let mut buf = Vec::new();
+		moof.encode(&mut buf).unwrap();
+		let data = buf.len() as i32 + 8;
+		for (traf, (_, offsets)) in moof.traf.iter_mut().zip(&trafs) {
+			for (trun, offset) in traf.trun.iter_mut().zip(offsets) {
+				trun.data_offset = Some(data + offset);
+			}
+		}
+		let mut fragment = Vec::new();
+		moof.encode(&mut fragment).unwrap();
+		mp4_atom::Mdat { data: vec![0xA5; 8] }.encode(&mut fragment).unwrap();
+
+		for passthrough in [false, true] {
+			let mut broadcast = moq_net::broadcast::Info::new().produce();
+			let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+			let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
+			fmp4.decode(&init).unwrap();
+			let err = fmp4.decode(&fragment).unwrap_err();
+			assert!(
+				matches!(
+					err,
+					crate::Error::Cmaf(crate::container::fmp4::Error::InvalidDataOffset)
+				),
+				"passthrough {passthrough}: {err:?}"
+			);
+		}
+	}
 }
 
 /// An unwrapped sample presents at `tfdt + the durations before it + its composition offset`, so
@@ -577,15 +1060,16 @@ async fn unwrapped_samples_present_at_their_composition_time() {
 			}),
 			trun: vec![mp4_atom::Trun {
 				data_offset: None,
-				entries: entries
+				samples: entries
 					.iter()
 					.map(|&(cts, flags, _)| mp4_atom::TrunEntry {
 						duration: Some(tick as u32),
 						size: Some(2),
 						flags: Some(flags),
-						cts: Some(cts as i32),
+						cts: Some(cts as i64),
 					})
-					.collect(),
+					.collect::<Vec<_>>()
+					.into(),
 			}],
 			..Default::default()
 		}],
@@ -598,7 +1082,7 @@ async fn unwrapped_samples_present_at_their_composition_time() {
 	.encode(&mut fragment)
 	.unwrap();
 	fmp4.decode(&fragment).unwrap();
-	fmp4.finish().unwrap();
+	let _finished = fmp4.finish().unwrap();
 
 	let mut group = track.recv_group().await.unwrap().unwrap();
 	let mut frames = Vec::new();
@@ -620,6 +1104,296 @@ async fn unwrapped_samples_present_at_their_composition_time() {
 		track.recv_group().await.unwrap().is_none(),
 		"the non-sync samples stay in the sync sample's group"
 	);
+}
+
+/// Once the video group is open, a forged moof's field-less runs of `u32::MAX` non-sync samples
+/// are refused at the moof, before the keyframe scan or sample planning walks them.
+#[test]
+fn fieldless_runs_do_not_stall_the_segment_scan() {
+	let (_, (video_id, video_scale), _) = bbb_init();
+	let init = bbb_init_with_edits(video_id, vec![media_edit(0)]);
+	let tick = video_scale.as_u64() / 24;
+
+	let traf = |runs: usize| mp4_atom::Traf {
+		tfhd: mp4_atom::Tfhd {
+			track_id: video_id,
+			default_sample_duration: Some(tick as u32),
+			default_sample_size: Some(1),
+			default_sample_flags: Some(0x0001_0000),
+			..Default::default()
+		},
+		tfdt: Some(mp4_atom::Tfdt {
+			base_media_decode_time: tick,
+		}),
+		trun: vec![
+			mp4_atom::Trun {
+				data_offset: None,
+				samples: mp4_atom::TrunSamples::Inherited {
+					count: u32::MAX,
+					first_flags: None,
+				},
+			};
+			runs
+		],
+		..Default::default()
+	};
+	// Many runs in one traf, and many trafs over a larger mdat: the budget spans the whole moof, so
+	// repeating the traf can't multiply it.
+	for (trafs, runs, mdat) in [(1, 1000, 6), (1000, 1, 1 << 16)] {
+		let moof = mp4_atom::Moof {
+			mfhd: mp4_atom::Mfhd { sequence_number: 2 },
+			traf: vec![traf(runs); trafs],
+		};
+		let mut forged = Vec::new();
+		moof.encode(&mut forged).unwrap();
+		mp4_atom::Mdat { data: vec![0; mdat] }.encode(&mut forged).unwrap();
+
+		for passthrough in [false, true] {
+			let mut broadcast = moq_net::broadcast::Info::new().produce();
+			let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+			let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
+			fmp4.decode(&init).unwrap();
+			fmp4.decode(&video_fragment(video_id, 0, tick, &[(0, 0, 0xA)])).unwrap();
+			assert!(
+				matches!(
+					fmp4.decode(&forged),
+					Err(crate::Error::Cmaf(super::Error::TooManySamples(_)))
+				),
+				"{trafs} trafs, passthrough {passthrough}"
+			);
+		}
+	}
+}
+
+fn bbb_init_with_edits(track_id: u32, entries: Vec<mp4_atom::ElstEntry>) -> Vec<u8> {
+	let (init, _, _) = bbb_init();
+	let (ftyp, mut moov) = decode_init(&init);
+	let trak = moov
+		.trak
+		.iter_mut()
+		.find(|trak| trak.tkhd.track_id == track_id)
+		.unwrap();
+	trak.edts = Some(mp4_atom::Edts {
+		elst: Some(mp4_atom::Elst { entries }),
+	});
+	let mut data = Vec::new();
+	ftyp.encode(&mut data).unwrap();
+	moov.encode(&mut data).unwrap();
+	data
+}
+
+/// An edit starting the media at `media_time`.
+fn media_edit(media_time: u64) -> mp4_atom::ElstEntry {
+	mp4_atom::ElstEntry {
+		segment_duration: 0,
+		media_time: Some(media_time),
+		media_rate: mp4_atom::FixedPoint::from(1),
+	}
+}
+
+/// The edit list moves every sample to its presentation time and drops the samples before the
+/// edit, priming that fills a frame or straddles one, passthrough or unwrapped. The passthrough
+/// init loses the `edts`, so no consumer applies it a second time.
+#[tokio::test]
+async fn audio_presents_from_its_edit() {
+	let (_, _, (audio_id, audio_scale)) = bbb_init();
+	let micros = |ticks: u64| u128::from(ticks) * 1_000_000 / u128::from(audio_scale.as_u64());
+	let empty = mp4_atom::ElstEntry {
+		// bbb's movie counts milliseconds.
+		segment_duration: 1000,
+		media_time: None,
+		media_rate: mp4_atom::FixedPoint::from(1),
+	};
+	// The samples start at 0 and 512, then every 1024 ticks.
+	let cases = [
+		// Priming of whole frames, as ffmpeg's AAC.
+		(vec![media_edit(512)], vec![0, 1024, 2048]),
+		// Priming that ends inside a frame drops that frame too, as Apple's AAC.
+		(vec![media_edit(1024)], vec![512, 1536]),
+		// An empty edit delays the media.
+		(vec![empty, media_edit(512)], vec![44_100, 45_124, 46_148]),
+	];
+
+	for (entries, expected) in cases {
+		for passthrough in [false, true] {
+			let init = bbb_init_with_edits(audio_id, entries.clone());
+			let mut broadcast = moq_net::broadcast::Info::new().produce();
+			let consumer = broadcast.consume();
+			let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+			let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
+			fmp4.decode(&init).unwrap();
+			// A fragment wholly before the edit publishes nothing.
+			fmp4.decode(&audio_fragment(0, 512, 4)).unwrap();
+			fmp4.decode(&audio_fragment_samples(512, 1024, 4, 3)).unwrap();
+			let _finished = fmp4.finish().unwrap();
+
+			let snapshot = catalog.snapshot();
+			if let Container::Cmaf { init } = &snapshot.audio.renditions.values().next().unwrap().container {
+				let (_, moov) = decode_init(init);
+				assert!(moov.trak[0].edts.is_none(), "the init keeps no edit list");
+			}
+			let [_, audio] = published(&consumer, &catalog).await;
+			let got: Vec<_> = audio.iter().map(|(timestamp, _, _)| *timestamp).collect();
+			let expected: Vec<_> = expected.iter().map(|&ticks| micros(ticks)).collect();
+			assert_eq!(got, expected, "{entries:?}, passthrough {passthrough}");
+		}
+	}
+}
+
+/// One video fragment decoding from `dts`, a sample per `(cts, flags, byte)` lasting `tick`.
+fn video_fragment(track_id: u32, dts: u64, tick: u64, entries: &[(u64, u32, u8)]) -> Vec<u8> {
+	let moof = mp4_atom::Moof {
+		mfhd: mp4_atom::Mfhd { sequence_number: 1 },
+		traf: vec![mp4_atom::Traf {
+			tfhd: mp4_atom::Tfhd {
+				track_id,
+				..Default::default()
+			},
+			tfdt: Some(mp4_atom::Tfdt {
+				base_media_decode_time: dts,
+			}),
+			trun: vec![mp4_atom::Trun {
+				data_offset: None,
+				samples: entries
+					.iter()
+					.map(|&(cts, flags, _)| mp4_atom::TrunEntry {
+						duration: Some(tick as u32),
+						size: Some(2),
+						flags: Some(flags),
+						cts: Some(cts as i64),
+					})
+					.collect::<Vec<_>>()
+					.into(),
+			}],
+			..Default::default()
+		}],
+	};
+	let mut fragment = Vec::new();
+	moof.encode(&mut fragment).unwrap();
+	mp4_atom::Mdat {
+		data: entries.iter().flat_map(|&(_, _, byte)| [byte; 2]).collect(),
+	}
+	.encode(&mut fragment)
+	.unwrap();
+	fragment
+}
+
+/// The edit list drops the video samples before it and keeps every other one at its own
+/// presentation time and in decode order, passthrough or unwrapped. A dropped sync sample takes the
+/// samples decoding from it along, so the track resumes at the next one.
+#[tokio::test]
+async fn video_drops_the_samples_before_its_edit() {
+	let (_, (video_id, video_scale), _) = bbb_init();
+	let tick = video_scale.as_u64() / 24;
+	let micros = |ticks: u64| u128::from(ticks) * 1_000_000 / u128::from(video_scale.as_u64());
+	let sample = |ticks: u64, keyframe: bool, byte: u8| (micros(ticks), keyframe, bytes::Bytes::from(vec![byte; 2]));
+	let non_sync = 0x0001_0000;
+
+	let cases = [
+		// I, a leading B presenting before it, P, then B, in decode order.
+		(
+			2 * tick,
+			vec![video_fragment(
+				video_id,
+				0,
+				tick,
+				&[
+					(2 * tick, 0, 0xA),
+					(0, non_sync, 0xB),
+					(2 * tick, non_sync, 0xC),
+					(0, non_sync, 0xD),
+				],
+			)],
+			vec![
+				sample(0, true, 0xA),
+				sample(2 * tick, false, 0xC),
+				sample(tick, false, 0xD),
+			],
+		),
+		// An edit after the first I, as a cut at a non-sync sample writes: the P frames after the
+		// edit can't decode without it.
+		(
+			tick,
+			vec![
+				video_fragment(
+					video_id,
+					0,
+					tick,
+					&[(0, 0, 0xA), (0, non_sync, 0xB), (0, non_sync, 0xC)],
+				),
+				video_fragment(video_id, 3 * tick, tick, &[(0, 0, 0xD), (0, non_sync, 0xE)]),
+			],
+			vec![sample(2 * tick, true, 0xD), sample(3 * tick, false, 0xE)],
+		),
+	];
+	for (media_time, fragments, expected) in cases {
+		let init = bbb_init_with_edits(video_id, vec![media_edit(media_time)]);
+		for passthrough in [false, true] {
+			let mut broadcast = moq_net::broadcast::Info::new().produce();
+			let consumer = broadcast.consume();
+			let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+			let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
+			fmp4.decode(&init).unwrap();
+			for fragment in &fragments {
+				fmp4.decode(fragment).unwrap();
+			}
+			let _finished = fmp4.finish().unwrap();
+			let [video, _] = published(&consumer, &catalog).await;
+			assert_eq!(video, expected, "edit at {media_time}, passthrough {passthrough}");
+		}
+	}
+}
+
+/// A video track joined mid-GOP, at the start or after a `seek`, publishes nothing before its next
+/// sync sample, passthrough or unwrapped, even when that sample sits inside a fragment, so no group
+/// opens on a frame its decoder cannot use.
+#[tokio::test]
+async fn video_joined_mid_gop_starts_at_a_sync_sample() {
+	let (_, (video_id, video_scale), _) = bbb_init();
+	let tick = video_scale.as_u64() / 24;
+	let micros = |ticks: u64| u128::from(ticks) * 1_000_000 / u128::from(video_scale.as_u64());
+	let sample = |ticks: u64, keyframe: bool, byte: u8| (micros(ticks), keyframe, bytes::Bytes::from(vec![byte; 2]));
+	let non_sync = 0x0001_0000;
+
+	let init = bbb_init_with_edits(video_id, vec![media_edit(0)]);
+	let fragments = [
+		video_fragment(video_id, 0, tick, &[(0, non_sync, 0xA), (0, non_sync, 0xB)]),
+		video_fragment(
+			video_id,
+			2 * tick,
+			tick,
+			&[(0, non_sync, 0xC), (0, 0, 0xD), (0, non_sync, 0xE)],
+		),
+		video_fragment(video_id, 5 * tick, tick, &[(0, 0, 0xF), (0, non_sync, 0x10)]),
+	];
+	let after_seek = [
+		video_fragment(video_id, 7 * tick, tick, &[(0, non_sync, 0x11)]),
+		video_fragment(video_id, 8 * tick, tick, &[(0, non_sync, 0x12), (0, 0, 0x13)]),
+	];
+	let expected = vec![
+		sample(3 * tick, true, 0xD),
+		sample(4 * tick, false, 0xE),
+		sample(5 * tick, true, 0xF),
+		sample(6 * tick, false, 0x10),
+		sample(9 * tick, true, 0x13),
+	];
+	for passthrough in [false, true] {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let consumer = broadcast.consume();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+		let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
+		fmp4.decode(&init).unwrap();
+		for fragment in &fragments {
+			fmp4.decode(fragment).unwrap();
+		}
+		fmp4.seek(10).unwrap();
+		for fragment in &after_seek {
+			fmp4.decode(fragment).unwrap();
+		}
+		let _finished = fmp4.finish().unwrap();
+		let [video, _] = published(&consumer, &catalog).await;
+		assert_eq!(video, expected, "passthrough {passthrough}");
+	}
 }
 
 #[test]
@@ -676,7 +1450,7 @@ fn test_av1_catalog() {
 	let color = video.color.as_ref().expect("the range");
 	assert_eq!(
 		(color.primaries, color.range),
-		(None, Some(hang::catalog::Range::Limited))
+		(None, Some(hang::catalog::ColorRange::Limited))
 	);
 	let Container::Cmaf { init, .. } = &video.container else {
 		panic!("expected Cmaf container");
@@ -776,7 +1550,7 @@ async fn test_seek_sets_initial_sequence_in(passthrough: bool) {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let broadcast_consumer = broadcast.consume();
 	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
-	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_passthrough(passthrough);
+	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
 
 	let data = include_bytes!("test_data/bbb.mp4");
 
@@ -818,7 +1592,7 @@ async fn test_seek_sets_initial_sequence_in(passthrough: bool) {
 	fmp4.seek(100).unwrap();
 	// Trailing partial fragments may error; ignore.
 	let _ = fmp4.decode(&frag_buf);
-	fmp4.finish().unwrap();
+	let _finished = fmp4.finish().unwrap();
 
 	let sequences = drain_group_sequences(&mut video_track);
 	assert!(!sequences.is_empty(), "expected at least one group");
@@ -842,7 +1616,7 @@ async fn test_msf_catalog_roundtrip() {
 	// MSF catalog track has been created by `catalog::Producer::new`.
 	let consumer = broadcast.consume();
 	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
-	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_passthrough(true);
+	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_cmaf(true);
 
 	let data = include_bytes!("test_data/bbb.mp4");
 	let buf = bytes::BytesMut::from(&data[..]);
@@ -881,72 +1655,22 @@ async fn test_msf_catalog_roundtrip() {
 	assert!(matches!(audio.container, Container::Cmaf { .. }));
 }
 
-/// Subscribe to `track`'s timeline as `section` advertises it.
-async fn subscribe(
-	consumer: &moq_net::broadcast::Consumer,
-	section: &hang::catalog::Archive,
-	track: &str,
-) -> crate::timeline::Consumer {
-	let mut section = section.clone();
-	section
-		.timelines
-		.entry(track.to_string())
-		.or_insert_with(|| hang::catalog::Timeline::new(hang::timeline::default_name(track), 0));
-	crate::timeline::Consumer::<()>::subscribe(consumer, &section, track)
+/// The sequence of every group a finished track published.
+async fn sequences(consumer: &moq_net::broadcast::Consumer, track: &str) -> Vec<u64> {
+	let replay = moq_net::track::Subscription::default()
+		.with_delay(moq_net::track::Delay::default().with_max(std::time::Duration::from_secs(3600)));
+	let mut track = consumer
+		.track(track)
+		.unwrap()
+		.subscribe(replay)
 		.await
 		.unwrap()
-}
-
-/// Every record a finished timeline published, as `(start group, end group)`.
-async fn groups(timeline: &mut crate::timeline::Consumer) -> Vec<(u64, u64)> {
-	let mut out = Vec::new();
-	while let Some(event) = timeline.next().await.unwrap() {
-		if let crate::timeline::Event::Push { entry, .. } = event {
-			assert_eq!(entry.start.frame, 0, "fragments never split a group here");
-			assert_eq!(entry.end.frame, 0, "fragments never split a group here");
-			out.push((entry.start.group, entry.end.group));
-		}
+		.ordered();
+	let mut sequences = Vec::new();
+	while let Some(group) = track.next_group().await.unwrap() {
+		sequences.push(group.sequence);
 	}
-	out
-}
-
-/// Passthrough writes groups by hand (no `container::Producer`), so the timeline recorders are fed
-/// directly. This guards that the import advertises both renditions' timelines at the catalog root
-/// and actually records their groups, the index the VOD/playlist export reads. Regression for the
-/// missing-timeline break that skipped VOD renditions.
-#[tokio::test]
-async fn import_populates_the_broadcast_timeline() {
-	let mut broadcast = moq_net::broadcast::Info::new().produce();
-	let consumer = broadcast.consume();
-	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
-	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve());
-
-	let data = include_bytes!("test_data/bbb.mp4");
-	let buf = bytes::BytesMut::from(&data[..]);
-	// Trailing partial fragments may error; ignore.
-	let _ = fmp4.decode(&buf);
-	fmp4.finish().unwrap();
-
-	let snapshot = catalog.snapshot();
-	assert_eq!(snapshot.video.renditions.len(), 1, "bbb has one video rendition");
-	assert_eq!(snapshot.audio.renditions.len(), 1, "bbb has one audio rendition");
-	let video_name = snapshot.video.renditions.keys().next().unwrap().clone();
-	let audio_name = snapshot.audio.renditions.keys().next().unwrap().clone();
-
-	// This short fixture ends before the four-second estimation record closes, so finishing the
-	// import flushes it and declares the minimum while the catalog stays live.
-	let section = snapshot.archive.clone().expect("the import advertises its timelines");
-	assert_eq!(section.timelines[&video_name].duration, Some(4_000));
-	assert_eq!(section.timelines[&audio_name].duration, Some(4_000));
-
-	// Subscribe while the producer is alive, then finish so the timeline groups close and the
-	// readers terminate rather than blocking.
-	let mut video = subscribe(&consumer, &section, &video_name).await;
-	let mut audio = subscribe(&consumer, &section, &audio_name).await;
-	catalog.finish().unwrap();
-
-	assert_eq!(groups(&mut video).await[0].0, 0, "the first video group is sequence 0");
-	assert_eq!(groups(&mut audio).await[0].0, 0, "the first audio group is sequence 0");
+	sequences
 }
 
 // ---- Sample-duration handling in decode() ----
@@ -1071,6 +1795,7 @@ fn opus_init(entry_rate: u16) -> (mp4_atom::Dops, Vec<u8>) {
 		pre_skip: 312,
 		input_sample_rate: 44_100,
 		output_gain: -1536,
+		channel_mapping: None,
 	};
 	let opus = mp4_atom::Opus {
 		audio: mp4_atom::Audio {
@@ -1123,21 +1848,100 @@ fn opus_catalog_uses_the_decode_rate() {
 	assert_eq!(a.warmup, Some(std::time::Duration::from_millis(80)));
 }
 
-/// A dOps with a channel mapping table is refused rather than imported without it.
+/// `init` with its Opus sample entry declaring `channels` channels and `mapping`.
+fn opus_init_with_mapping(init: &[u8], channels: u8, mapping: mp4_atom::OpusChannelMapping) -> Vec<u8> {
+	let (ftyp, mut moov) = decode_init(init);
+	let mp4_atom::Codec::Opus(opus) = &mut moov.trak[0].mdia.minf.stbl.stsd.codecs[0] else {
+		panic!("expected Opus sample entry");
+	};
+	opus.audio.channel_count = channels.into();
+	opus.dops.output_channel_count = channels;
+	opus.dops.channel_mapping = Some(mapping);
+	let mut data = Vec::new();
+	ftyp.encode(&mut data).unwrap();
+	moov.encode(&mut data).unwrap();
+	data
+}
+
+/// A family 1 5.1 dOps imports with its mapping table in the OpusHead description, and
+/// re-exporting that description writes the same dOps, table included.
 #[test]
-fn opus_dops_mapping_family_is_refused() {
-	let (_, mut data) = opus_init(48_000);
+fn opus_dops_surround_round_trips() {
+	let (_, data) = opus_init(48_000);
+	let mapping = mp4_atom::OpusChannelMapping {
+		family: 1,
+		stream_count: 4,
+		coupled_count: 2,
+		channel_mapping: vec![0, 4, 1, 2, 3, 5],
+	};
+	let data = opus_init_with_mapping(&data, 6, mapping.clone());
+	let (_, moov) = decode_init(&data);
+	let mp4_atom::Codec::Opus(source) = &moov.trak[0].mdia.minf.stbl.stsd.codecs[0] else {
+		panic!("expected Opus sample entry");
+	};
 
-	// The mapping family byte follows version, channels, pre-skip, rate, and gain.
-	let at = data.windows(4).position(|w| w == b"dOps").unwrap() + 4 + 10;
-	assert_eq!(data[at], 0);
-	data[at] = 1;
+	let catalog = run_fmp4(&data);
+	let a = catalog.audio.renditions.values().next().expect("opus rendition");
+	assert_eq!(a.channel_count, 6);
 
-	let mut broadcast = moq_net::broadcast::Info::new().produce();
-	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
-	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve());
-	assert!(fmp4.decode(&bytes::BytesMut::from(data.as_slice())).is_err());
-	assert!(catalog.snapshot().audio.renditions.is_empty());
+	let desc = a.description.as_ref().expect("opus description");
+	let head = crate::codec::opus::Config::parse(&mut desc.as_ref()).unwrap();
+	assert_eq!(head.channel_count, 6);
+	let parsed = head.mapping.expect("mapping table");
+	assert_eq!(parsed.family(), 1);
+	assert_eq!((parsed.streams(), parsed.coupled()), (4, 2));
+	assert_eq!(parsed.table(), &[0, 4, 1, 2, 3, 5]);
+
+	let trak = super::synthesize_audio_trak(1, 48_000, a).expect("synthesize Opus trak");
+	match &trak.mdia.minf.stbl.stsd.codecs[0] {
+		mp4_atom::Codec::Opus(opus) => {
+			assert_eq!(opus.dops, source.dops);
+			assert_eq!(opus.dops.channel_mapping, Some(mapping));
+			assert_eq!(opus.audio.channel_count, 6);
+		}
+		other => panic!("expected Opus sample entry, got {other:?}"),
+	}
+}
+
+/// A dOps mapping the OpusHead cannot describe is refused rather than imported: family 3,
+/// whose OpusHead carries a demixing matrix, and a family 1 table past its 8 channels.
+#[test]
+fn opus_dops_mapping_the_head_cannot_describe_is_refused() {
+	let (_, init) = opus_init(48_000);
+	let cases = [
+		(
+			mp4_atom::OpusChannelMapping {
+				family: 3,
+				stream_count: 2,
+				coupled_count: 2,
+				channel_mapping: vec![0, 1, 2, 3],
+			},
+			crate::codec::opus::Error::UnsupportedMappingFamily(3),
+		),
+		(
+			mp4_atom::OpusChannelMapping {
+				family: 1,
+				stream_count: 9,
+				coupled_count: 0,
+				channel_mapping: (0..9).collect(),
+			},
+			crate::codec::opus::Error::UnsupportedChannelCount(9),
+		),
+	];
+	for (mapping, expected) in cases {
+		let channels = mapping.channel_mapping.len() as u8;
+		let data = opus_init_with_mapping(&init, channels, mapping);
+
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
+		let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve());
+		let err = fmp4.decode(&bytes::BytesMut::from(data.as_slice())).unwrap_err();
+		assert!(
+			matches!(&err, crate::Error::Cmaf(super::Error::Opus(opus)) if opus.to_string() == expected.to_string()),
+			"{err:?}"
+		);
+		assert!(catalog.snapshot().audio.renditions.is_empty());
+	}
 }
 
 // ---- Segment-driven grouping ----
@@ -1216,7 +2020,7 @@ async fn segmented_source_groups_per_segment_in(passthrough: bool) {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
 	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
-	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_passthrough(passthrough);
+	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
 	fmp4.decode(&init).unwrap();
 
 	let snapshot = catalog.snapshot();
@@ -1242,7 +2046,7 @@ async fn segmented_source_groups_per_segment_in(passthrough: bool) {
 			fmp4.decode(&frag).unwrap();
 		}
 	}
-	fmp4.finish().unwrap();
+	let _finished = fmp4.finish().unwrap();
 
 	// An unwrapped video group also ends on a Legacy duration marker.
 	let marker = usize::from(!passthrough);
@@ -1258,33 +2062,27 @@ async fn segmented_source_groups_per_segment_in(passthrough: bool) {
 	);
 }
 
-/// Each declared segment is one group per track, and each track's timeline indexes it as one
-/// record. With audio grouping per fragment those records spanned many short groups, one FETCH
-/// round-trip each.
+/// Each declared segment is one group per track, rather than audio grouping per fragment, and the
+/// join interval is measured from those groups whether or not the import passes fragments through.
 #[tokio::test]
-async fn segmented_source_indexes_one_group_per_record() {
+async fn segmented_source_writes_one_group_per_segment() {
 	for passthrough in [false, true] {
-		segmented_source_indexes_one_group_per_record_in(passthrough).await;
+		segmented_source_writes_one_group_per_segment_in(passthrough).await;
 	}
 }
 
-async fn segmented_source_indexes_one_group_per_record_in(passthrough: bool) {
+async fn segmented_source_writes_one_group_per_segment_in(passthrough: bool) {
 	let (init, (video_id, video_scale), (audio_id, audio_scale)) = bbb_init();
 
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
 	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
-	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_passthrough(passthrough);
+	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
 	fmp4.decode(&init).unwrap();
 
 	let snapshot = catalog.snapshot();
 	let video_name = snapshot.video.renditions.keys().next().unwrap().clone();
 	let audio_name = snapshot.audio.renditions.keys().next().unwrap().clone();
-	let section = snapshot.archive.clone().expect("the import advertises its timelines");
-
-	// Subscribe while the producer is alive so the readers terminate on finish rather than blocking.
-	let mut video = subscribe(&consumer, &section, &video_name).await;
-	let mut audio = subscribe(&consumer, &section, &audio_name).await;
 
 	for segment in 0..3u64 {
 		let base = segment * 1_000_000;
@@ -1306,39 +2104,44 @@ async fn segmented_source_indexes_one_group_per_record_in(passthrough: bool) {
 			fmp4.decode(&frag).unwrap();
 		}
 	}
-	fmp4.finish().unwrap();
+	assert_eq!(
+		catalog.snapshot().media.interval(),
+		Some(std::time::Duration::from_secs(1)),
+		"passthrough={passthrough}"
+	);
+	let _finished = fmp4.finish().unwrap();
 	catalog.finish().unwrap();
 
-	let expected = vec![(0, 1), (1, 2), (2, 3)];
-	assert_eq!(groups(&mut video).await, expected, "one video group per record");
 	assert_eq!(
-		groups(&mut audio).await,
-		expected,
-		"one audio group per record, not one per fragment"
+		sequences(&consumer, &video_name).await,
+		[0, 1, 2],
+		"one video group per segment"
+	);
+	assert_eq!(
+		sequences(&consumer, &audio_name).await,
+		[0, 1, 2],
+		"one audio group per segment, not one per fragment"
 	);
 }
 
 /// Audio and video rarely start a segment at exactly the same timestamp: the boundary is nominal
-/// and each track begins at its own nearest sample. Each track cuts its own timeline where it opens
-/// its group for a declared segment, so a skew between them moves no group into another record.
+/// and each track begins at its own nearest sample. Each track opens its own group for a declared
+/// segment, so a skew between them moves no fragment into another group.
 ///
 /// `video_offset_us` shifts video relative to audio, so the same source is exercised with audio
-/// leading and lagging. Returns each track's records as `(start group, end group)`.
-async fn records_with_skew(video_offset_us: i64, passthrough: bool) -> (Vec<(u64, u64)>, Vec<(u64, u64)>) {
+/// leading and lagging. Returns each track's group sequences.
+async fn groups_with_skew(video_offset_us: i64, passthrough: bool) -> (Vec<u64>, Vec<u64>) {
 	let (init, (video_id, video_scale), (audio_id, audio_scale)) = bbb_init();
 
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
 	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
-	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_passthrough(passthrough);
+	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
 	fmp4.decode(&init).unwrap();
 
 	let snapshot = catalog.snapshot();
 	let video_name = snapshot.video.renditions.keys().next().unwrap().clone();
 	let audio_name = snapshot.audio.renditions.keys().next().unwrap().clone();
-	let section = snapshot.archive.clone().unwrap();
-	let mut video = subscribe(&consumer, &section, &video_name).await;
-	let mut audio = subscribe(&consumer, &section, &audio_name).await;
 
 	for segment in 0..3u64 {
 		let base = segment * 1_000_000;
@@ -1346,7 +2149,7 @@ async fn records_with_skew(video_offset_us: i64, passthrough: bool) -> (Vec<(u64
 		fmp4.decode(&styp()).unwrap();
 
 		// Audio first, so the segment transition is detected on the audio fragment and video's
-		// IDR lands after it. Two fragments each keeps the records unambiguous.
+		// IDR lands after it. Two fragments each keeps the groups unambiguous.
 		for offset in [0u64, 500_000] {
 			let frag = super::encode_fragment(
 				info(audio_id, audio_scale, segment as u32),
@@ -1364,19 +2167,22 @@ async fn records_with_skew(video_offset_us: i64, passthrough: bool) -> (Vec<(u64
 			fmp4.decode(&frag).unwrap();
 		}
 	}
-	fmp4.finish().unwrap();
+	let _finished = fmp4.finish().unwrap();
 	catalog.finish().unwrap();
 
-	(groups(&mut video).await, groups(&mut audio).await)
+	(
+		sequences(&consumer, &video_name).await,
+		sequences(&consumer, &audio_name).await,
+	)
 }
 
 /// Video's IDR lands 20ms AFTER audio's first sample of the segment, the normal interleave.
 #[tokio::test]
 async fn audio_leading_video_still_indexes_one_group_each() {
-	let expected = vec![(0, 1), (1, 2), (2, 3)];
+	let expected = vec![0, 1, 2];
 	for passthrough in [false, true] {
 		assert_eq!(
-			records_with_skew(20_000, passthrough).await,
+			groups_with_skew(20_000, passthrough).await,
 			(expected.clone(), expected.clone())
 		);
 	}
@@ -1385,10 +2191,10 @@ async fn audio_leading_video_still_indexes_one_group_each() {
 /// Video's IDR lands 20ms BEFORE audio's first sample, the other side of the same skew.
 #[tokio::test]
 async fn audio_lagging_video_still_indexes_one_group_each() {
-	let expected = vec![(0, 1), (1, 2), (2, 3)];
+	let expected = vec![0, 1, 2];
 	for passthrough in [false, true] {
 		assert_eq!(
-			records_with_skew(-20_000, passthrough).await,
+			groups_with_skew(-20_000, passthrough).await,
 			(expected.clone(), expected.clone())
 		);
 	}
@@ -1415,7 +2221,7 @@ async fn a_single_leading_styp_still_segments_on_keyframes_in(passthrough: bool)
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
 	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
-	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_passthrough(passthrough);
+	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
 	fmp4.decode(&init).unwrap();
 
 	let snapshot = catalog.snapshot();
@@ -1441,7 +2247,7 @@ async fn a_single_leading_styp_still_segments_on_keyframes_in(passthrough: bool)
 		.unwrap();
 		fmp4.decode(&frag).unwrap();
 	}
-	fmp4.finish().unwrap();
+	let _finished = fmp4.finish().unwrap();
 
 	// An unwrapped video group also ends on a Legacy duration marker.
 	let marker = usize::from(!passthrough);
@@ -1475,7 +2281,7 @@ async fn a_mid_gop_join_keeps_tracks_on_the_same_groups_in(passthrough: bool) {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
 	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
-	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_passthrough(passthrough);
+	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
 	fmp4.decode(&init).unwrap();
 
 	let snapshot = catalog.snapshot();
@@ -1500,7 +2306,7 @@ async fn a_mid_gop_join_keeps_tracks_on_the_same_groups_in(passthrough: bool) {
 		.unwrap();
 		fmp4.decode(&frag).unwrap();
 	}
-	fmp4.finish().unwrap();
+	let _finished = fmp4.finish().unwrap();
 
 	let video = drain_group_sequences(&mut video_track);
 	let audio = drain_group_sequences(&mut audio_track);
@@ -1524,7 +2330,7 @@ fn audio_fragment(base_media_decode_time: u64, duration: u32, size: u32) -> Vec<
 			tfdt: Some(mp4_atom::Tfdt { base_media_decode_time }),
 			trun: vec![mp4_atom::Trun {
 				data_offset: None,
-				entries: vec![mp4_atom::TrunEntry::default()],
+				samples: vec![mp4_atom::TrunEntry::default()].into(),
 			}],
 			..Default::default()
 		}],
@@ -1579,7 +2385,7 @@ fn non_advancing_fragment_decode_time_is_rejected() {
 }
 
 #[test]
-fn rejected_fragment_preserves_decode_time() {
+fn rejected_fragment_keeps_the_first_error() {
 	let (ftyp, moov) = decode_init(include_bytes!("test_data/bbb.mp4"));
 	let mut init = Vec::new();
 	ftyp.encode(&mut init).unwrap();
@@ -1589,14 +2395,13 @@ fn rejected_fragment_preserves_decode_time() {
 	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve());
 	fmp4.decode(&init).unwrap();
 	fmp4.decode(&audio_fragment(4096, 1024, 327)).unwrap();
-	assert!(fmp4.decode(&audio_fragment(3000, 1024, 327)).is_err());
-	assert!(matches!(
-		fmp4.decode(&audio_fragment(3500, 1024, 327)),
-		Err(crate::Error::Cmaf(
-			crate::container::fmp4::Error::NonMonotonicDecodeTime { decode_time, previous, .. }
-		)) if previous == moq_net::Timestamp::from_scale(4096, 44100).unwrap()
-			&& decode_time == moq_net::Timestamp::from_scale(3500, 44100).unwrap()
-	));
+	let err = fmp4.decode(&audio_fragment(3000, 1024, 327)).unwrap_err();
+	for time in [3500, 5120] {
+		assert_eq!(
+			fmp4.decode(&audio_fragment(time, 1024, 327)).unwrap_err().to_string(),
+			err.to_string()
+		);
+	}
 }
 
 /// Like [`audio_fragment`] but carrying `samples` samples, the shape a real segmenter emits.
@@ -1613,7 +2418,7 @@ fn audio_fragment_samples(base_media_decode_time: u64, duration: u32, size: u32,
 			tfdt: Some(mp4_atom::Tfdt { base_media_decode_time }),
 			trun: vec![mp4_atom::Trun {
 				data_offset: None,
-				entries: vec![mp4_atom::TrunEntry::default(); samples],
+				samples: vec![mp4_atom::TrunEntry::default(); samples].into(),
 			}],
 			..Default::default()
 		}],
@@ -1647,7 +2452,7 @@ fn fragment_jitter_never_shrinks_in(passthrough: bool) {
 
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
-	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_passthrough(passthrough);
+	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
 	fmp4.decode(&init).unwrap();
 
 	let audio_jitter = |catalog: &crate::catalog::Producer| {
@@ -1684,7 +2489,7 @@ fn fragment_jitter_never_shrinks_in(passthrough: bool) {
 		"a tighter fragment pair lowered the jitter"
 	);
 
-	fmp4.finish().unwrap();
+	let _finished = fmp4.finish().unwrap();
 	assert_eq!(audio_jitter(&catalog), Some(cadence));
 }
 
@@ -1719,14 +2524,15 @@ fn fragment_jitter_uses_sample_endpoints() {
 				}),
 				trun: vec![mp4_atom::Trun {
 					data_offset: None,
-					entries: samples
+					samples: samples
 						.iter()
 						.map(|(duration, cts)| mp4_atom::TrunEntry {
 							duration: *duration,
 							cts: Some(*cts),
 							..Default::default()
 						})
-						.collect(),
+						.collect::<Vec<_>>()
+						.into(),
 				}],
 				..Default::default()
 			}],
@@ -1765,11 +2571,9 @@ fn live_session(start_us: u64, frames: u64) -> Vec<u8> {
 struct Imported {
 	published: std::collections::BTreeMap<String, Vec<u128>>,
 	video: String,
-	/// The root clock the catalog advertised.
+	/// The `media.clock` the catalog advertised.
 	clock: hang::catalog::Clock,
-	arrival: std::ops::RangeInclusive<std::time::SystemTime>,
-	/// The first record the video timeline published, the index an archive replays from.
-	record: moq_net::Timestamp,
+	arrival: std::ops::RangeInclusive<kio::clock::Wall>,
 	/// Why a chunk was refused, if one was.
 	refused: Option<crate::Error>,
 }
@@ -1780,16 +2584,14 @@ async fn import_session(chunks: &[Vec<u8>]) -> Imported {
 	let (init, _, _) = bbb_init();
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
-	let mut catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
+	let mut catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
 	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve());
 	fmp4.decode(&init).unwrap();
 
 	let snapshot = catalog.snapshot();
 	let video = snapshot.video.renditions.keys().next().unwrap().clone();
-	let section = snapshot.archive.clone().expect("the import advertises its timelines");
-	let mut timeline = subscribe(&consumer, &section, &video).await;
 
-	let before = std::time::SystemTime::now();
+	let before = kio::clock::wall();
 	let mut after = before;
 	let mut refused = None;
 	for (i, chunk) in chunks.iter().enumerate() {
@@ -1798,31 +2600,25 @@ async fn import_session(chunks: &[Vec<u8>]) -> Imported {
 			break;
 		}
 		if i == 0 {
-			after = std::time::SystemTime::now();
+			after = kio::clock::wall();
 		}
 	}
-	fmp4.finish().unwrap();
+	let _finished = fmp4.finish().unwrap();
 	catalog.finish().unwrap();
-
-	let event = timeline.next().await.unwrap().expect("a recorded span");
-	let crate::timeline::Event::Push { entry, .. } = event else {
-		panic!("the first timeline event was not a record");
-	};
 
 	let snapshot = catalog.snapshot();
 	Imported {
 		published: crate::container::test_util::published(&consumer, &snapshot).await,
 		video,
-		clock: snapshot.clock.expect("the catalog advertises a clock"),
+		clock: snapshot.media.clock.expect("the catalog advertises a clock"),
 		arrival: before..=after,
-		record: entry.pts,
 		refused,
 	}
 }
 
 /// A feed an hour into its own decode timeline publishes that hour verbatim (the `tfdt` a
 /// decoder reads is untouched), and the catalog clock maps its first fragment to the arrival
-/// time. The archive index records the same times, so a replay names each segment's wall time.
+/// time, so a playlist names each segment's wall time.
 #[tokio::test]
 async fn import_publishes_decode_times_on_an_arrival_clock() {
 	let start = 3_600_000_000;
@@ -1831,15 +2627,11 @@ async fn import_publishes_decode_times_on_an_arrival_clock() {
 
 	let first = import.published[&import.video][0];
 	assert_eq!(first, start as u128, "the source's own decode time");
-	assert_eq!(
-		import.record.as_micros(),
-		first,
-		"the archive indexes the source's time"
-	);
 
 	// The advertised clock is micros, so allow its rounding.
 	let tick = std::time::Duration::from_micros(1);
-	let wall = import.clock.wall_clock(import.record).unwrap();
+	let first = moq_net::Timestamp::from_micros(first as u64).unwrap();
+	let wall = import.clock.wall_clock(first).unwrap();
 	assert!(
 		*import.arrival.start() - tick <= wall && wall <= *import.arrival.end() + tick,
 		"the first fragment is live on arrival"
@@ -1875,9 +2667,11 @@ async fn join_after(earlier: Earlier, start_us: u64) {
 					moq_net::track::Info::default().with_timescale(moq_net::Timescale::MILLI),
 				)
 				.unwrap();
-			let mut stream = catalog.binary_stream(track, crate::binary::Config::default()).unwrap();
+			let mut stream = catalog
+				.json_stream::<serde_json::Value>(track, crate::json::Config::default())
+				.unwrap();
 			stream
-				.append(moq_net::Timed::from(&b"before"[..]).at(catalog.clock().now()))
+				.append(&serde_json::json!("before"), catalog.clock().now())
 				.unwrap();
 			Some(stream)
 		}
@@ -1885,7 +2679,7 @@ async fn join_after(earlier: Earlier, start_us: u64) {
 	};
 	let mut stamps = data.as_ref().map(|stream| stream.consume());
 	let clock = catalog.clock();
-	let fixed = catalog.snapshot().clock;
+	let fixed = catalog.snapshot().media.clock;
 
 	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve());
 	fmp4.decode(&init).unwrap();
@@ -1894,13 +2688,16 @@ async fn join_after(earlier: Earlier, start_us: u64) {
 	let after = clock.now().as_micros();
 	if let Some(stream) = data.as_mut() {
 		stream
-			.append(moq_net::Timed::from(&b"after"[..]).at(catalog.clock().now()))
+			.append(&serde_json::json!("after"), catalog.clock().now())
 			.unwrap();
 	}
-	fmp4.finish().unwrap();
+	let _finished = fmp4.finish().unwrap();
 
 	let snapshot = catalog.snapshot();
-	assert_eq!(snapshot.clock, fixed, "{earlier:?}: the import never moves the clock");
+	assert_eq!(
+		snapshot.media.clock, fixed,
+		"{earlier:?}: the import never moves the clock"
+	);
 	let published = crate::container::test_util::published(&consumer, &snapshot).await;
 	let video = &published[snapshot.video.renditions.keys().next().unwrap()];
 	// The offset rounds down to the track's own units.
@@ -1950,7 +2747,7 @@ async fn an_import_shifts_onto_an_explicit_clock() {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
 	let clock = crate::Clock::new();
-	let config = crate::catalog::Config::default().with_clock(clock);
+	let config = crate::catalog::Config::default().with_clock(clock.clone());
 	let catalog = crate::catalog::Producer::new(&mut broadcast, config).unwrap();
 
 	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve());
@@ -1958,10 +2755,10 @@ async fn an_import_shifts_onto_an_explicit_clock() {
 	let before = clock.now().as_micros();
 	fmp4.decode(&live_session(3_600_000_000, 5)).unwrap();
 	let after = clock.now().as_micros();
-	fmp4.finish().unwrap();
+	let _finished = fmp4.finish().unwrap();
 
 	let snapshot = catalog.snapshot();
-	assert_eq!(snapshot.clock, clock.wall());
+	assert_eq!(snapshot.media.clock, clock.wall());
 	let published = crate::container::test_util::published(&consumer, &snapshot).await;
 	let first = published[snapshot.video.renditions.keys().next().unwrap()][0];
 	assert!((before - TICK..=after).contains(&first), "{before} {first} {after}");
@@ -1999,34 +2796,30 @@ async fn seek_keeps_the_decode_time_until_a_discontinuity() {
 
 async fn seek_keeps_the_decode_time_until_a_discontinuity_in(passthrough: bool) {
 	let (init, _, _) = bbb_init();
-	let mut broadcast = moq_net::broadcast::Info::new().produce();
-	let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
-	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_passthrough(passthrough);
-	fmp4.decode(&init).unwrap();
-	fmp4.decode(&live_session(5_000_000, 5)).unwrap();
-
-	fmp4.seek(100).unwrap();
-	let err = fmp4.decode(&live_session(0, 5)).unwrap_err();
-	assert!(
-		matches!(
-			err,
-			crate::Error::Cmaf(crate::container::fmp4::Error::NonMonotonicDecodeTime { .. })
-		),
-		"{err:?}"
-	);
-
-	fmp4.discontinuity();
-	fmp4.seek(200).unwrap();
-	let err = fmp4.decode(&live_session(0, 5)).unwrap_err();
-	// Passthrough writes its groups by hand, so the track refuses the rewound group; unwrapped,
-	// the media producer refuses the rewound keyframe before it gets that far.
-	assert!(
-		match passthrough {
-			true => matches!(err, crate::Error::Moq(moq_net::Error::TimestampMismatch)),
-			false => matches!(err, crate::Error::TimestampRewind(_)),
-		},
-		"{err:?}"
-	);
+	for discontinuity in [false, true] {
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
+		let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
+		fmp4.decode(&init).unwrap();
+		fmp4.decode(&live_session(5_000_000, 5)).unwrap();
+		if discontinuity {
+			fmp4.discontinuity().unwrap();
+		}
+		fmp4.seek(100).unwrap();
+		let err = fmp4.decode(&live_session(0, 5)).unwrap_err();
+		if discontinuity {
+			// Passthrough and unwrapped tracks both refuse a rewound group themselves.
+			assert!(matches!(err, crate::Error::TimestampRewind(_)), "{err:?}");
+		} else {
+			assert!(
+				matches!(
+					err,
+					crate::Error::Cmaf(crate::container::fmp4::Error::NonMonotonicDecodeTime { .. })
+				),
+				"{err:?}"
+			);
+		}
+	}
 }
 
 /// The catalog is first published at the first fragment, carrying the clock that fragment
@@ -2037,7 +2830,7 @@ async fn first_catalog_carries_the_anchored_clock() {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
 	let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
-	let provisional = catalog.snapshot().clock.expect("a clock");
+	let provisional = catalog.snapshot().media.clock.expect("a clock");
 	let mut clocks = crate::container::test_util::Clocks::subscribe(&consumer).await;
 	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve());
 
@@ -2045,13 +2838,13 @@ async fn first_catalog_carries_the_anchored_clock() {
 	assert_eq!(clocks.drain(), vec![], "the moov alone publishes nothing");
 
 	fmp4.decode(&live_session(3_600_000_000, 20)).unwrap();
-	let anchored = catalog.snapshot().clock.expect("a clock");
+	let anchored = catalog.snapshot().media.clock.expect("a clock");
 	assert_ne!(anchored, provisional, "the first fragment anchors the clock");
 	let published = clocks.drain();
 	assert!(!published.is_empty(), "the first fragment publishes the catalog");
 	assert!(published.iter().all(|clock| *clock == Some(anchored)), "{published:?}");
 
-	fmp4.finish().unwrap();
+	let _finished = fmp4.finish().unwrap();
 	assert!(clocks.drain().iter().all(|clock| *clock == Some(anchored)));
 }
 
@@ -2091,24 +2884,6 @@ async fn a_moov_with_nothing_selected_releases_its_reservation() {
 		.mutate(|catalog| catalog.m2ts = Some(hang::catalog::M2ts::new("input.m2ts")))
 		.unwrap();
 	assert_eq!(clocks.drain().len(), 1, "no reservation still gates the catalog");
-}
-
-/// A moov after `finish()` is refused: its tracks would be declared but never finished.
-#[test]
-fn a_moov_after_finish_is_refused() {
-	let (init, _, _) = bbb_init();
-	let mut broadcast = moq_net::broadcast::Info::new().produce();
-	let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
-	let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve());
-
-	fmp4.finish().unwrap();
-	let err = fmp4.decode(&init).unwrap_err();
-	assert!(
-		matches!(err, crate::Error::Cmaf(crate::container::fmp4::Error::MoovAfterFinish)),
-		"{err:?}"
-	);
-	let snapshot = catalog.snapshot();
-	assert!(snapshot.video.renditions.is_empty() && snapshot.audio.renditions.is_empty());
 }
 
 /// The catalog waits for a selected track's fragment: a deselected track's fragment is skipped,
@@ -2152,7 +2927,7 @@ async fn imports_the_sample_defaults_fixtures_in(passthrough: bool) {
 		let mut broadcast = moq_net::broadcast::Info::new().produce();
 		let consumer = broadcast.consume();
 		let catalog = crate::catalog::Producer::new(&mut broadcast, crate::catalog::Config::default()).unwrap();
-		let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_passthrough(passthrough);
+		let mut fmp4 = crate::container::fmp4::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
 		fmp4.decode(&fixture.init).unwrap();
 
 		let snapshot = catalog.snapshot();
@@ -2177,7 +2952,7 @@ async fn imports_the_sample_defaults_fixtures_in(passthrough: bool) {
 
 		fmp4.decode(&fixture.fragment).unwrap();
 		fmp4.decode(&later).unwrap();
-		fmp4.finish().unwrap();
+		let _finished = fmp4.finish().unwrap();
 
 		let Some(wire) = wire else {
 			// Unwrapped, each sample is its own frame and each sync sample opens a group. Legacy
@@ -2243,7 +3018,7 @@ fn an_unknown_subtitle_track_does_not_refuse_supported_media() {
 	let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
 	let mut importer = super::Import::new(broadcast, catalog.reserve());
 	importer.decode(&input).unwrap();
-	importer.finish().unwrap();
+	let _finished = importer.finish().unwrap();
 	assert!(!catalog.snapshot().video.renditions.is_empty());
 	assert!(catalog.snapshot().text.renditions.is_empty());
 }
@@ -2284,13 +3059,14 @@ fn webvtt_fragment(decode_time: u64, samples: &[Vec<u8>], duration: u32) -> Vec<
 			}),
 			trun: vec![mp4_atom::Trun {
 				data_offset: None,
-				entries: samples
+				samples: samples
 					.iter()
 					.map(|sample| mp4_atom::TrunEntry {
 						size: Some(sample.len() as u32),
 						..Default::default()
 					})
-					.collect(),
+					.collect::<Vec<_>>()
+					.into(),
 			}],
 			..Default::default()
 		}],
@@ -2327,7 +3103,7 @@ async fn webvtt_samples_become_timed_text_with_source_metadata() {
 	let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
 	let mut importer = super::Import::new(broadcast, catalog.reserve());
 	importer.decode(&input).unwrap();
-	importer.finish().unwrap();
+	let _finished = importer.finish().unwrap();
 	let snapshot = catalog.snapshot();
 	assert_eq!(snapshot.text.renditions.len(), 1);
 	let (name, config) = snapshot.text.renditions.iter().next().unwrap();
@@ -2390,9 +3166,67 @@ fn empty_and_multiple_webvtt_cues_are_supported() {
 		let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
 		let mut importer = super::Import::new(broadcast, catalog.reserve());
 		importer.decode(&input).unwrap();
-		importer.finish().unwrap();
+		let _finished = importer.finish().unwrap();
 		assert_eq!(catalog.snapshot().text.renditions.len(), 1);
 	}
+}
+
+/// A text sample is staged whole before it is rewritten, so one past the bound is refused before
+/// any of its bytes arrive, and later input stays refused.
+#[test]
+fn oversized_text_sample_is_refused_before_staging() {
+	let size = super::MAX_HELD_BYTES + 1;
+	let moof = mp4_atom::Moof {
+		mfhd: mp4_atom::Mfhd { sequence_number: 1 },
+		traf: vec![mp4_atom::Traf {
+			tfhd: mp4_atom::Tfhd {
+				track_id: 1,
+				default_sample_duration: Some(1000),
+				..Default::default()
+			},
+			tfdt: Some(mp4_atom::Tfdt {
+				base_media_decode_time: 0,
+			}),
+			trun: vec![mp4_atom::Trun {
+				data_offset: None,
+				samples: vec![mp4_atom::TrunEntry {
+					size: Some(size as u32),
+					..Default::default()
+				}]
+				.into(),
+			}],
+			..Default::default()
+		}],
+	};
+	let mut header = Vec::new();
+	moof.encode(&mut header).unwrap();
+	mp4_atom::Header {
+		kind: b"mdat".into(),
+		size: Some(size),
+	}
+	.encode(&mut header)
+	.unwrap();
+
+	let mut broadcast = moq_net::broadcast::Info::new().produce();
+	let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
+	let mut importer = super::Import::new(broadcast, catalog.reserve());
+	importer.decode(&webvtt_init("WEBVTT")).unwrap();
+	let err = importer.decode(&header).unwrap_err();
+	assert!(
+		matches!(err, crate::Error::Cmaf(super::Error::TextSampleTooLarge(refused)) if refused == size),
+		"{err:?}"
+	);
+	assert_eq!(importer.decode(&[0xA5; 1024]).unwrap_err().to_string(), err.to_string());
+	let cue = subtitle_box(b"vttc", &subtitle_box(b"payl", b"hello"));
+	assert_eq!(
+		importer
+			.decode(&webvtt_fragment(0, &[cue], 1000))
+			.unwrap_err()
+			.to_string(),
+		err.to_string()
+	);
+	let _finished = importer.finish().unwrap();
+	assert_eq!(catalog.snapshot().text.renditions.len(), 1);
 }
 
 /// The WebVTT `Kind` header sets the role, and lone CR line terminators are accepted.
@@ -2409,7 +3243,7 @@ async fn webvtt_kind_and_lone_cr_terminators() {
 	let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
 	let mut importer = super::Import::new(broadcast, catalog.reserve());
 	importer.decode(&input).unwrap();
-	importer.finish().unwrap();
+	let _finished = importer.finish().unwrap();
 	let snapshot = catalog.snapshot();
 	let (name, config) = snapshot.text.renditions.iter().next().unwrap();
 	assert_eq!(config.role, hang::catalog::TextRole::Caption);
@@ -2440,7 +3274,7 @@ fn webvtt_seek_after_several_cues_does_not_reuse_a_group() {
 	// Segment 101 was missed; groups 100..=102 already hold the three cues.
 	importer.seek(102).unwrap();
 	importer.decode(&webvtt_fragment(4000, &[cue], 1000)).unwrap();
-	importer.finish().unwrap();
+	let _finished = importer.finish().unwrap();
 }
 
 /// A text fragment may not start inside the decode span of the previous fragment's samples.
@@ -2485,8 +3319,8 @@ fn emsg_metadata_drops_warn_once() {
 	data.extend_from_slice(&fixture[..cursor.position() as usize]);
 	data.extend_from_slice(&audio_fragment(0, 1024, 327));
 	import.decode(&data).unwrap();
-	import.finish().unwrap();
 	assert_eq!(import.dropped_metadata(), 2);
+	let _import = import.finish().unwrap();
 	assert_eq!(catalog.snapshot().video.renditions.len(), 1);
 	assert_eq!(catalog.snapshot().audio.renditions.len(), 1);
 	logs_assert(|lines| {
@@ -2521,7 +3355,7 @@ async fn webvtt_sub_millisecond_cue_stays_positive() {
 	let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
 	let mut importer = super::Import::new(broadcast, catalog.reserve());
 	importer.decode(&init).unwrap();
-	importer.finish().unwrap();
+	let _finished = importer.finish().unwrap();
 	let snapshot = catalog.snapshot();
 	let name = snapshot.text.renditions.keys().next().unwrap();
 	let track = consumer.track(name).unwrap().subscribe(None).await.unwrap();
@@ -2539,7 +3373,7 @@ async fn imported_webvtt(payload: Vec<u8>) -> bytes::Bytes {
 	let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
 	let mut importer = super::Import::new(broadcast, catalog.reserve());
 	importer.decode(&webvtt_input(payload, 1250)).unwrap();
-	importer.finish().unwrap();
+	let _finished = importer.finish().unwrap();
 	let snapshot = catalog.snapshot();
 	let name = snapshot.text.renditions.keys().next().unwrap();
 	let track = consumer.track(name).unwrap().subscribe(None).await.unwrap();
@@ -2642,7 +3476,7 @@ async fn imported_ttml(
 	input.extend(webvtt_fragment(100_000, &[TTML.as_bytes().to_vec()], 4000));
 	let mut importer = super::Import::new(broadcast, timebase.reserve());
 	importer.decode(&input).unwrap();
-	importer.finish().unwrap();
+	let _finished = importer.finish().unwrap();
 	let snapshot = catalog.snapshot();
 	let (name, config) = snapshot.text.renditions.iter().next().unwrap();
 	let track = consumer.track(name).unwrap().subscribe(None).await.unwrap();
@@ -2672,7 +3506,7 @@ async fn ttml_samples_become_timed_text_with_source_metadata() {
 /// The source joins a catalog clock another input already fixed, so its TTML times move with it.
 #[tokio::test(start_paused = true)]
 async fn ttml_follows_a_shifted_source_clock() {
-	let wall = std::time::SystemTime::now();
+	let wall = kio::clock::wall();
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let consumer = broadcast.consume();
 	let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
@@ -2702,7 +3536,7 @@ fn unsupported_stpp_tracks_are_skipped() {
 		let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
 		let mut importer = super::Import::new(broadcast, catalog.reserve());
 		importer.decode(&input).unwrap();
-		importer.finish().unwrap();
+		let _finished = importer.finish().unwrap();
 		assert!(catalog.snapshot().text.renditions.is_empty(), "{namespace} {mime}");
 	}
 }
@@ -2735,7 +3569,7 @@ async fn ttml_body_begins_at_the_serialized_frame_timestamp() {
 	let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
 	let mut importer = super::Import::new(broadcast, catalog.reserve());
 	importer.decode(&input).unwrap();
-	importer.finish().unwrap();
+	let _finished = importer.finish().unwrap();
 	let snapshot = catalog.snapshot();
 	let name = snapshot.text.renditions.keys().next().unwrap();
 	let track = consumer.track(name).unwrap().subscribe(None).await.unwrap();
@@ -2803,6 +3637,23 @@ fn colr_fills_what_the_sps_leaves_unsaid() {
 	assert_eq!(video.color, Some(color(9, 16, 9, true)));
 }
 
+/// ICC profiles do not hide the CICP colour carried by another colr box.
+#[test]
+fn colr_after_an_icc_profile_fills_the_catalog() {
+	let init = avc1_init(crate::codec::h264::fixtures::SPS_IPB, Some(color(9, 16, 9, true)));
+	let (ftyp, mut moov) = decode_init(&init);
+	let mp4_atom::Codec::Avc1(avc1) = &mut moov.trak[0].mdia.minf.stbl.stsd.codecs[0] else {
+		panic!("expected avc1");
+	};
+	avc1.colr.insert(0, mp4_atom::Colr::Prof { profile: vec![1, 2, 3] });
+	let mut init = Vec::new();
+	ftyp.encode(&mut init).unwrap();
+	moov.encode(&mut init).unwrap();
+	let catalog = run_fmp4(&init);
+	let video = catalog.video.renditions.values().next().unwrap();
+	assert_eq!(video.color, Some(color(9, 16, 9, true)));
+}
+
 /// A source that signals no colour adds no catalog field and no colr box.
 #[test]
 fn unsignalled_color_stays_absent() {
@@ -2811,12 +3662,25 @@ fn unsignalled_color_stays_absent() {
 	let mp4_atom::Codec::Avc1(avc1) = &moov.trak[0].mdia.minf.stbl.stsd.codecs[0] else {
 		panic!("expected avc1");
 	};
-	assert_eq!(avc1.colr, None);
+	assert!(avc1.colr.is_empty());
 
 	let catalog = run_fmp4(&init);
 	let video = catalog.video.renditions.values().next().unwrap();
 	assert_eq!(video.color, None);
 	assert!(serde_json::to_value(video).unwrap().get("color").is_none());
+}
+
+/// A field-coded SPS in the avcC marks the rendition interlaced, so the player picks a decoder that accepts it.
+#[test]
+fn field_coded_sps_marks_interlaced() {
+	for (sps, interlaced) in [
+		(crate::codec::h264::fixtures::SPS_IPB, false),
+		(crate::codec::h264::fixtures::SPS_FIELD, true),
+	] {
+		let catalog = run_fmp4(&avc1_init(sps, None));
+		let video = catalog.video.renditions.values().next().unwrap();
+		assert_eq!(video.interlaced, interlaced);
+	}
 }
 
 /// An SDR init imported to the catalog and exported again is byte-identical.
@@ -2921,4 +3785,84 @@ fn colr_nclc_keeps_its_code_points() {
 		(Some(9), Some(16), Some(9), None)
 	);
 	assert!(super::colr_color(&mp4_atom::Colr::new(300, 1, 1, false).unwrap()).is_err());
+}
+
+/// A declared boundary waits for decodable video; dependent fragments stay in the old group.
+#[tokio::test(start_paused = true)]
+async fn declared_boundaries_wait_for_sync_samples() {
+	for passthrough in [false, true] {
+		for explicit in [false, true] {
+			let (init, (video_id, video_scale), _) = bbb_init();
+			let mut broadcast = moq_net::broadcast::Info::new().produce();
+			let consumer = broadcast.consume();
+			let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
+			let mut import = super::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
+			import.decode(&init).unwrap();
+			let snapshot = catalog.snapshot();
+			let name = snapshot.video.renditions.keys().next().unwrap();
+			let mut track = consumer.track(name).unwrap().subscribe(replay()).await.unwrap();
+			for (index, sync) in [true, false, false, true, false, true].into_iter().enumerate() {
+				if index == 1 {
+					if explicit {
+						import.cut().unwrap();
+					} else {
+						import.decode(&styp()).unwrap();
+					}
+				}
+				let fragment = super::encode_fragment(
+					info(video_id, video_scale, index as u32),
+					&[sample(index as u64 * 1_000_000, sync, Some(1_000_000))],
+				)
+				.unwrap();
+				import.decode(&fragment).unwrap();
+			}
+			let _finished = import.finish().unwrap();
+			let marker = usize::from(!passthrough);
+			assert_eq!(
+				drain_group_frames(&mut track),
+				vec![3 + marker, 2 + marker, 1 + marker],
+				"passthrough {passthrough}, explicit {explicit}"
+			);
+		}
+	}
+}
+
+#[tokio::test(start_paused = true)]
+async fn declared_boundaries_do_not_split_passthrough_fragments() {
+	for passthrough in [false, true] {
+		let (init, (video_id, video_scale), _) = bbb_init();
+		let mut broadcast = moq_net::broadcast::Info::new().produce();
+		let consumer = broadcast.consume();
+		let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
+		let mut import = super::Import::new(broadcast, catalog.reserve()).with_cmaf(passthrough);
+		import.decode(&init).unwrap();
+		let snapshot = catalog.snapshot();
+		let name = snapshot.video.renditions.keys().next().unwrap();
+		let mut track = consumer.track(name).unwrap().subscribe(replay()).await.unwrap();
+		let tick = video_scale.as_u64() / 24;
+		let non_sync = 0x0001_0000;
+		import
+			.decode(&video_fragment(video_id, 0, tick, &[(0, 0, 0xA)]))
+			.unwrap();
+		import.cut().unwrap();
+		import
+			.decode(&video_fragment(
+				video_id,
+				tick,
+				tick,
+				&[(0, non_sync, 0xB), (0, 0, 0xC)],
+			))
+			.unwrap();
+		import
+			.decode(&video_fragment(video_id, 3 * tick, tick, &[(0, non_sync, 0xD)]))
+			.unwrap();
+		import
+			.decode(&video_fragment(video_id, 4 * tick, tick, &[(0, 0, 0xE)]))
+			.unwrap();
+		let _finished = import.finish().unwrap();
+		assert_eq!(
+			drain_group_frames(&mut track),
+			if passthrough { vec![3, 1] } else { vec![3, 3, 2] }
+		);
+	}
 }

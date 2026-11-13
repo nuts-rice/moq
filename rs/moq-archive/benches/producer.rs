@@ -1,5 +1,8 @@
-// Host time measures benchmark throughput.
-#![allow(clippy::disallowed_methods, clippy::disallowed_types)]
+#![expect(
+	clippy::disallowed_methods,
+	clippy::disallowed_types,
+	reason = "host time measures benchmark throughput"
+)]
 
 //! `Producer::run` recording every track of a broadcast into memory, swept over the number of
 //! tracks and the groups each one holds. Throughput is per frame, so a per-event cost that grows
@@ -10,9 +13,9 @@
 use std::time::{Duration, Instant};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use moq_archive::object_store::memory::InMemory;
 use moq_archive::{Producer, Store, producer};
 use moq_net::{Timescale, Timestamp, broadcast, group, track};
+use object_store::memory::InMemory;
 
 const FRAMES_PER_GROUP: u64 = 2;
 
@@ -51,7 +54,7 @@ async fn record(source: broadcast::Producer, tracks: Vec<track::Producer>) -> Du
 		while track.subscription().is_none() {
 			tokio::task::yield_now().await;
 		}
-		track.finish().unwrap();
+		drop(track.clone().finish().unwrap());
 	}
 	source.close();
 	run.await.unwrap().unwrap();

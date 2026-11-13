@@ -7,15 +7,19 @@
 
 #include <moq/moq.hpp>
 
+#include "moq-worker.h"
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -53,6 +57,22 @@ inline bool WaitFor(const std::function<bool()> &done, std::chrono::milliseconds
 	return true;
 }
 
+// Runs whatever `worker` already queued, so a test checks what an object's dropped calls
+// did without waiting out a window. Dropping a moq::Continuation does not recall a result
+// whose delivery already began, which can still queue after this returns: a check after
+// it can miss a stale continuation, never fail falsely.
+inline void Drain(const MoQWorker &worker)
+{
+	auto drained = std::make_shared<std::promise<void>>();
+	// A stopped worker runs nothing more, which is just as settled.
+	if (!worker.Executor()([drained] { drained->set_value(); }))
+		return;
+	if (drained->get_future().wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+		std::fprintf(stderr, "FAIL: the worker never reached the drain\n");
+		std::abort();
+	}
+}
+
 // A moq-ffi server that publishes every broadcast it consumes, so whatever one
 // session announces, another can subscribe to.
 //
@@ -63,7 +83,7 @@ class TestRelay {
 public:
 	// With `accept` false the relay listens but never completes a handshake, so a
 	// connect to it stays pending.
-	explicit TestRelay(bool accept = true)
+	explicit TestRelay(bool accept = true, const std::vector<std::string> &versions = {})
 	{
 		origin = moq::OriginProducer::init(moq::OriginConfig{});
 		// The fingerprint needs the TCP port matching the UDP one the server drew, which
@@ -73,6 +93,7 @@ public:
 				server->cancel();
 			moq::ServerConfig config;
 			config.bind = "127.0.0.1:0";
+			config.versions = versions;
 			config.tls.generate = {"localhost"};
 			config.publish = origin;
 			config.consume = origin;
@@ -134,6 +155,14 @@ public:
 		return accepted;
 	}
 
+	// Whether a session the relay accepted advertised an implementation starting with `prefix`.
+	bool Advertised(const std::string &prefix)
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		return std::any_of(implementations.begin(), implementations.end(),
+				   [&](const std::string &value) { return value.rfind(prefix, 0) == 0; });
+	}
+
 	std::shared_ptr<moq::OriginProducer> origin;
 
 private:
@@ -143,11 +172,13 @@ private:
 			auto request = server->accept().get();
 			if (!request || !*request)
 				return;
+			const auto implementation = (*request)->peer_implementation();
 			auto session = (*request)->accept(nullptr, nullptr).get();
 			if (!session)
 				continue;
 			std::lock_guard<std::mutex> lock(mutex);
 			sessions.push_back(*session);
+			implementations.push_back(implementation.value_or(""));
 			accepted++;
 		}
 	}
@@ -196,6 +227,7 @@ private:
 
 	std::mutex mutex;
 	std::vector<std::shared_ptr<moq::Session>> sessions;
+	std::vector<std::string> implementations;
 	size_t accepted = 0;
 	std::thread sessions_thread;
 

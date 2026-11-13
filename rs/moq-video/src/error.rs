@@ -1,14 +1,24 @@
+use std::sync::Arc;
+
 /// Errors returned by `moq-video`.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+	/// A [`decode::Consumer`](crate::decode::Consumer) refused the rendition before
+	/// subscribing: its codec, codec parameters, or description is
+	/// [unsupported](Self::UnsupportedCodec). Backend faults keep their own variants.
+	#[error("unsupported video configuration: {0}")]
+	UnsupportedConfig(String),
+
 	/// No encoder matching the requested codec / hardware preference could be
 	/// opened (none compiled in, or none available on this machine).
 	#[error("no usable video encoder found (tried: {0})")]
 	NoEncoder(String),
 
-	/// No decoder matching the requested codec / hardware preference could be
-	/// opened (none compiled in, or none available on this machine).
+	/// Every decoder this build has for the requested codec and hardware preference
+	/// failed to open on this machine, at least one with a fault: missing drivers,
+	/// no device, or a library error. A codec this build has no decoder for, or a
+	/// stream every decoder's device refused, is [`UnsupportedCodec`](Self::UnsupportedCodec).
 	#[error("no usable video decoder found (tried: {0})")]
 	NoDecoder(String),
 
@@ -38,7 +48,8 @@ pub enum Error {
 		available: String,
 	},
 
-	/// A track's codec is not supported by the native decoders.
+	/// A track's codec, codec parameters, or description is not supported by the
+	/// native decoders this build has, or by the devices they run on here.
 	#[error("unsupported codec for native decode: {0}")]
 	UnsupportedCodec(String),
 
@@ -91,19 +102,19 @@ pub enum Error {
 		encoder: crate::Color,
 	},
 
-	/// The group configuration can't be honored by any backend (the message
-	/// says why).
-	#[error("invalid group configuration: {0}")]
-	InvalidGop(String),
+	/// [`encode::Config::join`](crate::encode::Config::join) is zero, which opens
+	/// no group.
+	#[error("a join of zero opens no group")]
+	ZeroJoin,
 
 	/// GPU rendering failure: building the pipeline, importing a frame's surface
 	/// as a texture, or the device itself.
 	#[error("render: {0}")]
-	Render(#[source] anyhow::Error),
+	Render(#[source] Arc<anyhow::Error>),
 
 	/// Capture / encode / codec failure (the message carries the detail).
 	#[error(transparent)]
-	Codec(#[from] anyhow::Error),
+	Codec(Arc<anyhow::Error>),
 
 	/// moq-mux muxer/catalog error.
 	#[error(transparent)]
@@ -116,4 +127,23 @@ pub enum Error {
 	/// Timestamp overflow converting to the moq microsecond timescale.
 	#[error(transparent)]
 	TimeOverflow(#[from] moq_net::TimeOverflow),
+}
+
+impl Error {
+	/// A [`Codec`](Self::Codec) failure.
+	pub(crate) fn codec(err: anyhow::Error) -> Self {
+		Self::Codec(Arc::new(err))
+	}
+
+	/// A [`Render`](Self::Render) failure.
+	#[cfg(feature = "render")]
+	pub(crate) fn render(err: anyhow::Error) -> Self {
+		Self::Render(Arc::new(err))
+	}
+}
+
+impl From<anyhow::Error> for Error {
+	fn from(err: anyhow::Error) -> Self {
+		Self::codec(err)
+	}
 }

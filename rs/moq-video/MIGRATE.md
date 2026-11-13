@@ -4,10 +4,56 @@ How to update your code for each breaking change, newest first.
 
 ## Unreleased
 
-### `Control::cut` is not rate limited, and capture advertises refresh (#6048)
+### Consumer decoder setup refusals are typed
 
-`encode::Control::cut` no longer spaces keyframes 500 ms apart: every request forces one on the next frame, so frequent calls produce all-keyframe video.
-Debounce your own calls if you relied on the spacing.
+`decode::Consumer::new` reports `Error::UnsupportedConfig` for a codec or description this build cannot decode, where `decode::Decoder::new` reports `Error::UnsupportedCodec`. That now includes a missing or malformed avcC or hvcC description (previously `Error::Codec` or `Error::Mux`) and a codec no compiled-in decoder handles (previously `Error::NoDecoder`). A stream every decoder for its codec refuses because the device cannot decode it, such as AV1 on a GPU without AV1 decode or a size past its limits, is a refusal too. `Error::NoDecoder` now means that a decoder for the codec failed to open for another reason, such as a missing driver or no device. Backend faults, scale-hint errors, and subscription failures keep their own errors. A codec worker that cannot start or exits during initialization reports `Error::CodecGone`, like a worker lost after initialization, rather than `Error::Codec`.
+
+### `decode::Options::max_delay` is `delay` ([#7311](https://github.com/moq-dev/moq/pull/7311), [#7597](https://github.com/moq-dev/moq/pull/7597))
+
+`decode::Options::max_delay: Duration` is `delay: decode::Delay` (`moq_net::track::Delay`).
+Replace `max_delay: d` with `delay: Delay { min: Some(playout), max: Some(d) }`: `min` is your playout delay, where a cold join starts, and `max` (`None` for no limit) is the old max delay.
+
+### A capture reopened onto a new identity publishes a new track ([#7110](https://github.com/moq-dev/moq/pull/7110))
+
+When a reopened camera or encoder emits a different codec string than the probed rendition, such as a higher level for a larger mode, `encode::Producer` publishes under the next free `<name>/<n>` and finishes the old track.
+`Producer::demand` follows the current track, so read it again after `publish` rather than holding the first one.
+
+### The renderer refuses GPU frames it cannot import (#6806)
+
+`render::Renderer::render` no longer downloads a GPU surface it cannot import; it returns an error naming the cause and the fix.
+`render::Config::zero_copy` is gone, along with the retry-and-retire fallback behind it.
+CPU frames (`Surface::I420`) upload as before.
+Decode and capture with `render::output(&device)` (`decode::Config::output`, `capture::Config::output`) to receive only frames the renderer on that device draws.
+It picks `Output::Render`, which keeps the surfaces this platform imports on the GPU and downloads the rest, for a device that can import, and `Output::Cpu` for one that cannot (wgpu's GL backend, or a Linux device without DMA-BUF import).
+Either errors on a surface with no download, such as a non-NV12 pixel buffer.
+On Linux, open the device with `wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF` where the adapter has it, or `render::output` picks the CPU.
+To force the CPU path that `zero_copy: false` gave, decode or capture with `Output::Cpu`.
+
+### `Rate` is `FrameRate` (#6653)
+
+`Rate` and `RateError` are `FrameRate` and `FrameRateError`, the name the bindings already use.
+Rename the imports; the methods and error variants are unchanged.
+
+### Decoded reads carry gaps and encoder ends (#6475)
+
+`decode::Consumer::read()` returns `decode::Read` events instead of bare frames, the same shape as `moq_audio::decode::Read`: `Frame(frame)`, `Gap { timestamp, duration }` for lost media, and `End { end }` where the publisher stopped its encoder; `None` still means the track is finished.
+Match `decode::Read::Frame(frame)` where you took the frame before, and skip the other variants to keep the old behavior.
+An `End` now drains the decoder, so the last picture before a pause arrives without waiting for the next one.
+
+### `Source::Display` no longer opens the portal on Wayland
+
+`capture::Source::Display` captures X11 displays only, including XWayland's `x11:` ids.
+On Wayland the main display and any non-`x11:` id now fail with `Error::Unsupported` instead of opening the system picker with a selection shared by every publication in the process.
+Pass `Source::Portal(portal::Selection::new(portal::Kind::Screen))` to ask the picker, and keep that selection for the publication's reopens.
+
+### Native frame imports use platform and format roles
+
+`frame::macos` is `frame::apple`.
+`frame::vulkan::Channels` is `Format`. `Image` exposes `device`, `memory`, `size`, `allocation_size`, and `format` as fields; replace `device_uuid()` with `device.device_uuid`, `size()` with `size`, `allocation_size()` with `allocation_size`, and `channels()` with `format`.
+Construct `Handles { memory, timeline }` directly instead of calling `Handles::new`.
+
+### Capture advertises refresh (#6048)
+
 Capture tracks now advertise `refresh: Some(2)` when every backend the selection may open honors a cut, and the driver forces a keyframe when `Demand::wanted` passes the largest group.
 
 ### OpenH264 is opt-in (#5771)
@@ -29,21 +75,14 @@ Set `encode::Config::color` to the first frame's `frame.surface.color()`, and re
 
 ### `encode::Producer` takes a catalog reservation (#5715)
 
-`encode::Producer::new` and `with_track` take a `moq_mux::catalog::Reserved` instead of the `catalog::Producer`, so the caller declares the encoder's GOP as the timeline hint.
-Pass `catalog.reserve().with_timeline_hint(gop)` instead of the catalog.
+`encode::Producer::new` and `with_track` take a `moq_mux::catalog::Reserved` instead of the `catalog::Producer`, so the caller declares the encoder's GOP as its join interval.
+Pass `catalog.reserve().with_interval(gop)` instead of the catalog.
 
-### Capture takes one `encode::Capture`, and `Control::new` returns the driver
+### Capture takes one `encode::Capture`
 
 `publish_capture(broadcast, catalog, capture, encode, clock)` is `publish_capture(broadcast, catalog, encode::Capture)`.
 `Capture` has no clock: the driver stamps on `catalog.clock()`.
-`encode::Control::new` returns the control handle and the driver; dropping the last `Control` cancels an in-flight open or encode.
 Build it from `encode::Capture::default()`, setting `capture` and `encode`.
-
-### `Control::cut` returns a `Result`
-
-`cut()` fails with `Error::CutUnsupported` once the driver knows its backend cannot force a keyframe, and the publish carries on at its cadence.
-It counts cadence keyframes too, so a request may be served without forcing one.
-On `Error::CutUnsupported`, wait for the next cadence keyframe.
 
 ### `Encoded` marks keyframes (#4295)
 

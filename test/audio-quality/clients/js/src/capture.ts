@@ -1,35 +1,30 @@
 /** Capture arrivals before the player's container orders or skips them. @module */
 
-import { Milli } from "@moq/clock";
+import { Duration, Instant, now } from "@moq/clock";
 import * as Catalog from "@moq/hang/catalog";
 import * as Cmaf from "@moq/hang/cmaf";
 import * as Container from "@moq/hang/container";
 import { type Group, Error as NetError } from "@moq/net";
 import { Effect, type Getter } from "@moq/signals";
-import type { Broadcast, Delay } from "@moq/watch";
+import type { Broadcast } from "@moq/watch";
+import { frameDuration, packetDuration } from "../../../../../js/watch/src/audio/config.ts";
+import { maxDelay } from "../../../../../js/watch/src/audio/latency.ts";
 import type { Arrival } from "./schema.ts";
-
-/**
- * The least max delay the decoder subscribes with at "auto": the estimator's 2 s ceiling, so a frame
- * later than the target is still observed (doc/concept/audio-jitter.md). The observer asks for the
- * same, or it would drop exactly the late frames the estimator measures.
- */
-const AUTO_MAX_DELAY = Milli(2000);
 
 /** The public player inputs needed to observe its existing subscription. */
 export type Input = {
 	broadcast: Getter<Broadcast | undefined>;
 	track: Getter<string | undefined>;
 	config: Getter<Catalog.AudioConfig | undefined>;
-	/** The configured delay, which decides whether the decoder subscribes past `maxDelay`. */
-	delay: Getter<Delay>;
-	maxDelay: Getter<Milli>;
+	/**
+	 * The terms of the max delay the decoder subscribes with, which the observer matches, codec warmup
+	 * included, or it would drop exactly the late frames the estimator measures
+	 * (doc/concept/audio-jitter.md).
+	 */
+	delay: Getter<Duration>;
+	maxDelay: Getter<Duration>;
+	stretch: Getter<Duration>;
 };
-
-/** The max delay the decoder subscribes with, which the observer matches. */
-function subscribed(delay: Delay, maxDelay: Milli): Milli {
-	return delay === "auto" ? Milli(Math.max(maxDelay, AUTO_MAX_DELAY)) : maxDelay;
-}
 
 /** Record frames on the player's connection with its subscription settings. */
 export class Capture {
@@ -51,7 +46,13 @@ export class Capture {
 				if (!active) return;
 				const track = active.track(name).subscribe({
 					priority: Catalog.PRIORITY.audio,
-					maxDelay: subscribed(input.delay.peek(), input.maxDelay.peek()),
+					delay: {
+						max: maxDelay({
+							delay: input.delay.peek(),
+							maxDelay: input.maxDelay.peek(),
+							stretch: input.stretch.peek(),
+						}).add(Duration.millis(config.warmup ?? 0)),
+					},
 				});
 				const groups = new Set<Group.Consumer>();
 				effect.cleanup(() => {
@@ -61,7 +62,13 @@ export class Capture {
 				effect.run((inner) =>
 					track.update({
 						priority: Catalog.PRIORITY.audio,
-						maxDelay: subscribed(inner.get(input.delay), inner.get(input.maxDelay)),
+						delay: {
+							max: maxDelay({
+								delay: inner.get(input.delay),
+								maxDelay: inner.get(input.maxDelay),
+								stretch: inner.get(input.stretch),
+							}).add(Duration.millis(inner.get(input.config)?.warmup ?? 0)),
+						},
 					}),
 				);
 				effect.spawn(async () => {
@@ -74,7 +81,7 @@ export class Capture {
 							// other error here is a real failure, even one surfacing during close.
 							const reader = (async () => {
 								try {
-									for await (const arrival of arrivals(group, decoder)) {
+									for await (const arrival of arrivals(group, { decoder, config })) {
 										// A resubscribe after a rerun re-delivers cached frames with a later stamp.
 										const key = `${group.sequence}:${arrival[1]}`;
 										if (this.#seen.has(key)) continue;
@@ -132,15 +139,22 @@ export function format(config: Catalog.AudioConfig): Container.Format {
 }
 
 /** Stamp frames as their group's stream delivers them, before in-order playback. */
-export async function* arrivals(group: Group.Consumer, decoder: Container.Format): AsyncGenerator<Arrival> {
+export async function* arrivals(
+	group: Group.Consumer,
+	{ decoder, config }: { decoder: Container.Format; config: Catalog.AudioConfig },
+): AsyncGenerator<Arrival> {
 	try {
 		for (;;) {
 			const next = await group.readFrame();
-			const at = performance.now();
+			const at = now().since(Instant.ZERO).asMillis();
 			if (!next) return;
 			for (const frame of decoder.decode(next.payload, next.timestamp)) {
 				if (decoder.end?.(frame) !== undefined) continue;
-				yield [at, Milli.fromMicro(frame.timestamp), group.sequence];
+				const duration = packetDuration(config.codec, frame) ?? frameDuration(config);
+				if (duration === undefined || duration.isZero()) {
+					throw new Error(`no encoded frame duration for ${config.codec}`);
+				}
+				yield [at, frame.timestamp.asMillis(), Number(group.sequence), duration.asMillis()];
 			}
 		}
 	} finally {

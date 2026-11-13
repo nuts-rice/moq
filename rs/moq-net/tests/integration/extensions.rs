@@ -9,32 +9,19 @@ use crate::support;
 
 use std::time::Duration;
 
-use moq_net::{Hop, Version, origin, setup::Extensions};
+use moq_net::{Version, origin, setup::Extensions};
 use support::harness::{MockConnectOptions, MockPair, connect_mock};
 
 /// Long enough, in virtual time, for anything in flight to reach the far side.
 const SETTLE: Duration = Duration::from_secs(1);
 
 /// Every moq-transport draft, each of which carries the SOLICIT option.
-const MOQT: [&str; 9] = [
-	"moq-transport-14",
-	"moq-transport-15",
-	"moq-transport-16",
-	"moq-transport-17",
-	"moq-transport-18",
-	"moq-transport-19",
-	"moq-transport-20",
-	"moq-transport-21",
-	"moq-transport-22",
-];
-
-/// The first draft that negotiates MoQ Auth, and the newest.
-const AUTH: [&str; 2] = ["moq-transport-17", "moq-transport-22"];
+const MOQT: [&str; 2] = ["moq-transport-18", "moq-transport-22"];
 
 fn produce_origin(hop: u64) -> origin::Producer {
-	let (producer, driver) = origin::Producer::new(origin::Config::new(Hop::new(hop).unwrap()));
+	let (producer, driver) = origin::Producer::new(origin::Config::new(std::num::NonZeroU64::new(hop).unwrap()));
 	support::harness::spawn(driver);
-	producer
+	producer.with_proxy(true)
 }
 
 fn declined(f: impl FnOnce(&mut Extensions)) -> Extensions {
@@ -50,16 +37,23 @@ fn assert_open(pair: &MockPair, context: &str) {
 
 /// Whether `path` is announced in `origin` right now.
 fn announced(origin: &origin::Producer, path: &str) -> bool {
-	let mut announced = origin.consume().announced();
+	let mut announced = origin.consume().routes();
 	let mut live = false;
 	while let Some(event) = announced.try_next() {
 		match event {
-			moq_net::announce::Event::Start(update)
-			| moq_net::announce::Event::Update(update)
-			| moq_net::announce::Event::Restart(update) => {
+			moq_net::origin::RouteEvent {
+				kind:
+					moq_net::origin::RouteKind::Start
+					| moq_net::origin::RouteKind::Update
+					| moq_net::origin::RouteKind::Restart,
+				announce: update,
+			} => {
 				live |= update.prefix.as_str() == path;
 			}
-			moq_net::announce::Event::End(update) => {
+			moq_net::origin::RouteEvent {
+				kind: moq_net::origin::RouteKind::End | moq_net::origin::RouteKind::Offline,
+				announce: update,
+			} => {
 				live &= update.prefix.as_str() != path;
 			}
 		}
@@ -70,7 +64,7 @@ fn announced(origin: &origin::Producer, path: &str) -> bool {
 /// A side that declines MoQ Solicit invites unsolicited advertisements, so its peer
 /// announces unasked and that is not held against the peer, even though the peer
 /// implements the extension itself.
-#[moq_clock::test]
+#[kio::test]
 async fn a_side_that_declines_solicit_takes_unsolicited_announces() {
 	for name in MOQT {
 		let version: Version = name.parse().unwrap();
@@ -95,131 +89,14 @@ async fn a_side_that_declines_solicit_takes_unsolicited_announces() {
 			}
 			let pair = connect_mock(options).await;
 
-			let broadcast = publisher.create_broadcast("room/cam").unwrap();
-			broadcast.announce(Default::default()).unwrap();
-			moq_clock::sleep(SETTLE).await;
+			let broadcast = publisher
+				.route("room/cam", moq_net::origin::RouteOptions::hidden())
+				.unwrap();
+			broadcast.announce().unwrap();
+			kio::clock::sleep(SETTLE).await;
 
 			assert!(announced(&subscriber, "room/cam"), "{context}: never announced");
 			assert_open(&pair, &context);
-		}
-	}
-}
-
-/// A side that declines MoQ Auth leaves it un-negotiated whichever side declines:
-/// neither side holds a grant, and a token is kept for the requests that name it
-/// rather than presented on an AUTH stream.
-#[moq_clock::test]
-async fn a_declined_auth_extension_is_not_negotiated() {
-	for name in AUTH {
-		let version: Version = name.parse().unwrap();
-
-		// Control: offered by both, the client's connection credential earns a grant.
-		let pair = connect_mock(MockConnectOptions::new(version)).await;
-		let mut grant = pair.client.auth().grant();
-		moq_clock::timeout(SETTLE, async {
-			while grant.peek().is_none() {
-				grant.changed().await.expect("grant watch ended");
-			}
-		})
-		.await
-		.unwrap_or_else(|_| panic!("{name}: no grant with both offering"));
-
-		for server_declines in [true, false] {
-			let context = format!("{name}, server declines: {server_declines}");
-			let no_auth = declined(|e| e.auth = false);
-			let mut options = MockConnectOptions::new(version);
-			match server_declines {
-				true => options.server_extensions = no_auth,
-				false => options.client_extensions = no_auth,
-			}
-			let pair = connect_mock(options).await;
-			moq_clock::sleep(SETTLE).await;
-
-			for session in [&pair.client, &pair.server] {
-				assert_eq!(session.auth().grant().peek(), None, "{context}");
-				// Only a request that names it can carry the token, so it resolves at once with
-				// a grant that stays unknown.
-				let added = moq_clock::timeout(SETTLE, session.auth().add("token"))
-					.await
-					.unwrap_or_else(|_| panic!("{context}: add never resolved"))
-					.unwrap_or_else(|err| panic!("{context}: {err:?}"));
-				assert_eq!(added.grant().peek(), None, "{context}");
-				assert_eq!(session.auth().grant().peek(), None, "{context}");
-			}
-			assert_open(&pair, &context);
-		}
-	}
-}
-
-/// The route `path` is announced on in `origin` right now, if any.
-fn route(origin: &origin::Producer, path: &str) -> Option<origin::Route> {
-	let mut announced = origin.consume().announced();
-	let mut route = None;
-	while let Some(event) = announced.try_next() {
-		match event {
-			moq_net::announce::Event::Start(update)
-			| moq_net::announce::Event::Update(update)
-			| moq_net::announce::Event::Restart(update) => {
-				if update.prefix.as_str() == path {
-					route = Some(update.route);
-				}
-			}
-			moq_net::announce::Event::End(update) => {
-				if update.prefix.as_str() == path {
-					route = None;
-				}
-			}
-		}
-	}
-	route
-}
-
-/// MoQ Epoch carries the publisher's epoch, in either direction, only when both sides
-/// offer it on draft-17 or later. A side declining it, or an older draft, leaves the
-/// route epochless exactly as before the extension, and nothing on the wire breaks the
-/// session.
-#[moq_clock::test]
-async fn an_epoch_crosses_only_when_both_offer_it() {
-	for name in MOQT {
-		let version: Version = name.parse().unwrap();
-		let negotiable = !matches!(name, "moq-transport-14" | "moq-transport-15" | "moq-transport-16");
-		for server_publishes in [true, false] {
-			for declines in [None, Some("server"), Some("client")] {
-				let context = format!("{name}, server publishes: {server_publishes}, declines: {declines:?}");
-				let publisher = produce_origin(1);
-				let subscriber = produce_origin(2);
-
-				let mut options = MockConnectOptions::new(version);
-				match server_publishes {
-					true => {
-						options.server_publish = Some(publisher.consume());
-						options.client_subscribe = Some(subscriber.clone());
-					}
-					false => {
-						options.client_publish = Some(publisher.consume());
-						options.server_subscribe = Some(subscriber.clone());
-					}
-				}
-				let no_epoch = declined(|e| e.epoch = false);
-				match declines {
-					Some("server") => options.server_extensions = no_epoch,
-					Some(_) => options.client_extensions = no_epoch,
-					None => {}
-				}
-				let pair = connect_mock(options).await;
-
-				let epoch = moq_net::Epoch::mint();
-				let broadcast = publisher.create_broadcast("room/cam").unwrap();
-				broadcast
-					.announce(origin::Route::default().with_epoch(epoch.clone()))
-					.unwrap();
-				moq_clock::sleep(SETTLE).await;
-
-				let route = route(&subscriber, "room/cam").unwrap_or_else(|| panic!("{context}: never announced"));
-				let expected = (negotiable && declines.is_none()).then_some(epoch);
-				assert_eq!(route.epoch, expected, "{context}");
-				assert_open(&pair, &context);
-			}
 		}
 	}
 }

@@ -1,27 +1,33 @@
-import { Milli, Nano } from "@moq/clock";
-import { Effect, type Getter, Once, Signal } from "@moq/signals";
-import type * as announce from "../announced.ts";
+import { Duration } from "@moq/clock";
+import { Effect, type GetPromise, type Getter, Once, Signal } from "@moq/signals";
+import * as announce from "../announced.ts";
 import type * as Auth from "../auth.ts";
 import { AuthSession } from "../auth_session.ts";
-import type { Established } from "../connection/established.ts";
 import type { Drain } from "../connection/goaway.ts";
-import { type Probe, type Stats, transportStats } from "../connection/stats.ts";
+import type { Session } from "../connection/session.ts";
+import { detect, type Probe, type Stats, statsOf, type TransportStats, transportStats } from "../connection/stats.ts";
 import { type Transport, transportOf } from "../connection/transport.ts";
 import { closeError, error, fromClose, ProtocolViolation, StreamCode, sessionCause } from "../error.ts";
-import { type Hop, randomHop } from "../hop.ts";
+import { type Hop, HopSchema, randomHop } from "../hop.ts";
+import { IMPLEMENTATION } from "../implementation.ts";
+import { hooks } from "../internal.ts";
+import { lines } from "../open.ts";
 import type { Consumer as OriginConsumer } from "../origin.ts";
 import * as Path from "../path.ts";
+import type { Own } from "../route.ts";
 import { type Reader, Readers, Stream, Writer } from "../stream.ts";
 import { Observed } from "../util/observed.ts";
 import { withTimeout } from "../util/timeout.ts";
-import { registerWire } from "../wire.ts";
+import { registerWire, wireOf } from "../wire.ts";
 import { AnnounceRequest } from "./announce.ts";
 import { LiteAuthWire } from "./auth.ts";
+import { Datagrams } from "./datagram.ts";
 import { closeViolation } from "./error.ts";
 import { Fetch } from "./fetch.ts";
 import { Goaway } from "./goaway.ts";
 import { Group } from "./group.ts";
 import { Publisher } from "./publisher.ts";
+import { proveRouteKey } from "./route_key.ts";
 import { SessionInfo } from "./session.ts";
 import { hasClientParameters, ProbeLevel, type Role, Setup } from "./setup.ts";
 import { DataType, StreamId } from "./stream.ts";
@@ -32,9 +38,13 @@ import { Tracks as TracksMessage } from "./tracks.ts";
 import {
 	hasAuth,
 	hasDatagrams,
+	hasDatagramTracks,
 	hasGoaway,
+	hasHidden,
 	hasPadding,
 	hasProbeRtt,
+	hasRouteKey,
+	hasRoutes,
 	hasSetupStream,
 	hasTrackStream,
 	hasTracks,
@@ -58,21 +68,33 @@ export interface ConnectionProps {
 	session?: Stream;
 	/** The origin whose broadcasts are served to the peer. Omit to publish nothing. */
 	publish?: OriginConsumer;
+	/** The auth handle to build the session on, or undefined for one of its own. */
+	handle?: Auth.Handle;
 	/**
 	 * Whether this side dialed. Only the dialing side aborts on a publication its grant does
 	 * not cover: a server publishes whatever the peer may read, not what it intends to push.
 	 * Defaults to true.
 	 */
 	client?: boolean;
+	/** The connection credential the client's SETUP presents, on versions that carry one (lite-07+). */
+	token?: Uint8Array;
+	/** The implementation our SETUP advertises (lite-05+). Defaults to this library's; empty sends nothing. */
+	implementation?: string;
+	/** The PROBE target to send a peer that advertised `Increase`, in bits per second; zero sends none. */
+	probeTarget?: Getter<number>;
 }
+
+/** Where a session is: open, delivering what it owes before it closes, or closed. */
+/** `leaving` is open but draining at this side's own request; see the wire view's `leave`. */
+type Phase = { kind: "open" } | { kind: "leaving" } | { kind: "closing"; done: Promise<void> } | { kind: "closed" };
 
 /**
  * Represents a connection to a MoQ server.
  *
- * @public
+ * @internal
  */
-export class Connection implements Established {
-	#closing?: Promise<void>;
+export class Connection implements Session {
+	#phase: Phase = { kind: "open" };
 	// The URL of the connection.
 	readonly url: URL;
 
@@ -93,18 +115,23 @@ export class Connection implements Established {
 
 	// Module for contributing tracks.
 	#publisher: Publisher;
+	// The lite-07 route identity our published claims are originated under, if we publish.
+	#own?: Own;
 
 	// Module for distributing tracks.
 	#subscriber: Subscriber;
 
-	/** The peer's PROBE estimates; see {@link Established.probe}. */
+	// The received unidirectional streams still being read, which a closing session drains.
+	#unis = new Set<Promise<void>>();
+
+	/** The peer's PROBE estimates; see {@link Session.probe}. */
 	readonly probe: Getter<Probe>;
 
-	// Our tokens and grants, and the answers to the peer's; see {@link Established.auth}.
+	// Our tokens and grants, and the answers to the peer's; see {@link Session.auth}.
 	#auth: AuthSession;
 
-	/** Random per-connection Hop ID. Shared by Publisher (for outbound hop
-	 * chains) and Subscriber (available for optional self-filtering on announces). */
+	/** This side's Hop ID, shared by Publisher (for outbound hop chains) and Subscriber (to drop
+	 * what crossed us). Random per connection, except a lite-07 publisher's, which is its origin's. */
 	readonly hop: Hop;
 
 	// The peer's SETUP, recorded once its Setup stream is read (lite-05+). Streams whose
@@ -122,6 +149,17 @@ export class Connection implements Established {
 
 	// Whether we dialed; see {@link ConnectionProps.client}.
 	#client: boolean;
+	// See {@link ConnectionProps.token}.
+	#token?: Uint8Array;
+	// What our SETUP advertises; see {@link ConnectionProps.implementation}.
+	#implementation: string;
+	// See {@link ConnectionProps.probeTarget}.
+	#probeTarget?: Getter<number>;
+	#peerImplementation = Promise.withResolvers<string | undefined>();
+
+	/** The implementation the peer advertised; see {@link Session.peerImplementation}. */
+	readonly peerImplementation = this.#peerImplementation.promise;
+
 	// The peer's GOAWAY. Lite carries no deadline, so only the URI is set.
 	#goaway = new Once<Drain>();
 
@@ -143,8 +181,21 @@ export class Connection implements Established {
 	 *
 	 * @internal
 	 */
-	constructor({ url, quic, version, session, publish, client = true }: ConnectionProps) {
+	constructor({
+		url,
+		quic,
+		version,
+		session,
+		publish,
+		handle,
+		client = true,
+		token,
+		implementation = IMPLEMENTATION,
+		probeTarget,
+	}: ConnectionProps) {
 		this.url = url;
+		// Older versions carry the credential in the URL instead.
+		this.#token = client && hasAuth(version) ? token : undefined;
 		this.#quic = quic;
 		this.#session = session;
 		// The session stream was opened at the SETUP exchange's version; the rest of it speaks this one.
@@ -155,10 +206,14 @@ export class Connection implements Established {
 		this.version = versionName(version);
 		this.#version = version;
 		this.transport = transportOf(quic);
+		detect(this, quic);
 
 		this.probe = this.#probe;
+		// Opens waiting for credit make room after about this RTT when the transport has none.
+		lines(quic).probe = this.#probe;
 
-		this.hop = randomHop();
+		this.#own = publish && wireOf(publish).own;
+		this.hop = hasRoutes(version) && this.#own ? HopSchema.parse(this.#own.hop) : randomHop();
 		// What the peer's connection credential earns by default: publishing anything to us,
 		// since we consume on demand, and subscribing to whatever we publish.
 		this.#auth = new AuthSession({
@@ -167,11 +222,24 @@ export class Connection implements Established {
 				publish: new Path.Patterns([Path.Pattern.all()]),
 				subscribe: new Path.Patterns(publish ? [Path.Pattern.all()] : []),
 			},
+			handle,
+			draining: () => this.#goaway.peek() !== undefined || this.#phase.kind !== "open",
 		});
+		// Left before anything observes the close, so a successor on the same handle never
+		// finds this session still active.
+		const leave = () => this.#auth.close();
+		void quic.closed.then(leave, leave);
+		// Before lite-07 the peer can't ask for hidden routes, so a client publishes none of
+		// them, and a socket endpoint behind it is unreachable. A server leaves it to the
+		// client, whose origin holds that endpoint.
+		if (client && publish && !hasHidden(version)) {
+			const withholding = hooks.withholdHidden(publish);
+			void quic.closed.then(withholding, withholding);
+		}
 		this.#auth.violated.subscribe((err) => {
 			if (!err) return;
 			closeViolation(this.#quic, err);
-			this.abort();
+			this.#fail(err);
 		});
 
 		this.#publisher = new Publisher(this.#quic, this.#version, this.hop, publish, {
@@ -190,39 +258,78 @@ export class Connection implements Established {
 			this.#auth,
 		);
 		this.#client = client;
-		registerWire(this, { consume: (path) => this.#subscriber.consume(path), goaway: this.#goaway });
+		this.#implementation = implementation;
+		this.#probeTarget = probeTarget;
+		// Only the lite-05+ Setup Stream carries it.
+		if (!hasSetupStream(version)) this.#peerImplementation.resolve(undefined);
+		registerWire(this, {
+			consume: (path, instance) => this.#subscriber.consume(path, instance),
+			exclusive: false,
+			leave: () => this.#leave(),
+			auth: this.#auth,
+		});
 
 		void this.#run();
 	}
 
-	/** Our tokens and grants; see {@link Established.auth}. */
+	#leave(): void {
+		if (this.#phase.kind !== "open") return;
+		this.#phase = { kind: "leaving" };
+		if (!hasGoaway(this.#version)) return;
+		const version = this.#version;
+		const send = async () => {
+			const stream = await Stream.open(this.#quic, { version });
+			await stream.writer.u53(StreamId.Goaway);
+			await new Goaway("").encode(stream.writer, version);
+			stream.writer.close();
+		};
+		// A session closing first has nothing left to tell.
+		send().catch((err: unknown) => console.debug("failed to send GOAWAY:", err));
+	}
+
+	/** Our tokens and grants; see {@link Session.auth}. */
 	get auth(): Auth.Handle {
-		return this.#auth;
+		return this.#auth.handle;
 	}
 
 	/**
 	 * Withdraw announcements and finish the requests this session serves, waiting up to one
 	 * second for delivery before closing.
 	 *
-	 * A served subscription first delivers its remaining group streams, and on lite-07 also
+	 * A served subscription first delivers its remaining group streams, and from lite-05 also
 	 * waits for the subscriber's FIN, which says it read the tail. A live track never ends on
 	 * its own, so it holds the close until the deadline.
 	 */
 	close(): Promise<void> {
-		this.#closing ??= withTimeout(
-			this.#publisher.drain(),
-			Nano.fromMilli(Milli(1000)),
-			"session close timed out",
-		).finally(() => this.abort());
-		return this.#closing;
+		switch (this.#phase.kind) {
+			case "open":
+			case "leaving": {
+				const done = withTimeout(
+					this.#publisher.drain(),
+					Duration.millis(1000),
+					"session close timed out",
+				).finally(() => this.abort());
+				this.#phase = { kind: "closing", done };
+				return done;
+			}
+			case "closing":
+				return this.#phase.done;
+			case "closed":
+				return Promise.resolve();
+		}
 	}
 
 	/** End the session immediately without waiting for delivery. */
 	abort(): void {
+		if (this.#phase.kind === "closed") return;
+		this.#phase = { kind: "closed" };
 		this.#auth.close();
 		this.#publisher.close();
-		this.#subscriber.close();
+		// Received tracks end in #run once what already arrived drains, as on the peer's close.
+		this.#closeTransport();
+	}
 
+	#closeTransport(): void {
 		try {
 			// TODO: For whatever reason, this try/catch doesn't seem to work..?
 			this.#quic.close();
@@ -231,16 +338,23 @@ export class Connection implements Established {
 		}
 	}
 
+	// End the received tracks with the session's end, then tear down the rest.
+	#fail(err: Error): void {
+		this.#subscriber.close(err);
+		this.abort();
+	}
+
 	async #run(): Promise<void> {
-		const tasks: Promise<void>[] = [this.#runSession(), this.#runBidis(), this.#runUnis()];
+		const unis = this.#runUnis();
+		const tasks: Promise<void>[] = [this.#runSession(), this.#runBidis(), unis];
 
 		if (hasSetupStream(this.#version)) {
 			tasks.push(this.#sendSetup());
 		}
 
 		const probes = new Effect((effect) => {
-			if (!effect.get(this.#probe.used)) return;
-			effect.spawn(() => this.#subscriber.runProbe(effect.abort));
+			if (!effect.get(this.#probe.wanted)) return;
+			effect.spawn(() => this.#subscriber.runProbe(effect.abort, this.#probeTarget));
 		});
 
 		// Fail loud on a publication our grant never covers, once the peer has answered the
@@ -266,15 +380,31 @@ export class Connection implements Established {
 			fatal = await sessionCause(this.#quic, err);
 		} finally {
 			probes.close();
-			// The session died under every track it was receiving, so they end with its
-			// error. A deliberate close() already ended them cleanly, which makes this a no-op.
-			this.#subscriber.close(fatal ?? (await closeError(this.#quic)));
-			this.abort();
+			// A session that ends before the peer's SETUP never learns its implementation.
+			this.#peerImplementation.resolve(undefined);
+			const err = fatal ?? (await closeError(this.#quic));
+			// A failed task can end the session over a live transport. Closing it first ends
+			// every read the drain waits on.
+			this.#closeTransport();
+			// The peer's close can overtake the group streams and SUBSCRIBE FIN it sent first.
+			// Read what already arrived, so a track its publisher ended finishes rather than aborts.
+			// Accepting yields to the host, so take the streams still queued before draining.
+			await unis.catch(() => {});
+			await Promise.all([...this.#unis, this.#subscriber.drain()]);
+			// The session ended under every track it was receiving, so they end with its
+			// error: a clean close from either side reads as a cancelled session.
+			this.#fail(err);
 		}
 	}
 
+	/** The paths announced matching `scope`, each present or absent; see {@link Session.announced}. */
 	announced(scope?: Path.Pattern, options?: announce.Options): announce.Consumer {
-		return this.#subscriber.announced(scope, options);
+		return announce.list(this.#subscriber.routes(scope, options));
+	}
+
+	/** Every route change matching `scope`, for code that forwards routes. @internal */
+	routes(scope?: Path.Pattern, options?: announce.RouteOptions): announce.Routes {
+		return this.#subscriber.routes(scope, options);
 	}
 
 	async #runSession() {
@@ -297,15 +427,23 @@ export class Connection implements Established {
 	// path and leave routing to the URL. The probe level reflects what this transport
 	// can actually measure; we never pad, so we never advertise Increase.
 	// Role stays Both: the publish origin starts empty and fills later, and consume is
-	// called after this point, so there is nothing to narrow yet. The origin declares
-	// our session identity so the peer can filter
-	// reflected announcements (lite-06 removed ANNOUNCE_REQUEST's exclude_hop for it).
+	// called after this point, so there is nothing to narrow yet. Before lite-07 the hop
+	// declares our session identity so the peer can filter reflected announcements
+	// (lite-06 removed ANNOUNCE_REQUEST's exclude_hop for it). From lite-07 the parameter
+	// is the Node ID our published claims originate under, omitted when we publish nothing.
 	async #sendSetup(): Promise<void> {
 		const writer = await Writer.open(this.#quic, { version: this.#version });
 		try {
 			await writer.u53(DataType.Setup);
 			const probe = await probeLevel(this.#quic, this.#version);
-			await new Setup({ probe, hop: this.hop }).encode(writer, this.#version);
+			const routeKey = hasRouteKey(this.#version) ? await proveRouteKey(this.#quic, this.#client) : undefined;
+			await new Setup({
+				probe,
+				hop: hasRoutes(this.#version) ? this.#own && HopSchema.parse(this.#own.node) : this.hop,
+				token: this.#token,
+				implementation: this.#implementation,
+				routeKey,
+			}).encode(writer, this.#version);
 			writer.close();
 		} catch (err: unknown) {
 			writer.reset(err);
@@ -323,7 +461,8 @@ export class Connection implements Established {
 					stream.writer.reset(err);
 					// A protocol violation on one stream is the peer breaking the session.
 					// Resetting that stream would leave it free to repeat malformed input.
-					if (closeViolation(this.#quic, err)) this.abort();
+					const violation = closeViolation(this.#quic, err);
+					if (violation) this.#fail(violation);
 				})
 				.finally(() => {
 					stream.writer.close();
@@ -347,6 +486,14 @@ export class Connection implements Established {
 				(async () => {
 					const msg = await Subscribe.decode(stream.reader, this.#version);
 					await this.#publisher.runSubscribe(msg, stream);
+				})(),
+			);
+		} else if (typ === StreamId.Datagrams) {
+			if (!hasDatagramTracks(this.#version)) throw new Error("DATAGRAMS is not supported on this version");
+			await this.#publisher.owe(
+				(async () => {
+					const msg = await Datagrams.decode(stream.reader, this.#version);
+					await this.#publisher.runDatagrams(msg, stream);
 				})(),
 			);
 		} else if (typ === StreamId.Fetch) {
@@ -395,14 +542,19 @@ export class Connection implements Established {
 			const stream = await readers.next();
 			if (!stream) break;
 
-			this.#runUni(stream)
+			const task = this.#runUni(stream)
 				.then(() => {
 					stream.stop(StreamCode.Cancel);
 				})
 				.catch((err: unknown) => {
 					stream.stop(err);
-					if (err instanceof ProtocolViolation) closeViolation(this.#quic, err);
-				});
+					if (err instanceof ProtocolViolation) {
+						closeViolation(this.#quic, err);
+						this.#fail(err);
+					}
+				})
+				.finally(() => this.#unis.delete(task));
+			this.#unis.add(task);
 		}
 	}
 
@@ -425,22 +577,30 @@ export class Connection implements Established {
 				throw new ProtocolViolation("invalid SETUP", { cause: err });
 			});
 			if (this.#client && hasClientParameters(setup))
-				throw new ProtocolViolation("server SETUP contains Path or Role");
+				throw new ProtocolViolation("server SETUP contains Path, Role, or Token");
 			if (!this.#client && setup.path !== undefined)
 				throw new ProtocolViolation("Path on a URI-carrying binding");
 			this.#peerSetup.set(setup);
 			this.#peerRole.set(setup.role);
+			this.#peerImplementation.resolve(setup.implementation);
 		} else {
 			throw new Error(`unknown stream type: ${typ.toString()}`);
 		}
 	}
 
-	/** Snapshot the transport's counters; see {@link Established.stats}. */
+	/** Snapshot the transport's counters; see {@link Session.stats}. */
 	async stats(): Promise<Stats> {
-		return transportStats(this.#quic);
+		const stats = await transportStats(this.#quic);
+		if (hasDatagrams(this.#version)) stats.datagramsUnrouted = this.#subscriber.datagramsUnrouted;
+		return stats;
 	}
 
-	/** Resolves when the session closes, decoding the peer's close code; see {@link Established.closed}. */
+	/** Settles with the peer's GOAWAY; see {@link Session.draining}. */
+	get draining(): GetPromise<Drain> {
+		return this.#goaway;
+	}
+
+	/** Resolves when the session closes, decoding the peer's close code; see {@link Session.closed}. */
 	get closed(): Promise<Error | null> {
 		return this.#quic.closed.then(fromClose, (err: unknown) => error(err));
 	}
@@ -462,17 +622,13 @@ export class Connection implements Established {
  * @internal
  */
 export async function probeLevel(quic: WebTransport, version: Version): Promise<ProbeLevel> {
-	const getStats = (
-		quic as unknown as {
-			getStats?: () => Promise<{ estimatedSendRate: number | null; smoothedRtt?: number | null }>;
-		}
-	).getStats;
-	if (typeof getStats !== "function") return ProbeLevel.None;
+	const getStats = statsOf(quic);
+	if (!getStats) return ProbeLevel.None;
 
 	// A transport that can't answer tells us nothing, which is itself an answer.
-	let stats: { estimatedSendRate: number | null; smoothedRtt?: number | null };
+	let stats: TransportStats;
 	try {
-		stats = await getStats.call(quic);
+		stats = await getStats();
 	} catch {
 		return ProbeLevel.None;
 	}

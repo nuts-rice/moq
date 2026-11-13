@@ -1,6 +1,6 @@
 /** Sweep tracks x viewers for 1000 estimate rises inside one second. */
 
-import { Manual, Milli, Nano } from "@moq/clock";
+import { Duration, Manual } from "@moq/clock";
 import * as Catalog from "@moq/hang/catalog";
 import * as Json from "@moq/json";
 import { Track } from "@moq/net";
@@ -27,10 +27,8 @@ async function measure(tracks: number, viewers: number, clock: Manual) {
 	const output = new Track.Producer("catalog.json");
 	catalog.serve(output, scope);
 	const subscribers = Array.from({ length: viewers }, () => {
-		const subscriber = output.subscribe();
 		return {
-			subscriber,
-			catalog: new Json.Snapshot.Consumer<Catalog.Root>({ track: subscriber }),
+			catalog: new Json.Snapshot.Consumer<Catalog.Root>({ track: output }),
 			media: media.map((track) => track.subscribe()),
 		};
 	});
@@ -55,7 +53,7 @@ async function measure(tracks: number, viewers: number, clock: Manual) {
 			for (let index = 0; index < media.length; index++) {
 				// Model the player's changed latency floor with real subscription handles.
 				viewer.media[index].update({
-					maxDelay: Milli(root?.video?.renditions[media[index].name].jitter ?? 0),
+					delay: { max: Duration.millis(root?.video?.renditions[media[index].name].jitter ?? 0) },
 				});
 				updates++;
 			}
@@ -63,14 +61,14 @@ async function measure(tracks: number, viewers: number, clock: Manual) {
 	};
 	const start = performance.now();
 	for (let step = 0; step < 1000; step++) {
-		if (step > 0) clock.jump(Nano.fromMilli(Milli(1)));
+		if (step > 0) clock.jump(Duration.millis(1));
 		catalog.mutate((root) => {
 			if (!root.video) throw new Error("video missing");
 			for (const config of Object.values(root.video.renditions)) config.jitter = Catalog.u53(step + 1);
 		});
 		await receive();
 	}
-	await clock.advance(Nano.fromMilli(Milli(1)));
+	await clock.advance(Duration.millis(1));
 	await receive();
 	const elapsed = performance.now() - start;
 	if (publishes !== 2 || updates !== 2 * tracks * viewers) {
@@ -81,7 +79,7 @@ async function measure(tracks: number, viewers: number, clock: Manual) {
 	publishing.close();
 	output.close();
 	for (const viewer of subscribers) {
-		viewer.subscriber.close();
+		viewer.catalog.close();
 		for (const track of viewer.media) track.close();
 	}
 	for (const track of media) track.close();
@@ -91,11 +89,11 @@ console.log("tracks,viewers,catalog_publishes,subscribe_updates,unlimited_subscr
 for (const tracks of [1, 4, 16]) {
 	for (const viewers of [1, 4, 16]) {
 		const clock = new Manual();
-		const restore = clock.install();
+		const installed = clock.install();
 		try {
 			await measure(tracks, viewers, clock);
 		} finally {
-			restore();
+			installed.close();
 		}
 	}
 }

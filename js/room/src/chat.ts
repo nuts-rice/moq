@@ -4,7 +4,7 @@
  * @module
  */
 
-import { Instant, Nano, now, Second } from "@moq/clock";
+import { Duration, type Instant, now } from "@moq/clock";
 import * as Json from "@moq/json";
 import { type Broadcast, Time, type Timed, type Track } from "@moq/net";
 import { Effect, Signal } from "@moq/signals";
@@ -14,7 +14,7 @@ export const TRACK = "chat";
 /** Delivery priority, below audio and video. */
 export const PRIORITY = 10;
 /** How long a published message stays in the window. */
-export const HISTORY = Nano.fromSecond(Second(10));
+export const HISTORY = Duration.secs(10);
 /** A message entering, leaving, or missed from the window. */
 export type Event = Json.Window.Event<string>;
 
@@ -37,11 +37,11 @@ export class Publisher {
 	/** Publish a chat window over an existing track. */
 	constructor(track: Track.Producer) {
 		// Every edit restates the retained window, so a late reader never replays expired records.
-		this.#producer = new Json.Window.Producer({ track, opRatio: 0 });
+		this.#producer = new Json.Window.Producer({ track, ops: false });
 		this.#signals.run((effect) => {
 			const next = effect.get(this.#expires)[0];
 			if (next === undefined) return;
-			effect.timer(() => this.expire(), Instant.durationSince(next, now()));
+			effect.timer(() => this.expire(), next.since(now()));
 		});
 	}
 
@@ -50,7 +50,7 @@ export class Publisher {
 		if (!text) return;
 		this.expire();
 		this.#producer.push({ value: text, at: Time.Timestamp.now() });
-		this.#expires.update((expires) => [...expires, Instant.add(now(), HISTORY)]);
+		this.#expires.update((expires) => [...expires, now().saturatingAdd(HISTORY)]);
 	}
 
 	/** Retire elapsed messages now; the publisher also schedules this automatically. */
@@ -58,7 +58,7 @@ export class Publisher {
 		const at = now();
 		const expires = this.#expires.peek();
 		let count = 0;
-		while (count < expires.length && expires[count] <= at) count++;
+		while (count < expires.length && expires[count].le(at)) count++;
 		if (!count) return;
 		this.#producer.pop(count, Time.Timestamp.now());
 		this.#expires.set(expires.slice(count));
@@ -88,7 +88,7 @@ export class Subscriber {
 		this.#track = track;
 		this.#consumer = new Json.Window.Consumer({ track });
 		this.#positioned = track.largest().then((largest) => {
-			if (largest) track.setGroups({ start: { included: largest.group } });
+			if (largest) track.withRange({ start: { included: largest.group } });
 		});
 	}
 

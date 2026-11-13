@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use moq_clock::Instant;
+use kio::clock::Instant;
 
 use windows::Foundation::{Metadata::ApiInformation, TypedEventHandler};
 use windows::Graphics::Capture::{
@@ -37,7 +37,7 @@ use super::super::settle::{Settle, Settled};
 use super::super::{Config, Display, FrameChannel, Source, Stream, Window};
 use super::{Delivery, Event, Signal, Startup, display_index, window_handle};
 use crate::frame::{Surface, d3d11};
-use crate::{Error, Rate, Size};
+use crate::{Error, FrameRate, Size};
 
 const BUFFERS: i32 = 2;
 
@@ -45,7 +45,7 @@ pub(in crate::capture) async fn open(config: &Config) -> Result<Stream, Error> {
 	let chan = FrameChannel::new();
 	let signal = Arc::new(Signal::default());
 	let label = config.source.label();
-	let rate = config.framerate.unwrap_or(Rate::integer(30));
+	let rate = config.framerate.unwrap_or(FrameRate::integer(30));
 	let handle = std::thread::Builder::new()
 		.name("moq-wgc".into())
 		.spawn({
@@ -58,11 +58,11 @@ pub(in crate::capture) async fn open(config: &Config) -> Result<Stream, Error> {
 				match result {
 					Ok(Ok(())) => chan.close(),
 					Ok(Err(error)) => chan.fail(error),
-					Err(_) => chan.fail(Error::Codec(anyhow::anyhow!("WGC capture thread panicked"))),
+					Err(_) => chan.fail(Error::codec(anyhow::anyhow!("WGC capture thread panicked"))),
 				}
 			}
 		})
-		.map_err(|error| Error::Codec(anyhow::anyhow!("start WGC thread: {error}")))?;
+		.map_err(|error| Error::codec(anyhow::anyhow!("start WGC thread: {error}")))?;
 	let guard = Guard {
 		signal,
 		handle: Some(handle),
@@ -203,7 +203,7 @@ impl Capture {
 		if size.Width < 2 || size.Height < 2 {
 			return Err(Error::SourceUnavailable("WGC item has no capturable area".into()));
 		}
-		let device = d3d11::create_device()?;
+		let device = d3d11::create_device(None)?;
 		let dxgi: IDXGIDevice = device.cast().map_err(|e| error("query capture DXGI device", e))?;
 		let winrt: IDirect3DDevice = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi) }
 			.and_then(|device| device.cast())
@@ -272,7 +272,7 @@ impl Capture {
 			.StartCapture()
 			.map_err(|e| error("start WGC", e))?;
 		let mut startup = Startup::new(Instant::now());
-		let rate = config.framerate.unwrap_or(Rate::integer(30));
+		let rate = config.framerate.unwrap_or(FrameRate::integer(30));
 		let interval =
 			Duration::from_nanos(1_000_000_000 * u64::from(rate.denominator()) / u64::from(rate.numerator()));
 		let mut opened = None;
@@ -356,7 +356,7 @@ impl Capture {
 					.map_err(|e| error("read WGC timestamp", e))?
 					.Duration;
 				let micros =
-					u64::try_from(ticks).map_err(|_| Error::Codec(anyhow::anyhow!("negative WGC timestamp")))? / 10;
+					u64::try_from(ticks).map_err(|_| Error::codec(anyhow::anyhow!("negative WGC timestamp")))? / 10;
 				let timestamp = moq_net::Timestamp::from_micros(micros)?;
 				let surface = frame.0.Surface().map_err(|e| error("read WGC surface", e))?;
 				let access: IDirect3DDxgiInterfaceAccess = surface.cast().map_err(|e| error("query WGC surface", e))?;
@@ -584,7 +584,7 @@ fn error(context: &str, error: windows::core::Error) -> Error {
 	if error.code() == E_ACCESSDENIED {
 		Error::PermissionDenied(format!("{context}: {error}"))
 	} else {
-		Error::Codec(anyhow::anyhow!("{context}: {error}"))
+		Error::codec(anyhow::anyhow!("{context}: {error}"))
 	}
 }
 

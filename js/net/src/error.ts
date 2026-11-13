@@ -4,6 +4,7 @@
  * @module
  */
 
+import type { Duration } from "@moq/clock";
 import { sharedStreamCode } from "./ietf/error.ts";
 import type { IetfVersion } from "./ietf/version.ts";
 import { TimeoutError } from "./util/timeout.ts";
@@ -42,7 +43,7 @@ export const SessionCode = Object.freeze(
 		InvalidRequestId: 0x4 as SessionCode,
 		/** A key-value pair was malformed or repeated more than allowed. */
 		KeyValueFormatting: 0x6 as SessionCode,
-		/** The peer went past what the session allows: a request ID past MAX_REQUEST_ID, or too many announcements or subscriptions. */
+		/** The peer went past what the session allows: a request ID past MAX_REQUEST_ID, or too many announcements. */
 		TooManyRequests: 0x7 as SessionCode,
 		/** A PATH the peer may not send, such as a server sending one at all. */
 		InvalidPath: 0x8 as SessionCode,
@@ -54,6 +55,8 @@ export const SessionCode = Object.freeze(
 		AuthTokenCacheOverflow: 0x13 as SessionCode,
 		/** No version could be negotiated. */
 		Version: 0x15 as SessionCode,
+		/** The token could not be parsed. Retrying with the same token will fail again. */
+		MalformedAuthToken: 0x16 as SessionCode,
 		/** A token named an alias that was never registered. */
 		UnknownAuthTokenAlias: 0x17 as SessionCode,
 		/** An AUTHORITY the peer may not send, such as a server sending one at all. */
@@ -75,7 +78,7 @@ export type StreamCode = number & { readonly [STREAM_CODE]: true };
  * Codes a peer sends when resetting a stream, mirroring the Rust `Stream`.
  *
  * The counterpart to {@link SessionCode}, and a disjoint space: a stream reset of 0 is
- * {@link StreamCode.Internal}, not a cancellation ({@link StreamCode.Cancel} is 1). Call
+ * `StreamCode.Internal`, not a cancellation (`StreamCode.Cancel` is 1). Call
  * `StreamCode(code)` to construct an application code in the 64+ range.
  *
  * Conditions the shared codes don't cover are assigned in moq-lite's own 48-63 range, so a
@@ -114,6 +117,11 @@ export const StreamCode = Object.freeze(
 		Unroutable: 0x36 as StreamCode,
 		/** The grant does not cover this request, or no longer does. The session stays up. */
 		Unauthorized: 0x3b as StreamCode,
+		/**
+		 * The publisher reset a group's stream to make room for a higher-priority one, pausing the
+		 * group for a later stream to continue rather than giving it up (lite-07).
+		 */
+		Yielded: 0x3c as StreamCode,
 		/** A group grew past its cache budget and was aborted. */
 		GroupTooLarge: 0x32 as StreamCode,
 		/** A frame's timedness or timestamp doesn't match its track's timescale. */
@@ -239,10 +247,10 @@ export class FrameTooLarge extends Stream {
 }
 
 /**
- * A write grew the group past its cache budget, so the group is aborted.
+ * A peer could not retain a group and aborted it.
  *
- * Raised locally by a frame write, and decoded from a moq-lite peer's `GROUP_TOO_LARGE`
- * reset. Mirrors the Rust `Error::GroupTooLarge`.
+ * Decoded from a moq-lite peer's `GROUP_TOO_LARGE` reset. Local groups shed their front
+ * instead of aborting when their retained tail exceeds its budget.
  *
  * @public
  */
@@ -303,6 +311,24 @@ export class RefusedRedirect extends Error {
 }
 
 /**
+ * The dial and the MoQ handshake together outlived the connect's `timeout` option.
+ *
+ * A caller can retry it. Mirrors the Rust `Error::ConnectTimeout`.
+ *
+ * @public
+ */
+export class ConnectTimeout extends Error {
+	/** The timeout that elapsed. */
+	readonly timeout: Duration;
+
+	constructor(timeout: Duration) {
+		super(`connect timed out after ${timeout}`);
+		this.name = "ConnectTimeout";
+		this.timeout = timeout;
+	}
+}
+
+/**
  * A peer broke the protocol in a way the spec says must end the session.
  *
  * Thrown where the violation is detected, rather than handled there: a decoder has no session
@@ -351,12 +377,12 @@ interface TransportErrorOptions {
  * means. Mirrors the Rust `From<&Error> for Stream`.
  *
  * Lossy on purpose. An error describes what went wrong here, while the registry is what the peer
- * can act on, so anything without a code of its own degrades to {@link StreamCode.Internal}
- * rather than inventing one. A {@link Session} is {@link StreamCode.Unroutable}: a stream that
+ * can act on, so anything without a code of its own degrades to {@link StreamCode | StreamCode.Internal}
+ * rather than inventing one. A {@link Session} is {@link StreamCode | StreamCode.Unroutable}: a stream that
  * can still be reset outlived the session that failed, so that was the route it was served
  * through, and forwarding the session's code would mistranslate it across disjoint registries.
  * An application code is the exception, since both registries share the 64+ range. A session
- * that failed at the transport, with no code at all, is {@link StreamCode.Unroutable} too.
+ * that failed at the transport, with no code at all, is {@link StreamCode | StreamCode.Unroutable} too.
  *
  * On an IETF stream the code has to be one the negotiated draft assigns the same meaning to,
  * so a condition it does not register degrades to INTERNAL_ERROR as well. See
@@ -367,7 +393,7 @@ interface TransportErrorOptions {
 export function toStreamCode(err: unknown, options?: TransportErrorOptions): StreamCode {
 	const code = localStreamCode(err);
 	if (options?.version === undefined) return code;
-	return sharedStreamCode(code, options.version) ? code : StreamCode.Internal;
+	return sharedStreamCode(code) ? code : StreamCode.Internal;
 }
 
 /** The moq-lite code for a local failure, before any draft has a say. */
@@ -385,22 +411,29 @@ function localStreamCode(err: unknown): StreamCode {
 }
 
 /**
- * The transport refused a request stream or failed to grant stream credit before its deadline.
+ * A group was created at a sequence its track declared skipped.
  *
- * This local failure is terminal and has no wire code. The request is not retried.
+ * A skip says the sequence will never be produced, so it is final. See the track producer's
+ * `skipGroups`. Mirrors the Rust `Error::Skipped`.
+ *
+ * @public
  */
-export class NoStreamCredit extends Error {
-	constructor(options?: ErrorOptions) {
-		super("no stream credit", options);
-		this.name = "NoStreamCredit";
+export class Skipped extends Error {
+	/** The sequence that was refused. */
+	readonly sequence: bigint;
+
+	constructor(sequence: bigint) {
+		super(`sequence ${sequence} was skipped`);
+		this.name = "Skipped";
+		this.sequence = sequence;
 	}
 }
 
 /**
- * The {@link StreamCode.ControlTimeout} error for a control request the peer never answered.
+ * The {@link StreamCode | StreamCode.ControlTimeout} error for a control request the peer never answered.
  *
  * A control request that outlives its deadline is not late content, so it does not go out as
- * {@link StreamCode.DeliveryTimeout} the way a bare {@link TimeoutError} would. Callers that
+ * {@link StreamCode | StreamCode.DeliveryTimeout} the way a bare {@link TimeoutError} would. Callers that
  * bound a request's response build this instead.
  *
  * @internal
@@ -411,7 +444,7 @@ export function controlTimeout(cause: unknown): Stream {
 }
 
 /**
- * The {@link StreamCode.Unauthorized} error for a request the grant does not cover, naming
+ * The {@link StreamCode | StreamCode.Unauthorized} error for a request the grant does not cover, naming
  * the broadcast. Unlike {@link SessionCode.Unauthorized}, it ends only this stream.
  *
  * @internal
@@ -432,9 +465,8 @@ export function unauthorized(broadcast: string): Stream {
  * the same `instanceof` as one raised here.
  *
  * On an IETF stream a code keeps its value unless moq-lite claims that number for something
- * the draft does not: `0x4` is GOING_AWAY here but UNKNOWN_OBJECT_STATUS on draft-16 and 17,
- * and reading one back as the other would retire a session that is not going anywhere. Those
- * read as {@link StreamCode.Internal} with the wire value kept in the message, since
+ * the draft does not, such as its own 48-63 range. Those read as
+ * {@link StreamCode | StreamCode.Internal} with the wire value kept in the message, since
  * {@link StreamCode} is one numeric space and cannot hold a foreign code without lying about
  * it. A code moq-lite names nothing for survives intact: nothing can misread it.
  *
@@ -443,7 +475,7 @@ export function unauthorized(broadcast: string): Stream {
 export function fromTransport(err: unknown, options?: TransportErrorOptions): Error {
 	const code = streamCode(err);
 	if (code === undefined) return error(err);
-	if (options?.version !== undefined && !sharedStreamCode(code, options.version) && claimedLocally(code)) {
+	if (options?.version !== undefined && !sharedStreamCode(code) && claimedLocally(code)) {
 		return new Stream(StreamCode.Internal, { cause: err, message: `remote error: ${code}` });
 	}
 	if (code === StreamCode.TooFarBehind) return new TooFarBehind({ cause: err });
@@ -473,7 +505,7 @@ const legacyWebTransportErrors = new WeakSet<object>();
  *
  * Both the WebTransport spec and the WebSocket fallback take the reset code from a
  * `WebTransportError`'s `streamErrorCode` and send 0 for anything else, a plain `Error`
- * included. Since 0 is {@link StreamCode.Internal}, cancelling with a bare `Error` tells the
+ * included. Since 0 is {@link StreamCode | StreamCode.Internal}, cancelling with a bare `Error` tells the
  * peer we failed rather than that we are done.
  *
  * The native constructor exists exactly where native WebTransport does, which is where the

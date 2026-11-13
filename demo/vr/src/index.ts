@@ -7,9 +7,9 @@ const url = new URL(params.get("url") ?? import.meta.env.VITE_RELAY_URL ?? "http
 const name = Net.Path.from(params.get("name") ?? "vr.hang");
 
 const connection = new Net.Connection({ url });
-const broadcast = new Broadcast({ origin: connection.origin, name, enabled: true, announced: true });
+const broadcast = new Broadcast({ origin: connection.origin, name, enabled: true });
 const audioSrc = new Audio.Source({ broadcast, supported: Audio.Decoder.supported });
-const videoSrc = new Video.Source({ broadcast, supported: Video.Decoder.supported, probe: connection.probe });
+const videoSrc = new Video.Source({ broadcast, supported: Video.Decoder.supported });
 const sync = new Sync({});
 const audio = new Audio.Decoder({ source: audioSrc, sync, enabled: true });
 const video = new Video.Decoder({ source: videoSrc, sync, enabled: true });
@@ -22,13 +22,29 @@ effect.run((e) => {
 	if (frame) scene.frame(frame.clone());
 });
 
-const status = document.getElementById("status");
 effect.run((e) => {
-	if (!status) return;
 	const error = e.get(video.out.error) ?? e.get(audio.out.error);
-	status.textContent = error
-		? `error: ${error.message}`
-		: `${e.get(connection.status)} · ${name} ${e.get(broadcast.out.status)}`;
+	const muted = e.get(scene.muted) ? " · muted" : "";
+	const config = e.get(videoSrc.out.config);
+	const display = e.get(video.out.display);
+	const delay = e.get(sync.out.delay);
+	const fps = e.get(scene.fps);
+	// Stats change every frame, so sample them on the once-a-second fps tick instead.
+	const stats = video.out.stats.peek();
+
+	const projection = config?.projection;
+	const shape = projection?.kind === "equirectangular" ? `equirect ${projection.fov ?? 360}°` : "flat";
+	const lines = [
+		error
+			? `error: ${error.message}`
+			: `${e.get(connection.status)} · ${name} ${e.get(broadcast.out.status)}${muted}`,
+		config
+			? `${display?.width ?? "?"}×${display?.height ?? "?"} ${config.codec} · ${shape} · ${config.stereo ?? "mono"}`
+			: "no video",
+		`render ${fps.render} fps · video ${fps.video} fps`,
+		`buffer ${Math.round(delay.asMillis())} ms · late ${stats?.late ?? 0} · stalls ${stats?.stalls ?? 0}`,
+	];
+	scene.status(lines);
 });
 
 effect.run((e) => {
@@ -48,6 +64,9 @@ effect.run((e) => {
 				: { kind: "point", position: scene.speaker };
 	const spatial = new Spatial(root, placement);
 	scene.listener = spatial;
+	e.run((inner) => {
+		spatial.muted = inner.get(scene.muted);
+	});
 
 	e.cleanup(() => {
 		spatial.close();

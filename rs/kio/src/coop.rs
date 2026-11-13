@@ -9,6 +9,10 @@ use std::task::Poll;
 
 use crate::Waiter;
 
+/// Ready kio polls one task poll may make under the simulator before it panics as a spin.
+#[cfg(feature = "sim")]
+pub(crate) const READY_LIMIT: usize = 4096;
+
 #[cfg(feature = "sim")]
 thread_local! {
 	static READY: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
@@ -29,7 +33,7 @@ impl Drop for Reset {
 /// Count ready kio polls until the returned guard drops, panicking if the task spins.
 #[cfg(feature = "sim")]
 #[must_use = "keep the guard until the task poll returns"]
-pub fn scope() -> impl Drop {
+pub(crate) fn scope() -> impl Drop {
 	Reset(READY.replace(Some(0)))
 }
 
@@ -47,7 +51,7 @@ pub(crate) fn ready<T>(value: T) -> Poll<T> {
 		let count = READY.get().map(|count| count + 1);
 		READY.set(count);
 		assert!(
-			count.is_none_or(|count| count <= 4096),
+			count.is_none_or(|count| count <= READY_LIMIT),
 			"kio Ready poll limit exceeded at {}; add a coop::Budget to the loop",
 			std::panic::Location::caller(),
 		);
@@ -91,7 +95,7 @@ impl Budget {
 	}
 }
 
-#[cfg(all(test, not(loom)))]
+#[cfg(test)]
 mod tests {
 	use std::{
 		sync::{

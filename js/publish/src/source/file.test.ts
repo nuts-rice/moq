@@ -1,4 +1,5 @@
 import { expect, mock, spyOn, test } from "bun:test";
+import { Duration, Instant, Manual } from "@moq/clock";
 import { File as FileSource } from "./file";
 
 const flush = () => new Promise<void>((resolve) => queueMicrotask(resolve));
@@ -79,6 +80,64 @@ test("clearing a decoded file clears its published media", async () => {
 		expect(source.out.source.peek()).toBeUndefined();
 	} finally {
 		source.close();
+		if (createImageBitmap) Object.defineProperty(globalThis, "createImageBitmap", createImageBitmap);
+		else Reflect.deleteProperty(globalThis, "createImageBitmap");
+		if (videoFrame) Object.defineProperty(globalThis, "VideoFrame", videoFrame);
+		else Reflect.deleteProperty(globalThis, "VideoFrame");
+	}
+});
+
+test("an image read again after a gap skips to the slot due now", async () => {
+	const createImageBitmap = Object.getOwnPropertyDescriptor(globalThis, "createImageBitmap");
+	const videoFrame = Object.getOwnPropertyDescriptor(globalThis, "VideoFrame");
+
+	Object.defineProperty(globalThis, "createImageBitmap", {
+		configurable: true,
+		value: async () => ({ close() {} }),
+	});
+	Object.defineProperty(globalThis, "VideoFrame", {
+		configurable: true,
+		value: class {
+			timestamp: number;
+			constructor(_image: unknown, init: { timestamp: number }) {
+				this.timestamp = init.timestamp;
+			}
+			close() {}
+		},
+	});
+
+	const clock = new Manual();
+	const installed = clock.install();
+	// Start away from zero so an unanchored timestamp can't pass by accident.
+	clock.jump(Duration.secs(1));
+	const zero = 1_000_000;
+
+	const source = new FileSource({
+		file: new File([new Uint8Array([0])], "still.png", { type: "image/png" }),
+	});
+
+	try {
+		await settle();
+		const video = source.out.source.peek()?.video;
+		if (!video || !("frames" in video)) throw new Error("missing image frames");
+		const reader = video.frames.getReader();
+		const read = async () => (await clock.drive(reader.read())).value?.timestamp;
+
+		expect(await read()).toBe(zero);
+
+		// Unread for a minute: the next frame is the one due now, not the 1,799 missed in between.
+		clock.jump(Duration.secs(60));
+		expect(await read()).toBe(zero + 60_000_000);
+
+		// Then the 30fps cadence resumes from the present.
+		const next = zero + (1801 / 30) * 1_000_000;
+		expect(await read()).toBe(Math.round(next));
+		expect(clock.now().since(Instant.ZERO).asMicros()).toBeCloseTo(next, 3);
+
+		await reader.cancel();
+	} finally {
+		source.close();
+		installed.close();
 		if (createImageBitmap) Object.defineProperty(globalThis, "createImageBitmap", createImageBitmap);
 		else Reflect.deleteProperty(globalThis, "createImageBitmap");
 		if (videoFrame) Object.defineProperty(globalThis, "VideoFrame", videoFrame);

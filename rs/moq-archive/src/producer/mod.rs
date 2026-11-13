@@ -3,9 +3,9 @@
 //! A [`Producer`] lists the broadcast's tracks (TRACKS, [`broadcast::Consumer::tracks`]) and
 //! records each through its own ascending SUBSCRIBE, so it holds what the publisher's cache
 //! stops serving: a group still missing once the subscription's max delay passes is a gap, never
-//! a stall. Datagrams are never cached, so a track's are recorded from when its subscription
-//! takes effect. The host picks the key prefix, per broadcast path and epoch say, and runs one
-//! producer per broadcast; the producer stores no epoch. See the [crate docs](crate#layout) for
+//! a stall. TRACKS lists stream tracks only, so a datagram track, which is live-only, is never
+//! recorded. The host picks the key prefix, per broadcast path and instance say, and runs one
+//! producer per broadcast; the producer stores no instance. See the [crate docs](crate#layout) for
 //! what it writes.
 //!
 //! A producer started under a prefix that already holds objects resumes each track at the frame
@@ -13,7 +13,7 @@
 //!
 //! ```no_run
 //! # async fn example(broadcast: moq_net::broadcast::Consumer) -> moq_archive::Result<()> {
-//! use moq_archive::object_store::memory::InMemory;
+//! use object_store::memory::InMemory;
 //!
 //! let store = moq_archive::Store::new(InMemory::new(), "recordings/demo");
 //! moq_archive::Producer::new(store, broadcast, Default::default()).run().await?;
@@ -201,7 +201,9 @@ impl<S: ObjectStore> Producer<S> {
 					// Only fails once closed, which happens when the listing ends.
 					let _ = queue.try_push(info);
 				}
-				Event::Listed(Ok(Some(TracksEvent::Synced | TracksEvent::Removed { .. }))) => {}
+				Event::Listed(Ok(Some(
+					TracksEvent::Synced | TracksEvent::Removed { .. } | TracksEvent::Finished { .. },
+				))) => {}
 				Event::Listed(Ok(None)) => {
 					listing = None;
 					for queue in queues.values() {

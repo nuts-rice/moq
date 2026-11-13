@@ -1,18 +1,18 @@
 #![cfg(feature = "async")]
 
-//! A dialed moq-transport session whose peer declares no hop must not be offered
-//! a route learned from that peer, and a SUBSCRIBE that arrives for that route
-//! must not be sent back to the peer that announced it.
+//! A dialed session must not be offered a route learned from its peer, and a
+//! SUBSCRIBE that arrives for that route must not be sent back to the peer that
+//! announced it.
 //!
-//! Draft 16 has no cluster extension, so neither side declares a hop. That is the
-//! anonymous dial: the accepting side already stamps one, and the dialing side
-//! has to as well.
+//! The anonymous dial is the hard case: when the peer declares no hop, the
+//! accepting side already stamps one, and the dialing side has to as well.
 
 use crate::support;
 
 use std::time::Duration;
 
-use moq_net::{Client, Hop, Server, Session, Version, origin, stats};
+use moq_net::{Client, Server, Session, Version, origin, stats};
+use std::num::NonZeroU64;
 use support::{
 	harness::{now, spawn},
 	mock::create_mock_session_pair,
@@ -21,12 +21,8 @@ use support::{
 /// Long enough, in virtual time, for an announce or subscribe to cross the mock link.
 const SETTLE: Duration = Duration::from_secs(1);
 
-fn version() -> Version {
-	"moq-transport-16".parse().unwrap()
-}
-
-fn produce(hop: u64) -> origin::Producer {
-	let (producer, driver) = origin::Producer::new(origin::Config::new(Hop::new(hop).unwrap()));
+fn produce(hop: NonZeroU64) -> origin::Producer {
+	let (producer, driver) = origin::Producer::new(origin::Config::new(hop));
 	spawn(driver);
 	producer
 }
@@ -40,18 +36,19 @@ struct Link {
 	registry: stats::Registry,
 }
 
-async fn dial(dialer: &origin::Producer, edge: &origin::Producer) -> Link {
-	let version = version();
+async fn dial(version: Version, dialer: &origin::Producer, edge: &origin::Producer) -> Link {
 	let registry = stats::Registry::new(stats::Config::new());
-	let session_stats = registry.tier(stats::Tier::default()).session("");
+	let session_stats = registry
+		.tier(stats::Tier::default())
+		.session(moq_net::stats::SessionInfo::new(moq_net::Path::from_static("")));
 	let mut mock = moq_net::transport::memory::Config::default();
 	mock.protocol = Some(version.alpn().to_string());
 	let (client_transport, server_transport) = create_mock_session_pair(mock);
 
 	// Cluster dials publish and subscribe through a peer handle, which is what
 	// records the announcing session on the route.
-	let dialer_origin = dialer.clone().peer();
-	let edge_origin = edge.clone().peer();
+	let dialer_origin = dialer.clone().with_link(moq_net::origin::Link::Peer);
+	let edge_origin = edge.clone().with_link(moq_net::origin::Link::Peer);
 	let client = Client::new()
 		.with_versions(version.into())
 		.with_publisher(dialer_origin.consume().with_hidden(true))
@@ -97,16 +94,23 @@ fn traffic(registry: &stats::Registry, role: stats::Role) -> stats::Traffic {
 }
 
 /// The hop the dialer attributed `path` to, once that announce has arrived.
-async fn learned_hop(dialer: &origin::Producer, path: &str) -> Hop {
-	let mut announced = dialer.consume().announced();
-	let event = moq_clock::timeout(SETTLE, async {
+async fn learned_hop(dialer: &origin::Producer, path: &str) -> u64 {
+	let mut announced = dialer.consume().routes();
+	let event = kio::clock::timeout(SETTLE, async {
 		loop {
 			let event = announced.next().await.expect("announce cursor closed");
 			let announce = match event {
-				moq_net::announce::Event::Start(announce)
-				| moq_net::announce::Event::Update(announce)
-				| moq_net::announce::Event::Restart(announce) => announce,
-				moq_net::announce::Event::End(_) => continue,
+				moq_net::origin::RouteEvent {
+					kind:
+						moq_net::origin::RouteKind::Start
+						| moq_net::origin::RouteKind::Update
+						| moq_net::origin::RouteKind::Restart,
+					announce,
+				} => announce,
+				moq_net::origin::RouteEvent {
+					kind: moq_net::origin::RouteKind::End | moq_net::origin::RouteKind::Offline,
+					..
+				} => continue,
 			};
 			if announce.prefix.as_str() == path {
 				return announce;
@@ -122,37 +126,58 @@ async fn learned_hop(dialer: &origin::Producer, path: &str) -> Hop {
 	}
 }
 
-/// Draft-16 edges dialed by one origin each get their own hop. The edge that
+fn hop(id: u64) -> NonZeroU64 {
+	NonZeroU64::new(id).unwrap()
+}
+
+/// Edges that declare their own hop over the MoQ Cluster extension.
+#[kio::test]
+async fn dialed_named_session_does_not_echo_or_route_subscribe_back() {
+	split_horizon("moq-transport-18", [hop(2), hop(3)]).await;
+}
+
+/// moq-lite-01 carries no hop, so neither side declares one.
+#[kio::test]
+async fn dialed_anonymous_session_does_not_echo_or_route_subscribe_back() {
+	split_horizon("moq-lite-01", [hop(2), hop(3)]).await;
+}
+
+/// Edges dialed by one origin each get their own hop. The edge that
 /// announced a namespace is not told about it, and the other edge is. A
 /// subscribe from that other edge is fetched from the announcer and is not
 /// sent back to the subscriber.
-#[moq_clock::test]
-async fn dialed_anonymous_session_does_not_echo_or_route_subscribe_back() {
-	let dialer = produce(1);
-	let publisher = produce(2);
-	let subscriber = produce(3);
-	let to_publisher = dial(&dialer, &publisher).await;
-	let to_subscriber = dial(&dialer, &subscriber).await;
+async fn split_horizon(version: &str, [publisher_hop, subscriber_hop]: [NonZeroU64; 2]) {
+	let version: Version = version.parse().unwrap();
+	let dialer = produce(hop(1));
+	let publisher = produce(publisher_hop);
+	let subscriber = produce(subscriber_hop);
+	let to_publisher = dial(version, &dialer, &publisher).await;
+	let to_subscriber = dial(version, &dialer, &subscriber).await;
 
-	let broadcast = publisher.create_broadcast("room").unwrap();
-	let track = broadcast.create_track("video", None).unwrap();
-	broadcast.announce(origin::Route::default()).unwrap();
+	let broadcast = publisher
+		.route("room", moq_net::origin::RouteOptions::hidden())
+		.unwrap();
+	let track = broadcast.broadcast().create_track("video", None).unwrap();
+	broadcast.announce().unwrap();
 
 	let publisher_hop = learned_hop(&dialer, "room").await;
 	assert_ne!(
-		publisher_hop,
-		Hop::UNKNOWN,
+		publisher_hop, 0,
 		"an anonymous dial still needs a hop, or its routes echo"
 	);
 
 	// The other edge learns the namespace, attributed to a different hop, so the
 	// two dials are not one endpoint.
-	let mut subscriber_announced = subscriber.consume().announced();
-	let subscriber_saw = moq_clock::timeout(SETTLE, subscriber_announced.next())
+	let mut subscriber_announced = subscriber.consume().routes();
+	let subscriber_saw = kio::clock::timeout(SETTLE, subscriber_announced.next())
 		.await
 		.expect("the other edge never learned the namespace")
 		.expect("announce cursor closed");
-	let moq_net::announce::Event::Start(subscriber_saw) = subscriber_saw else {
+	let moq_net::origin::RouteEvent {
+		kind: moq_net::origin::RouteKind::Start,
+		announce: subscriber_saw,
+	} = subscriber_saw
+	else {
 		panic!("the other edge's first event was not the namespace: {subscriber_saw:?}");
 	};
 	assert_eq!(subscriber_saw.prefix.as_str(), "room");
@@ -161,9 +186,9 @@ async fn dialed_anonymous_session_does_not_echo_or_route_subscribe_back() {
 		origin::Source::Local => panic!("the forwarded route looks local"),
 	};
 	assert_ne!(subscriber_hop, publisher_hop, "each dial gets its own hop");
-	assert_ne!(subscriber_hop, Hop::UNKNOWN);
+	assert_ne!(subscriber_hop, 0);
 
-	moq_clock::sleep(SETTLE).await;
+	kio::clock::sleep(SETTLE).await;
 
 	let echoed = traffic(&to_publisher.registry, stats::Role::Subscriber);
 	assert_eq!(
@@ -181,7 +206,7 @@ async fn dialed_anonymous_session_does_not_echo_or_route_subscribe_back() {
 	// session it arrived on.
 	let viewed = subscriber
 		.consume()
-		.request_broadcast("room", None)
+		.request("room", None)
 		.await
 		.expect("subscriber resolves the namespace");
 	let subscription = moq_net::track::Subscription::default();
@@ -191,12 +216,12 @@ async fn dialed_anonymous_session_does_not_echo_or_route_subscribe_back() {
 		.subscribe(subscription)
 		.await
 		.expect("subscriber subscribes");
-	moq_clock::timeout(SETTLE, crate::support::wanted(track.demand()))
+	kio::clock::timeout(SETTLE, crate::support::wanted(track.demand()))
 		.await
 		.expect("the subscribe never reached the announcer")
 		.unwrap();
 
-	moq_clock::sleep(SETTLE).await;
+	kio::clock::sleep(SETTLE).await;
 
 	let from_announcer = traffic(&to_publisher.registry, stats::Role::Publisher);
 	assert_eq!(

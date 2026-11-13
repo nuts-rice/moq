@@ -3,6 +3,10 @@
 # migrates to relay B when A drains, without a dropped group. See README.md.
 set -euo pipefail
 
+if [[ "${GITHUB_ACTIONS:-}" != true && "${LOCAL_SUPERVISED:-}" != 1 ]]; then
+    exec bash "$(dirname "$0")/../../sh/local.sh" bash "$0" "$@"
+fi
+
 DRAIN_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 WORKSPACE=$(cd "$DRAIN_DIR/../.." && pwd)
 
@@ -57,7 +61,7 @@ flag=()
 TARGET_BASE="${CARGO_TARGET_DIR:-$WORKSPACE/target}"
 [[ -n "$RELAY" ]] || RELAY="$TARGET_BASE/$PROFILE/moq-relay"
 
-(cd "$WORKSPACE" && bun install --frozen-lockfile)
+uv run --no-project python "$WORKSPACE/sh/js/install.py" frozen
 
 # ── relays ──────────────────────────────────────────────────────────────────
 # Start one relay on a reserved port: `start <name> [extra relay args...]`.

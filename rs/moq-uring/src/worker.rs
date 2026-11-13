@@ -1,13 +1,15 @@
 //! The per-thread worker: ring ownership, the drive loop, and parking.
 
 use std::cell::RefCell;
+use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::Ordering;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use io_uring::{EnterFlags, IoUring, opcode, types};
-use moq_clock::Instant;
+use kio::clock::Instant;
 
 use crate::clock::{Clock, Wait};
 use crate::metrics::Metrics;
@@ -32,9 +34,9 @@ const SQ_ENTRIES: u32 = 128;
 /// allocation-per-CQE slow path and it ends any armed multishot receive, so
 /// the CQ is sized to keep it out of steady state.
 ///
-/// No larger: the ring is charged to `RLIMIT_MEMLOCK` at 16 bytes per entry,
-/// most of each worker's footprint, and that budget is shared by every
-/// io_uring the user runs.
+/// No larger: the ring costs 16 bytes per entry, most of each worker's
+/// footprint, and Linux 6.14 up to the 7.3 fix charges it to `RLIMIT_MEMLOCK`,
+/// a budget shared by every io_uring the user runs.
 const PRODUCTION_CQ_ENTRIES: u32 = 2048;
 #[cfg(not(test))]
 const CQ_ENTRIES: u32 = PRODUCTION_CQ_ENTRIES;
@@ -53,11 +55,17 @@ const TEARDOWN_EINTR_RETRIES: usize = 8;
 /// Maximum time spent staging cancellations and draining completions.
 const TEARDOWN_TIMEOUT: Duration = Duration::from_millis(3200);
 
+/// The most passes over its woken tasks one turn runs before it submits. A
+/// received datagram's chain is the demux, its connection, the application
+/// task it wakes, and the connection again for the reply. A sweep of 1, 2, 4,
+/// and 8 passes found nothing left to run past four.
+const PASSES: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+
 /// Worker construction knobs.
 ///
 /// The worker sizes its ring internally, with a completion queue that
 /// comfortably covers the per-socket pool ceilings in [`udp::Config`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub struct Config {
 	/// Where the worker accumulates its counters.
@@ -69,6 +77,24 @@ pub struct Config {
 	/// so give each worker its own. Cloning this config starts a fresh set for
 	/// the cloned worker.
 	pub metrics: Metrics,
+	/// The most passes over its woken tasks one turn runs before it submits:
+	/// [`PASSES`], which only tests change.
+	///
+	/// A turn runs its tasks until a pass wakes nothing, so work a completion
+	/// sets off (a datagram routed to its connection, the connection staging
+	/// its reply) is staged by the enter that follows it. The budget bounds a
+	/// wake chain, or a task waking itself, so the ring is still reaped and
+	/// submitted to between steps of it. One is a pass per turn.
+	pub(crate) passes: NonZeroUsize,
+}
+
+impl Default for Config {
+	fn default() -> Self {
+		Self {
+			metrics: Metrics::default(),
+			passes: PASSES,
+		}
+	}
 }
 
 impl Clone for Config {
@@ -77,6 +103,7 @@ impl Clone for Config {
 		// not be folded into the source worker's per-worker series.
 		Self {
 			metrics: Metrics::default(),
+			passes: self.passes,
 		}
 	}
 }
@@ -97,7 +124,9 @@ impl Clone for Config {
 /// cannot finish. It runs no tasks, though, so work a task has merely been
 /// asked for is not performed: a QUIC close is queued on its connection and
 /// framed by the driver task, so keep driving until the close is published
-/// rather than stopping the worker on the call that asked for it.
+/// rather than stopping the worker on the call that asked for it. Its tasks are
+/// dropped instead, so a socket, endpoint, connection, or stream handle that
+/// outlives it fails rather than pending.
 pub struct Worker {
 	shared: Rc<Shared>,
 	tasks: kio::Tasks<Task>,
@@ -110,7 +139,11 @@ pub struct Worker {
 	/// parked wakes the worker to re-park for it.
 	owner: kio::Waiter,
 	/// A manual clock's wake for the next deadline; the host clock needs none.
-	alarm: Option<moq_clock::Sleep>,
+	alarm: Option<kio::clock::Sleep>,
+	/// The most passes over the woken tasks a turn runs.
+	passes: NonZeroUsize,
+	/// The yields a turn wakes once its passes are done, kept to reuse.
+	yields: Vec<std::task::Waker>,
 }
 
 impl Worker {
@@ -120,7 +153,7 @@ impl Worker {
 	/// park timeout, and batched minimum waits with one code path; there is
 	/// deliberately no fallback (use the tokio stack instead).
 	pub fn new(config: Config) -> Result<Self, Error> {
-		let Config { metrics } = config;
+		let Config { metrics, passes } = config;
 		let metrics = metrics.counters().clone();
 		let ring = IoUring::builder()
 			.setup_single_issuer()
@@ -153,8 +186,11 @@ impl Worker {
 		}
 
 		let clock = Clock::new();
-		let deadlines = moq_clock::Deadlines::new(clock.now());
+		let deadlines = kio::clock::Deadlines::new(clock.now());
 		let unpark = Unpark::new(metrics.clone());
+		// A wake CQE can join a larger batch after warmup. Reserve the kernel's
+		// actual queue size so copying those completions does not allocate.
+		let cqes = Vec::with_capacity(ring.params().cq_entries() as usize);
 		Ok(Self {
 			owner: kio::Waiter::new(unpark.waker()),
 			shared: Rc::new(Shared {
@@ -163,18 +199,25 @@ impl Worker {
 				clock,
 				deadlines,
 				turning: std::cell::Cell::new(false),
+				turn: std::cell::Cell::new(0),
+				yields: RefCell::new(Vec::new()),
 				spawns: RefCell::new(Vec::new()),
 				unpark,
 				metrics,
-				next_bgid: std::cell::Cell::new(0),
+				bgids: RefCell::default(),
+				failed: std::cell::Cell::new(None),
 				stopped: std::cell::Cell::new(false),
 				spill: RefCell::new(std::collections::VecDeque::new()),
+				#[cfg(test)]
+				enter_faults: RefCell::default(),
 			}),
 			tasks: kio::Tasks::new(),
 			park: kio::Park::default(),
-			cqes: Vec::new(),
+			cqes,
 			futex_armed: false,
 			alarm: None,
+			passes,
+			yields: Vec::new(),
 		})
 	}
 
@@ -192,39 +235,82 @@ impl Worker {
 	/// is fatal to the worker.
 	///
 	/// While it runs, the worker's clock is the thread's ambient
-	/// [`moq_clock`] clock: [`moq_clock::now`] reads the instant the current
-	/// turn sampled, and [`moq_clock::sleep`] arms this worker's timers.
+	/// [`kio::clock`] clock: [`kio::clock::now`] reads the instant the current
+	/// turn sampled, and [`kio::clock::sleep`] arms this worker's timers.
 	pub fn block_on<F: Future>(&mut self, future: F) -> Result<F::Output, Error> {
 		let mut future = std::pin::pin!(future);
 		let waker = self.shared.unpark.waker();
+		// A turn runs as one batch of the worker's own poll: a wake of the task
+		// set from a completion, the root future, or a task is held rather than
+		// delivered as a wake of the worker. The passes take it, and only one
+		// the pass budget leaves over wakes the worker for another turn.
+		let batch = kio::Waiter::new(waker.clone());
 		let _turn = Turn::enter(&self.shared);
 		loop {
-			self.shared.metrics.turns.add(1);
-			// The turn's one clock read: every timer due by now fires, and
-			// everything polled below sees this instant.
-			self.shared.deadlines.advance(self.shared.clock.now());
-			// Adopt tasks spawned since the last turn (spawning wakes us).
-			let spawns = std::mem::take(&mut *self.shared.spawns.borrow_mut());
-			for task in spawns {
-				self.tasks.push(task);
-			}
-
-			let cx = Context::from_waker(&waker);
-			let waiter = self.park.hold(&cx);
-			if let Poll::Ready(value) = waiter.poll_future(future.as_mut()) {
+			if let Some(value) = batch.batch(|| self.turn(future.as_mut(), &waker))? {
 				return Ok(value);
 			}
-			// `Ready` just means the set is drained; the waiter stays
-			// registered for the next push.
-			let _ = self.tasks.poll(waiter);
-
-			self.pump()?;
-			self.maybe_park()?;
+			self.finish()?;
 		}
 	}
 
-	/// Dispatch completions, carrying parked submissions into the wait enter.
-	fn pump(&mut self) -> Result<(), Error> {
+	/// One turn up to its submit: completions in, then the root future and the
+	/// tasks, until a pass wakes nothing or the pass budget is spent.
+	fn turn<F: Future>(&mut self, future: Pin<&mut F>, waker: &Waker) -> Result<Option<F::Output>, Error> {
+		self.shared.metrics.turns.add(1);
+		self.shared.turn.set(self.shared.turn.get() + 1);
+		// The turn's one clock read: every timer due by now fires, and
+		// everything polled below sees this instant.
+		self.shared.deadlines.advance(self.shared.clock.now());
+		// Dispatch what the last enter brought back first, so the passes below
+		// run on it and the sends they stage ride the next enter.
+		self.reap(None)?;
+		// Everything below polls whatever a wake so far could have readied, so
+		// take the notifications that came before it, and leave only the ones
+		// raised from here on to keep the turn from parking. The swap acquires
+		// a remote wake's store, so the task bits it set before it are seen.
+		self.shared.unpark.word.swap(RUNNING, Ordering::AcqRel);
+		// Adopt tasks spawned since the last turn (spawning wakes us).
+		let spawns = std::mem::take(&mut *self.shared.spawns.borrow_mut());
+		for task in spawns {
+			self.tasks.push(task);
+		}
+		// A failure recorded between calls (or as the last call's future
+		// resolved) surfaces before a ready future can return past it.
+		if let Some(err) = self.shared.failed.take() {
+			return Err(err.into());
+		}
+
+		let cx = Context::from_waker(waker);
+		let waiter = self.park.hold(&cx);
+		if let Poll::Ready(value) = waiter.poll_future(future) {
+			return Ok(Some(value));
+		}
+		// The waiter stays registered for the next push even once the set is
+		// drained.
+		let passes = self.tasks.poll_passes(waiter, self.passes);
+		self.shared.metrics.passes.add(passes as u64);
+		Ok(None)
+	}
+
+	/// End a turn: park on its submissions when nothing is left to run, or
+	/// submit them and turn again.
+	fn finish(&mut self) -> Result<(), Error> {
+		// Woken outside the turn's batch, so each wakes the worker: a task that
+		// yielded runs after the next reap, not in another pass of this turn.
+		std::mem::swap(&mut self.yields, &mut *self.shared.yields.borrow_mut());
+		for waker in self.yields.drain(..) {
+			waker.wake();
+		}
+		if let Some(err) = self.shared.failed.take() {
+			return Err(err.into());
+		}
+		self.submit_unparked()?;
+		self.maybe_park()
+	}
+
+	/// Submit what cannot ride the parked enter.
+	fn submit_unparked(&mut self) -> Result<(), Error> {
 		let notified = self.shared.unpark.word.load(Ordering::Acquire) == crate::park::NOTIFIED;
 		let full = !notified && !self.futex_armed && self.shared.ring.borrow_mut().submission().is_full();
 		if full {
@@ -235,7 +321,7 @@ impl Worker {
 		if notified || full {
 			self.submit()?;
 		}
-		self.reap(None)
+		Ok(())
 	}
 
 	/// Submit and reap completions only while the teardown budget remains.
@@ -516,7 +602,7 @@ impl Worker {
 /// current instant until this drops.
 struct Turn {
 	shared: Rc<Shared>,
-	_ambient: moq_clock::Entered,
+	_ambient: kio::clock::Entered,
 }
 
 impl Turn {
@@ -542,7 +628,7 @@ impl Drop for Worker {
 		self.shared.stopped.set(true);
 		// One deadline bounds cancellation staging and draining together. It is
 		// on the host's time, so it passes even on a manual clock.
-		let deadline = self.shared.clock.host_now() + TEARDOWN_TIMEOUT;
+		let deadline = self.shared.clock.host_now().saturating_add(TEARDOWN_TIMEOUT);
 		// The kernel may still write into provided buffers and read send
 		// headers owned by the ops slab. Queue cancels behind every staged
 		// receive and the futex, so partial submissions cannot strand an
@@ -567,6 +653,13 @@ impl Drop for Worker {
 			tracing::error!("failed to queue one or more io_uring teardown cancellations");
 		}
 		self.drain_teardown(deadline);
+		// Drop every task here, including those spawned since the last turn,
+		// which a surviving handle would otherwise keep alive. A QUIC driver
+		// fails its connection as it drops, waking whatever its handles have
+		// parked.
+		let spawns = std::mem::take(&mut *self.shared.spawns.borrow_mut());
+		drop(spawns);
+		self.tasks = kio::Tasks::new();
 	}
 }
 
@@ -650,9 +743,9 @@ pub(crate) struct Owner {
 	/// Held directly: a timer on a dropped worker still has to exist, since
 	/// the driver that owns it is torn down by the same drop that would need
 	/// it.
-	#[cfg_attr(not(feature = "quic"), allow(dead_code))]
-	deadlines: moq_clock::Deadlines,
-	#[cfg_attr(not(feature = "quic"), allow(dead_code))]
+	#[cfg_attr(not(feature = "quic"), allow(dead_code, reason = "only the `quic` feature uses it"))]
+	deadlines: kio::clock::Deadlines,
+	#[cfg_attr(not(feature = "quic"), allow(dead_code, reason = "only the `quic` feature uses it"))]
 	metrics: std::sync::Arc<crate::metrics::Counters>,
 }
 
@@ -666,11 +759,20 @@ impl Owner {
 	}
 
 	/// The worker's time: the current turn's instant, or the clock's between turns.
-	#[cfg_attr(not(feature = "quic"), allow(dead_code))]
+	#[cfg_attr(not(feature = "quic"), allow(dead_code, reason = "only the `quic` feature uses it"))]
 	pub fn now(&self) -> Instant {
 		self.shared
 			.upgrade()
 			.map_or_else(|| self.deadlines.now(), |shared| shared.now())
+	}
+
+	/// The worker's clock read now, mid-turn, rather than the turn's instant: for pairing with a
+	/// wall clock read at the same moment.
+	#[cfg_attr(not(feature = "quic"), allow(dead_code, reason = "only the `quic` feature uses it"))]
+	pub fn read_clock(&self) -> Instant {
+		self.shared
+			.upgrade()
+			.map_or_else(|| self.deadlines.now(), |shared| shared.clock.now())
 	}
 
 	/// The worker's core while it is still allocated, torn down or not.
@@ -685,21 +787,37 @@ impl Owner {
 	}
 
 	/// Run a `!Send` future on the worker, or drop it if the worker is gone.
-	#[cfg_attr(not(feature = "quic"), allow(dead_code))]
+	#[cfg_attr(not(feature = "quic"), allow(dead_code, reason = "only the `quic` feature uses it"))]
 	pub fn spawn(&self, future: impl Future<Output = ()> + 'static) {
 		if let Some(handle) = self.handle() {
 			handle.spawn(future);
 		}
 	}
 
+	/// The worker's turn count, so a task can budget its work per turn. Zero
+	/// once the worker is gone.
+	#[cfg_attr(not(feature = "quic"), allow(dead_code, reason = "only the `quic` feature uses it"))]
+	pub fn turn(&self) -> u64 {
+		self.shared.upgrade().map_or(0, |shared| shared.turn.get())
+	}
+
+	/// Wake `waker` once this turn's passes are done, so the task runs again
+	/// after the next reap rather than in a later pass of this turn.
+	#[cfg_attr(not(feature = "quic"), allow(dead_code, reason = "only the `quic` feature uses it"))]
+	pub fn yield_turn(&self, waker: &Waker) {
+		if let Some(shared) = self.shared.upgrade() {
+			shared.yields.borrow_mut().push(waker.clone());
+		}
+	}
+
 	/// A disarmed timer on the worker.
-	#[cfg_attr(not(feature = "quic"), allow(dead_code))]
+	#[cfg_attr(not(feature = "quic"), allow(dead_code, reason = "only the `quic` feature uses it"))]
 	pub fn timer(&self) -> crate::Timer {
 		crate::Timer::from_queue(&self.deadlines, self.metrics.clone())
 	}
 
 	/// A timer that expires after `duration`.
-	#[cfg_attr(not(feature = "quic"), allow(dead_code))]
+	#[cfg_attr(not(feature = "quic"), allow(dead_code, reason = "only the `quic` feature uses it"))]
 	pub fn after(&self, duration: Duration) -> crate::Timer {
 		let mut timer = self.timer();
 		timer.set(self.now().checked_add(duration));
@@ -779,13 +897,13 @@ mod tests {
 	}
 
 	fn worker_with(config: Config) -> Option<Worker> {
-		worker_result(Worker::new(config), std::env::var_os("MOQ_STRICT").is_some())
+		worker_result(Worker::new(config), std::env::var_os("CI_STRICT").is_some())
 	}
 
 	/// A worker on a manual clock, which only `advance` moves.
-	fn manual() -> Option<(Worker, moq_clock::Installed)> {
+	fn manual() -> Option<(Worker, kio::clock::Installed)> {
 		let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
-		let clock = moq_clock::Manual::new().install(runtime.handle());
+		let clock = kio::clock::Manual::new().install(runtime.handle());
 		let _entered = runtime.enter();
 		Some((worker()?, clock))
 	}
@@ -793,7 +911,7 @@ mod tests {
 	/// Past on the host clock but ahead of the worker's last turn, so a park
 	/// for it times out at once.
 	fn due(worker: &Worker) -> Instant {
-		worker.shared.deadlines.now() + Duration::from_nanos(1)
+		worker.shared.deadlines.now().saturating_add(Duration::from_nanos(1))
 	}
 
 	fn worker_result(result: Result<Worker, Error>, required: bool) -> Option<Worker> {
@@ -838,12 +956,60 @@ mod tests {
 			.expect("stage NOP");
 		let mut timer = worker.handle().timer();
 		timer.set(Some(due(&worker)));
-		worker.pump().expect("pump");
+		worker.submit_unparked().expect("submit");
+		worker.reap(None).expect("reap");
 		worker.maybe_park().expect("park");
 		assert_eq!(
 			worker.handle().metrics().snapshot().enters,
 			1,
 			"the parked enter carries the staged SQE"
+		);
+	}
+
+	/// A wake-before-arm futex CQE can join a send-sized batch after warmup.
+	#[test]
+	fn a_larger_wake_batch_reuses_completion_storage() {
+		let Some(mut worker) = worker() else { return };
+		for _ in 0..4 {
+			let key = worker.shared.insert(Op::Cancel);
+			worker.shared.push(&opcode::Nop::new().build().user_data(key)).unwrap();
+		}
+		worker.shared.ring.borrow().submitter().submit_and_wait(4).unwrap();
+		worker.reap(None).unwrap();
+		let capacity = worker.cqes.capacity();
+		let before = worker.handle().metrics().snapshot();
+
+		for _ in 0..4 {
+			let key = worker.shared.insert(Op::Cancel);
+			worker.shared.push(&opcode::Nop::new().build().user_data(key)).unwrap();
+		}
+		// The wake lands after committing to park but before the kernel arms it.
+		// FUTEX_WAIT therefore posts EAGAIN beside the four ordinary completions.
+		let unpark = worker.shared.unpark.clone();
+		unpark.word.store(PARKED, Ordering::Release);
+		unpark.unpark();
+		let key = worker.shared.insert(Op::FutexWait);
+		let entry = opcode::FutexWait::new(
+			unpark.word.as_ptr(),
+			PARKED as u64,
+			FUTEX_BITSET_MATCH_ANY,
+			FUTEX2_SIZE_U32 | FUTEX2_PRIVATE,
+		)
+		.build()
+		.user_data(key);
+		worker.shared.push(&entry).unwrap();
+		worker.futex_armed = true;
+		worker.shared.ring.borrow().submitter().submit_and_wait(5).unwrap();
+		worker.reap(None).unwrap();
+
+		let after = worker.handle().metrics().snapshot();
+		assert_eq!(after.completions - before.completions, 5);
+		assert_eq!(after.wakes - before.wakes, 1);
+		assert!(!worker.futex_armed, "the futex completion must be dispatched");
+		assert_eq!(
+			worker.cqes.capacity(),
+			capacity,
+			"a larger steady-state batch grew the scratch buffer"
 		);
 	}
 
@@ -857,7 +1023,8 @@ mod tests {
 				.push(&opcode::Nop::new().build().user_data(key))
 				.expect("stage NOP");
 		}
-		worker.pump().expect("full pump");
+		worker.submit_unparked().expect("full submit");
+		worker.reap(None).expect("reap");
 		let snapshot = worker.handle().metrics().snapshot();
 		assert_eq!(snapshot.sq_full_enters, 1);
 		assert_eq!(snapshot.enters, 1);
@@ -881,7 +1048,8 @@ mod tests {
 				.push(&opcode::Nop::new().build().user_data(key))
 				.expect("stage NOP");
 		}
-		worker.pump().expect("full pump");
+		worker.submit_unparked().expect("full submit");
+		worker.reap(None).expect("reap");
 		worker.maybe_park().expect("park with armed futex");
 		let after = worker.handle().metrics().snapshot();
 		assert_eq!(after.enters - before.enters, 1);
@@ -904,7 +1072,7 @@ mod tests {
 		worker.shared.ring.borrow_mut().submit().expect("arm receive");
 		peer.send_to(b"deferred", sock.local_addr().expect("addr"))
 			.expect("send");
-		let deadline = worker.shared.clock.now() + Duration::from_secs(5);
+		let deadline = worker.shared.clock.now().saturating_add(Duration::from_secs(5));
 		while !worker.shared.ring.borrow_mut().submission().taskrun() {
 			assert!(
 				worker.shared.clock.now() < deadline,
@@ -913,14 +1081,116 @@ mod tests {
 			std::thread::yield_now();
 		}
 		assert!(worker.shared.ring.borrow_mut().submission().is_empty());
-		// A continuously self-waking future never parks. Its next pump must
+		// A continuously self-waking future never parks. Its next turn must
 		// dispatch the receive even though there is nothing new to submit.
 		worker.shared.unpark.unpark();
-		worker.pump().expect("notified pump");
+		worker.submit_unparked().expect("notified submit");
+		worker.reap(None).expect("reap");
 		let Poll::Ready(Ok(packet)) = sock.poll_recv(&kio::Waiter::noop()) else {
 			panic!("one busy turn must publish the receive");
 		};
 		assert_eq!(packet.payload(), b"deferred");
+	}
+
+	/// A completion's wake chain runs in the turn that reaps it: a receive task
+	/// hands each request to a sending task, so with a pass for each hop the
+	/// reply is staged in the turn that reaped its request, before that turn
+	/// submits. Each task records the worker turn it ran in, which the network's
+	/// completion order and timing cannot change.
+	#[test]
+	fn a_reply_is_staged_in_the_turn_that_reaps_its_request() {
+		const ROUNDS: usize = 16;
+
+		/// For each round trip, the turns from the request's receive to its reply.
+		fn hand_offs(passes: usize, busy: bool) -> Option<Vec<u64>> {
+			let mut worker = worker_with(Config {
+				passes: NonZeroUsize::new(passes).unwrap(),
+				..Config::default()
+			})?;
+			let handle = worker.handle();
+			let owner = Owner::new(&handle.shared);
+			let busy_polls = Rc::new(std::cell::Cell::new((0, 0)));
+			if busy {
+				let (owner, polls) = (owner.clone(), busy_polls.clone());
+				handle.spawn(kio::wait(move |waiter: &kio::Waiter| {
+					let (turn, count) = polls.get();
+					let count = if turn == owner.turn() { count + 1 } else { 1 };
+					assert!(count <= passes, "a self-wake ran past the turn's budget");
+					polls.set((owner.turn(), count));
+					waiter.waker().wake_by_ref();
+					Poll::<()>::Pending
+				}));
+			}
+			let udp_config = udp::Config {
+				gro: false,
+				gso: false,
+				..udp::Config::default()
+			};
+			let bind = || std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+			let client = handle.udp(bind(), udp_config.clone()).expect("client");
+			let server = Rc::new(handle.udp(bind(), udp_config).expect("server"));
+			let (client_addr, server_addr) = (client.local_addr().unwrap(), server.local_addr().unwrap());
+
+			// The turn each request was received in, handed from one task to the other.
+			let requests = kio::Producer::new(Vec::<u64>::new());
+			let gaps = Rc::new(RefCell::new(Vec::new()));
+			let (receiver, received, turns) = (server.clone(), requests.clone(), owner.clone());
+			handle.spawn(async move {
+				while receiver.recv().await.is_ok() {
+					let Ok(mut turn) = received.write() else { return };
+					turn.push(turns.turn());
+				}
+			});
+			let (sender, consumer, recorded) = (server.clone(), requests.consume(), gaps.clone());
+			handle.spawn(async move {
+				let mut replied = 0;
+				loop {
+					let Some(received) = kio::wait(|waiter: &kio::Waiter| {
+						match consumer.poll(waiter, |turns| match turns.len() > replied {
+							true => Poll::Ready(turns[replied]),
+							false => Poll::Pending,
+						}) {
+							Poll::Ready(Ok(turn)) => Poll::Ready(Some(turn)),
+							Poll::Ready(Err(_)) => Poll::Ready(None),
+							Poll::Pending => Poll::Pending,
+						}
+					})
+					.await
+					else {
+						return;
+					};
+					replied += 1;
+					let mut tx = sender.acquire().await.expect("send buffer");
+					tx.extend_from_slice(b"pong");
+					tx.send(udp::Transmit::new(client_addr, 4)).expect("reply");
+					recorded.borrow_mut().push(owner.turn() - received);
+				}
+			});
+
+			worker
+				.block_on(async {
+					for _ in 0..ROUNDS {
+						let mut tx = client.acquire().await.expect("send buffer");
+						tx.extend_from_slice(b"ping");
+						tx.send(udp::Transmit::new(server_addr, 4)).expect("request");
+						assert_eq!(client.recv().await.expect("reply").payload(), b"pong");
+					}
+				})
+				.expect("worker");
+			if busy {
+				assert_eq!(busy_polls.get().1, passes, "the busy task spent every pass");
+			}
+			drop(worker);
+			assert_eq!(Rc::strong_count(&busy_polls), 1, "a task survived its worker");
+			Some(gaps.take())
+		}
+
+		for busy in [false, true] {
+			for passes in [1, 2, 4, 8] {
+				let Some(gaps) = hand_offs(passes, busy) else { return };
+				assert_eq!(gaps, [u64::from(passes == 1); ROUNDS], "passes={passes}, busy={busy}");
+			}
+		}
 	}
 
 	#[test]
@@ -933,7 +1203,7 @@ mod tests {
 
 	#[test]
 	fn spawned_tasks_run() {
-		let Some(mut worker) = worker() else { return };
+		let Some((mut worker, clock)) = manual() else { return };
 		let handle = worker.handle();
 		let flag = Rc::new(std::cell::Cell::new(0));
 
@@ -943,13 +1213,22 @@ mod tests {
 				flag.set(flag.get() + index + 1);
 			});
 		}
-		// Spawned tasks run even while the main future pends on a timer.
+		// Spawned tasks run even while the main future pends on a timer, which only
+		// fires once the worker has parked on it and the clock is advanced.
+		let parks = handle.metrics();
+		let advancer = std::thread::spawn(move || {
+			while parks.snapshot().parks == 0 {
+				std::hint::spin_loop();
+			}
+			clock.advance(Duration::from_millis(10));
+		});
 		let handle2 = handle.clone();
 		worker
 			.block_on(async move {
 				Deadline::after(&handle2, Duration::from_millis(10)).wait().await;
 			})
 			.unwrap();
+		advancer.join().unwrap();
 		assert_eq!(flag.get(), 6);
 	}
 
@@ -961,11 +1240,11 @@ mod tests {
 		let handle = worker.handle();
 		let at = worker
 			.block_on(async move {
-				let at = moq_clock::now() + Duration::from_millis(50);
+				let at = kio::clock::now().saturating_add(Duration::from_millis(50));
 				let mut timer = handle.timer();
 				timer.set(Some(at));
 				timer.wait().await;
-				assert!(moq_clock::now() >= at, "fired before the turn reached it");
+				assert!(kio::clock::now() >= at, "fired before the turn reached it");
 				at
 			})
 			.unwrap();
@@ -992,12 +1271,12 @@ mod tests {
 		});
 		let woke = worker
 			.block_on(async move {
-				moq_clock::sleep(Duration::from_secs(5)).await;
-				moq_clock::now()
+				kio::clock::sleep(Duration::from_secs(5)).await;
+				kio::clock::now()
 			})
 			.unwrap();
 		advancer.join().unwrap();
-		assert_eq!(woke, start + Duration::from_secs(5));
+		assert_eq!(woke, start.saturating_add(Duration::from_secs(5)));
 	}
 
 	/// Ambient timers and reads on the worker resolve to its clock.
@@ -1008,14 +1287,14 @@ mod tests {
 		let handle = worker.handle();
 		let (now, timed_out) = worker
 			.block_on(async move {
-				let now = moq_clock::now();
+				let now = kio::clock::now();
 				// Due at once, so this needs no advance.
-				let timed_out = moq_clock::timeout(Duration::ZERO, std::future::pending::<()>()).await;
+				let timed_out = kio::clock::timeout(Duration::ZERO, std::future::pending::<()>()).await;
 				assert_eq!(handle.now(), now);
 				(now, timed_out.is_err())
 			})
 			.unwrap();
-		assert_eq!(now, moq_clock::Instant::ZERO + Duration::from_secs(1));
+		assert_eq!(now, kio::clock::Instant::ZERO.saturating_add(Duration::from_secs(1)));
 		assert!(timed_out);
 	}
 
@@ -1025,12 +1304,12 @@ mod tests {
 	fn the_worker_reads_its_manual_clocks_wall_time() {
 		let Some((mut worker, clock)) = manual() else { return };
 		clock.advance(Duration::from_secs(5));
-		let (wall, anchor) = worker
-			.block_on(async { (moq_clock::wall(), moq_clock::anchor()) })
+		let (wall, origin) = worker
+			.block_on(async { (kio::clock::wall(), kio::clock::origin()) })
 			.unwrap();
 		assert_eq!(wall, clock.wall(), "the worker read the host's wall time");
-		assert_eq!(anchor.0, clock.now());
-		assert_eq!(anchor.1, clock.wall());
+		assert_eq!(origin.0, clock.now());
+		assert_eq!(origin.1, clock.wall());
 	}
 
 	/// A timer made between turns counts from the clock, not from the last turn's
@@ -1071,20 +1350,20 @@ mod tests {
 		assert!(timer.poll(&kio::Waiter::noop()).is_ready());
 
 		// Re-arming to the future pends again; disarming stays pending.
-		timer.set(Some(now + Duration::from_secs(60)));
+		timer.set(Some(now.saturating_add(Duration::from_secs(60))));
 		assert!(timer.poll(&kio::Waiter::noop()).is_pending());
 		timer.set(None);
 		assert!(timer.poll(&kio::Waiter::noop()).is_pending());
 
 		// And a re-arm fires through the worker once its clock gets there.
-		timer.set(Some(now + Duration::from_millis(20)));
+		timer.set(Some(now.saturating_add(Duration::from_millis(20))));
 		clock.advance(Duration::from_millis(20));
 		worker
 			.block_on(async move {
 				kio::wait(|waiter| timer.poll(waiter)).await;
 			})
 			.unwrap();
-		assert_eq!(handle.now(), now + Duration::from_millis(20));
+		assert_eq!(handle.now(), now.saturating_add(Duration::from_millis(20)));
 	}
 
 	#[test]
@@ -1109,14 +1388,7 @@ mod tests {
 		assert!(handle.udp(bind(), udp::Config::default()).is_err());
 		assert!(matches!(sock.poll_recv(&kio::Waiter::noop()), Poll::Ready(Err(_))));
 		assert!(matches!(sock.poll_acquire(&kio::Waiter::noop()), Poll::Ready(Err(_))));
-		assert!(
-			tx.send(udp::Transmit {
-				to,
-				segment: 1200,
-				ecn: None,
-			})
-			.is_err()
-		);
+		assert!(tx.send(udp::Transmit::new(to, 1200)).is_err());
 		// And a late spawn is dropped rather than parked forever.
 		handle.spawn(async {});
 		drop(sock);
@@ -1133,8 +1405,8 @@ mod tests {
 			result: 0,
 			flags: 0,
 		};
-		let before = moq_clock::Instant::ZERO;
-		let deadline = before + Duration::from_millis(1);
+		let before = kio::clock::Instant::ZERO;
+		let deadline = before.saturating_add(Duration::from_millis(1));
 		let mut now = [before, deadline].into_iter();
 
 		worker.cqes = vec![cqe(first), cqe(second)];
@@ -1230,6 +1502,11 @@ mod tests {
 		let Some(worker) = worker() else { return };
 		let cq = worker.shared.ring.borrow().params().cq_entries();
 		assert!(cq >= CQ_ENTRIES, "kernel granted a {cq}-entry CQ, wanted {CQ_ENTRIES}");
+		assert_eq!(
+			worker.cqes.capacity(),
+			cq as usize,
+			"scratch must cover the accepted CQ geometry"
+		);
 	}
 
 	#[test]
@@ -1258,12 +1535,7 @@ mod tests {
 		assert_eq!(held.len(), usize::from(ceiling));
 		for mut tx in held.drain(..) {
 			tx.resize(1200, 0);
-			tx.send(udp::Transmit {
-				to,
-				segment: 1200,
-				ecn: None,
-			})
-			.expect("send");
+			tx.send(udp::Transmit::new(to, 1200)).expect("send");
 		}
 
 		// The point of the test is the overflow, so prove it happened: the
@@ -1274,7 +1546,7 @@ mod tests {
 
 		// Drive the worker until every completion, backlog included, has been
 		// reaped and released its buffer back to the pool.
-		let deadline = handle.now() + Duration::from_secs(10);
+		let deadline = handle.now().saturating_add(Duration::from_secs(10));
 		loop {
 			overflowed = overflowed || saw_overflow(&worker);
 			let h = handle.clone();
@@ -1377,12 +1649,7 @@ mod tests {
 			panic!("no tx buffer");
 		};
 		tx.resize(64 * 1024, 0);
-		tx.send(udp::Transmit {
-			to,
-			segment: 1000,
-			ecn: None,
-		})
-		.expect("send 66 datagrams");
+		tx.send(udp::Transmit::new(to, 1000)).expect("send 66 datagrams");
 		drop(worker);
 	}
 
@@ -1406,11 +1673,7 @@ mod tests {
 		};
 		tx.resize(64 * 1024, 0);
 		let err = tx
-			.send(udp::Transmit {
-				to,
-				segment: 1,
-				ecn: None,
-			})
+			.send(udp::Transmit::new(to, 1))
 			.expect_err("65536 datagrams from one buffer");
 		assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 		drop(worker);
@@ -1466,11 +1729,7 @@ mod tests {
 		};
 		tx.resize(4096, 0);
 		let err = tx
-			.send(udp::Transmit {
-				to,
-				segment: 1024,
-				ecn: None,
-			})
+			.send(udp::Transmit::new(to, 1024))
 			.expect_err("4096 bytes from a 2048 byte buffer");
 		assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 		drop(worker);
@@ -1494,11 +1753,7 @@ mod tests {
 		// `UDP_SEGMENT` is a u16: without validation this would truncate to a
 		// one-byte stride instead of one segment.
 		let err = tx
-			.send(udp::Transmit {
-				to,
-				segment: usize::from(u16::MAX) + 2,
-				ecn: None,
-			})
+			.send(udp::Transmit::new(to, usize::from(u16::MAX) + 2))
 			.expect_err("oversized segment");
 		assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 		drop(worker);
@@ -1531,18 +1786,13 @@ mod tests {
 		// Two trains of two: the first is rejected and resent, the second
 		// never tries GSO.
 		for _ in 0..2 {
-			let deadline = handle.now() + Duration::from_secs(5);
+			let deadline = handle.now().saturating_add(Duration::from_secs(5));
 			let mut received = 0;
 			let Poll::Ready(Ok(mut tx)) = sock.poll_acquire(&kio::Waiter::noop()) else {
 				panic!("the socket failed after a rejected train");
 			};
 			tx.resize(2 * 1200, 7);
-			tx.send(udp::Transmit {
-				to,
-				segment: 1200,
-				ecn: None,
-			})
-			.expect("send");
+			tx.send(udp::Transmit::new(to, 1200)).expect("send");
 			while received < 2 * 1200 && handle.now() < deadline {
 				let handle = handle.clone();
 				worker
@@ -1586,16 +1836,11 @@ mod tests {
 			panic!("no tx buffer");
 		};
 		tx.resize(4 * 1200, 7);
-		tx.send(udp::Transmit {
-			to,
-			segment: 1200,
-			ecn: None,
-		})
-		.expect("send");
+		tx.send(udp::Transmit::new(to, 1200)).expect("send");
 
 		// Drive the worker until the loopback delivers, parking on a timer each
 		// turn so the park and timer counters see traffic too.
-		let deadline = handle.now() + Duration::from_secs(5);
+		let deadline = handle.now().saturating_add(Duration::from_secs(5));
 		let mut received = 0;
 		while received == 0 && handle.now() < deadline {
 			let handle = handle.clone();
@@ -1669,16 +1914,11 @@ mod tests {
 		assert!(sock.poll_acquire(&kio::Waiter::noop()).is_pending());
 		assert!(sock.poll_acquire(&kio::Waiter::noop()).is_pending());
 		assert_eq!(metrics.snapshot().tx_stalls, 1);
-		tx.send(udp::Transmit {
-			to,
-			segment: 1200,
-			ecn: None,
-		})
-		.expect("send");
+		tx.send(udp::Transmit::new(to, 1200)).expect("send");
 
 		// Hold the received packet: its buffer is the pool, so the re-arm has
 		// nowhere to receive into.
-		let deadline = handle.now() + Duration::from_secs(5);
+		let deadline = handle.now().saturating_add(Duration::from_secs(5));
 		let mut held = None;
 		while held.is_none() && handle.now() < deadline {
 			let handle = handle.clone();
@@ -1723,11 +1963,11 @@ mod tests {
 		let mut timer = handle.timer();
 		let now = handle.now();
 
-		timer.set(Some(now + Duration::from_secs(60)));
+		timer.set(Some(now.saturating_add(Duration::from_secs(60))));
 		assert_eq!(metrics.snapshot().timers_active(), 1);
 
 		// A re-arm is a cancel plus an arm, which is exactly the churn signal.
-		timer.set(Some(now + Duration::from_secs(61)));
+		timer.set(Some(now.saturating_add(Duration::from_secs(61))));
 		let snap = metrics.snapshot();
 		assert_eq!((snap.timers_armed, snap.timers_cancelled, snap.timers_fired), (2, 1, 0));
 		assert_eq!(snap.timers_active(), 1);
@@ -1740,7 +1980,7 @@ mod tests {
 		assert_eq!(snap.timers_active(), 0);
 
 		// A dropped armed timer is a cancel, and the queue empties again.
-		timer.set(Some(now + Duration::from_secs(60)));
+		timer.set(Some(now.saturating_add(Duration::from_secs(60))));
 		assert_eq!(metrics.snapshot().timers_active(), 1);
 		drop(timer);
 		assert_eq!(metrics.snapshot().timers_active(), 0);
@@ -1752,7 +1992,7 @@ mod tests {
 	fn metrics_count_an_unpolled_expiry_as_fired() {
 		let metrics = Metrics::default();
 		let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
-		let clock = moq_clock::Manual::new().install(runtime.handle());
+		let clock = kio::clock::Manual::new().install(runtime.handle());
 		let _entered = runtime.enter();
 		let Some(mut worker) = worker_with(Config {
 			metrics: metrics.clone(),
@@ -1767,7 +2007,7 @@ mod tests {
 		worker.block_on(async {}).unwrap();
 
 		drop(dropped);
-		rearmed.set(Some(handle.now() + Duration::from_secs(1)));
+		rearmed.set(Some(handle.now().saturating_add(Duration::from_secs(1))));
 		let snap = metrics.snapshot();
 		assert_eq!((snap.timers_armed, snap.timers_cancelled, snap.timers_fired), (3, 0, 2));
 		assert_eq!(snap.timers_active(), 1);

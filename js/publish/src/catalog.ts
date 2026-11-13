@@ -1,4 +1,4 @@
-import { Instant, Milli, Nano, now, origin } from "@moq/clock";
+import { Duration, type Instant, now, origin } from "@moq/clock";
 import * as Catalog from "@moq/hang/catalog";
 import * as Json from "@moq/json";
 import type * as Moq from "@moq/net";
@@ -6,7 +6,7 @@ import { Time } from "@moq/net";
 import { Effect } from "@moq/signals";
 
 // Estimate-only edits publish at most this often.
-const ESTIMATE_INTERVAL = Nano.fromMilli(Milli(1000));
+const ESTIMATE_INTERVAL = Duration.millis(1000);
 
 /**
  * A stable catalog producer that fans out to one or more network tracks.
@@ -17,7 +17,7 @@ const ESTIMATE_INTERVAL = Nano.fromMilli(Milli(1000));
  * application's own sections, e.g. `scte35`) each edit only their own keys, so their sections
  * compose instead of clobbering one another.
  *
- * The root `clock` is advertised from the first snapshot: every js/publish timestamp is the
+ * The `media.clock` is advertised from the first snapshot: every js/publish timestamp is the
  * installed clock's instant in microseconds, so PTS zero is the wall time of instant zero. The
  * mapping is fixed when the producer is created, so a later system-clock adjustment never retimes
  * the broadcast. A page whose wall clock reads before 2020 has not set it yet (a device booted
@@ -31,14 +31,10 @@ export class CatalogProducer {
 
 	/** Edit the catalog; estimate-only changes publish at most once a second with a trailing update. */
 	mutate(fn: (catalog: Catalog.Root) => void): void {
-		const value = structuredClone(this.#value);
-		fn(value);
+		const draft = structuredClone(this.#value);
+		fn(draft);
 		// Every consumer refuses a catalog that fails this, so refuse the edit before it reaches one.
-		Catalog.checkRenditions(value);
-		// Computed, never carried, so an edit can't claim less than the catalog uses.
-		const version = Catalog.minVersion(value);
-		if (version === undefined) delete value.version;
-		else value.version = version;
+		const value = Catalog.encode(draft);
 		// Estimates only rise for a track; a renamed rendition starts its new track over.
 		for (const field of ["jitter", "delay"] as const) {
 			const previous = new Map(advertised(this.#value, field));
@@ -56,12 +52,12 @@ export class CatalogProducer {
 		if (!changed || this.#outputs.size === 0) return;
 
 		const at = now();
-		const next = this.#lastEstimate === undefined ? undefined : Instant.add(this.#lastEstimate, ESTIMATE_INTERVAL);
-		if (!estimateOnly || next === undefined || at >= next) {
+		const next = this.#lastEstimate === undefined ? undefined : this.#lastEstimate.saturatingAdd(ESTIMATE_INTERVAL);
+		if (!estimateOnly || next === undefined || at.ge(next)) {
 			this.#publish(estimateOnly || this.#pending !== undefined);
 		} else if (!this.#pending) {
 			this.#pending = new Effect();
-			this.#pending.timer(() => this.#publish(true), Instant.durationSince(next, at));
+			this.#pending.timer(() => this.#publish(true), next.since(at));
 		}
 	}
 
@@ -76,15 +72,10 @@ export class CatalogProducer {
 	/**
 	 * Serve a track: seed it with the current catalog, then forward updates.
 	 *
-	 * Pass `opts.compression` to DEFLATE-compress this subscriber's frames, so the same catalog can be
-	 * served both plaintext and compressed (e.g. `catalog.json` and `catalog.json.z`).
+	 * Create the track with `compression: "deflate"`: catalog JSON is small and repetitive.
 	 */
-	serve(track: Moq.Track.Producer, effect: Effect, opts?: { compression?: boolean }): void {
-		const output = new Json.Snapshot.Producer<Catalog.Root>({
-			track,
-			compression: opts?.compression ? "deflate" : "none",
-			deltaRatio: 0,
-		});
+	serve(track: Moq.Track.Producer, effect: Effect): void {
+		const output = new Json.Snapshot.Producer<Catalog.Root>({ track, deltas: false });
 		output.update({ value: this.#value, at: Time.Timestamp.now() });
 
 		this.#outputs.add(output);
@@ -143,7 +134,7 @@ function advertised(catalog: Catalog.Root, field: "jitter" | "delay"): [string, 
 // An empty root advertising the wall time of instant zero, the zero every js/publish timestamp
 // counts from, when the wall clock is set.
 function pageRoot(): Catalog.Root {
-	const at = Math.round((origin() - Catalog.MOQ_EPOCH_UNIX_MILLIS) * 1000);
+	const at = Math.round((origin().asUnixMillis() - Catalog.MOQ_EPOCH_UNIX_MILLIS) * 1000);
 	if (at < 0) return {};
-	return { clock: { wall: Catalog.u53(at), timescale: 1_000_000 } };
+	return { media: { clock: { wall: Catalog.u53(at), timescale: 1_000_000 } } };
 }

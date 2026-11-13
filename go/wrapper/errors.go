@@ -41,7 +41,7 @@ var (
 	ErrVideo = ffi.ErrMoqErrorVideo
 	// ErrURL matches a malformed URL passed when connecting or publishing.
 	ErrURL = ffi.ErrMoqErrorUrl
-	// ErrTimeOverflow matches a timestamp outside the supported range.
+	// ErrTimeOverflow matches a timestamp value or scale outside the supported range, or a zero scale.
 	ErrTimeOverflow = ffi.ErrMoqErrorTimeOverflow
 	// ErrLogLevel matches an unparseable log level string passed to LogLevel.
 	ErrLogLevel = ffi.ErrMoqErrorLogLevel
@@ -53,7 +53,7 @@ var (
 	ErrCancelled = ffi.ErrMoqErrorCancelled
 	// ErrClosed is returned when the session or stream has closed; IsShutdown treats it as a graceful stop.
 	ErrClosed = ffi.ErrMoqErrorClosed
-	// ErrBusy is returned when CertFingerprints races an in-flight server operation.
+	// ErrBusy is returned when a call races an in-flight read on the same handle.
 	ErrBusy = ffi.ErrMoqErrorBusy
 	// ErrConnect is returned when establishing a client session fails.
 	ErrConnect = ffi.ErrMoqErrorConnect
@@ -61,7 +61,7 @@ var (
 	ErrBind = ffi.ErrMoqErrorBind
 	// ErrReject is returned when a session is refused during the handshake.
 	ErrReject = ffi.ErrMoqErrorReject
-	// ErrAlreadyResponded is returned when a Request is accepted or rejected more than once.
+	// ErrAlreadyResponded is returned when a request is used after it was accepted or rejected.
 	ErrAlreadyResponded = ffi.ErrMoqErrorAlreadyResponded
 	// ErrCodec is returned when codec configuration or bitstream parsing fails.
 	ErrCodec = ffi.ErrMoqErrorCodec
@@ -75,12 +75,12 @@ var (
 	ErrNotFound = ffi.ErrMoqErrorNotFound
 	// ErrUnsupported is returned when the requested operation is not supported by this build or peer, however it is asked for.
 	ErrUnsupported = ffi.ErrMoqErrorUnsupported
+	// ErrUnsupportedConfig is returned when media setup refuses a rendition or decoder output.
+	ErrUnsupportedConfig = ffi.ErrMoqErrorUnsupportedConfig
 	// ErrAlreadyCommitted is returned when a track already reading one way (arrival order, sequence order, or a typed reader) is asked to read another; subscribe again for a second cursor.
 	ErrAlreadyCommitted = ffi.ErrMoqErrorAlreadyCommitted
-	// ErrInvalidRoute is returned when a route has an invalid hop ID or too many hops.
-	ErrInvalidRoute = ffi.ErrMoqErrorInvalidRoute
-	// ErrInvalidEpoch is returned when an epoch is not a lowercase hyphenated UUIDv7.
-	ErrInvalidEpoch = ffi.ErrMoqErrorInvalidEpoch
+	// ErrInvalidInstance is returned when an instance is empty.
+	ErrInvalidInstance = ffi.ErrMoqErrorInvalidInstance
 	// ErrInvalidPattern is returned when a path pattern is empty, has a doubled slash, or uses a reserved segment form.
 	ErrInvalidPattern = ffi.ErrMoqErrorInvalidPattern
 	// ErrUnresolvableBroadcast is returned when a referenced sibling broadcast cannot be resolved without an origin.
@@ -91,6 +91,8 @@ var (
 	ErrLog = ffi.ErrMoqErrorLog
 	// ErrConfig is returned when Dial or Listen is given a value the native side cannot use.
 	ErrConfig = ffi.ErrMoqErrorConfig
+	// ErrOutOfRange is returned when a number is outside the range the call accepts, such as viewer ceilings summing above 2^53 - 1.
+	ErrOutOfRange = ffi.ErrMoqErrorOutOfRange
 )
 
 // IsShutdown reports whether err is the expected result of a graceful shutdown

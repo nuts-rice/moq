@@ -5,10 +5,11 @@
 //! the catalog [`Producer`](crate::catalog::Producer) for what a publisher writes, the export
 //! [`Source`](crate::Source) for what a viewer reads.
 
+use kio::clock::Wall;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::Duration;
 
 /// What one published track has written.
 #[derive(Default)]
@@ -16,6 +17,9 @@ pub(crate) struct Sent {
 	frames: AtomicU64,
 	bytes: AtomicU64,
 	keyframes: AtomicU64,
+	skipped: AtomicU64,
+	/// The encoder's latest target, in bits per second, or zero before one is reported.
+	bitrate: AtomicU64,
 }
 
 impl Sent {
@@ -26,11 +30,23 @@ impl Sent {
 		self.keyframes.fetch_add(keyframes, Relaxed);
 	}
 
+	/// Count `frames` frames the source produced but never sent.
+	pub(crate) fn skip(&self, frames: u64) {
+		self.skipped.fetch_add(frames, Relaxed);
+	}
+
+	/// Record the encoder's latest target bitrate.
+	pub(crate) fn target(&self, bitrate: moq_net::bandwidth::Rate) {
+		self.bitrate.store(bitrate.as_bps(), Relaxed);
+	}
+
 	fn report(&self) -> hang::stats::Rendition {
 		let mut report = hang::stats::Rendition::default();
 		report.frames = self.frames.load(Relaxed);
 		report.bytes = self.bytes.load(Relaxed);
 		report.keyframes = self.keyframes.load(Relaxed);
+		report.skipped = self.skipped.load(Relaxed);
+		report.bitrate = Some(self.bitrate.load(Relaxed)).filter(|&bitrate| bitrate != 0);
 		report
 	}
 }
@@ -56,7 +72,7 @@ impl Received {
 			return;
 		};
 		let wall = wall
-			.duration_since(UNIX_EPOCH)
+			.checked_duration_since(Wall::UNIX_EPOCH)
 			.map_or(0, |since| u64::try_from(since.as_millis()).unwrap_or(0));
 		let micros = u64::try_from(timestamp.as_micros()).unwrap_or(u64::MAX);
 		self.timestamp.store(micros, Relaxed);
@@ -73,7 +89,7 @@ impl Received {
 		if wall != 0
 			&& let Ok(timestamp) = moq_net::Timestamp::from_micros(self.timestamp.load(Relaxed))
 		{
-			let wall = UNIX_EPOCH + Duration::from_millis(wall);
+			let wall = Wall::UNIX_EPOCH + Duration::from_millis(wall);
 			report.arrival = Some(hang::echo::Arrival::new(timestamp, wall));
 		}
 		report
@@ -176,6 +192,22 @@ mod tests {
 		}
 	}
 
+	/// An encoder's skips accumulate, and its target is the latest one set: none until then.
+	#[test]
+	fn an_encoder_reports_skips_and_its_latest_target() {
+		let registry = Registry::<Sent>::default();
+		let track = registry.track("video");
+		assert_eq!(registry.sent()["video"].bitrate, None);
+
+		track.skip(2);
+		track.skip(1);
+		track.target(moq_net::bandwidth::Rate::from_bps(2_000_000));
+		track.target(moq_net::bandwidth::Rate::from_bps(1_500_000));
+		let report = &registry.sent()["video"];
+		assert_eq!(report.skipped, 3);
+		assert_eq!(report.bitrate, Some(1_500_000));
+	}
+
 	#[test]
 	fn a_returning_track_continues_its_counts() {
 		let registry = Registry::<Sent>::default();
@@ -244,7 +276,7 @@ mod tests {
 		let track = registry.track("hd");
 		assert_eq!(registry.received()["hd"].arrival, None);
 
-		let wall = UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+		let wall = Wall::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
 		crate::clock::fake_host_wall(wall);
 		track.frame(moq_net::Timestamp::from_millis(40).unwrap(), 100);
 		track.frame(moq_net::Timestamp::from_millis(80).unwrap(), 50);
@@ -260,7 +292,7 @@ mod tests {
 	fn an_unset_host_clock_records_no_arrival() {
 		let registry = Registry::<Received>::default();
 		let track = registry.track("hd");
-		crate::clock::fake_host_wall(UNIX_EPOCH + Duration::from_secs(86_400));
+		crate::clock::fake_host_wall(Wall::UNIX_EPOCH + Duration::from_secs(86_400));
 		track.frame(moq_net::Timestamp::from_millis(40).unwrap(), 100);
 		let report = &registry.received()["hd"];
 		assert_eq!((report.frames, report.bytes), (1, 100));

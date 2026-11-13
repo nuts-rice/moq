@@ -1,11 +1,12 @@
+use kio::clock::Wall;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
+use bytes::Bytes;
+use moq_net::{broadcast, group, track};
 use moq_tokio::Status;
-use moq_tokio::moq_net::{self, bytes::Bytes};
-use moq_tokio::moq_net::{broadcast, group, track};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
@@ -107,7 +108,7 @@ pub async fn run(ctx: Connection) {
 		config.name()
 	};
 
-	let mut broadcasts = Vec::new();
+	let mut routes = Vec::new();
 	let mut publishing = Vec::new();
 	let mut own = HashSet::new();
 	let mut tasks = JoinSet::new();
@@ -125,16 +126,18 @@ pub async fn run(ctx: Connection) {
 	};
 
 	for (relative, path) in paths {
-		let broadcast = match publish.create_broadcast(&path) {
-			Ok(broadcast) => broadcast,
+		let route = match publish.route(&path, moq_net::origin::RouteOptions::hidden()) {
+			Ok(route) => route,
 			Err(err) => {
 				tracing::error!(connection, %err, "failed to create broadcast");
 				continue;
 			}
 		};
-		let track = match broadcast.create_track(
+		let track = match route.broadcast().create_track(
 			TRACK,
-			moq_net::track::Info::default().with_timescale(moq_net::Timescale::MILLI),
+			moq_net::track::Info::default()
+				.with_timescale(moq_net::Timescale::MILLI)
+				.with_max_age(None),
 		) {
 			Ok(track) => track,
 			Err(err) => {
@@ -142,14 +145,14 @@ pub async fn run(ctx: Connection) {
 				continue;
 			}
 		};
-		if let Err(err) = broadcast.announce(Default::default()) {
+		if let Err(err) = route.announce() {
 			tracing::error!(connection, %err, "failed to announce broadcast");
 			continue;
 		}
 		own.insert(relative);
-		// Hold the broadcast producer for the connection's lifetime so it stays
-		// published and advertised.
-		broadcasts.push(broadcast);
+		// Hold the route for the connection's lifetime so it stays published and
+		// advertised.
+		routes.push(route);
 
 		let published = Published::new(stats.clone());
 		publishing.push(Arc::downgrade(&published));
@@ -243,8 +246,8 @@ async fn produce(
 
 	let zeros = Bytes::from(vec![0u8; rolled.frame_size as usize]);
 	let period = Duration::from_secs_f64(1.0 / rolled.fps as f64);
-	let mut ticker = moq_clock::interval(period);
-	ticker.set_missed_tick_behavior(moq_clock::MissedTickBehavior::Delay);
+	let mut ticker = kio::clock::interval(period);
+	ticker.set_missed_tick_behavior(kio::clock::MissedTickBehavior::Delay);
 
 	let mut sequence = 0u64;
 	loop {
@@ -261,9 +264,8 @@ async fn produce(
 			group_size: rolled.group_size,
 			broadcasts: rolled.broadcasts,
 			subscribe: rolled.subscribe,
-			timestamp_ms: SystemTime::from(moq_clock::wall())
-				.duration_since(UNIX_EPOCH)
-				.unwrap_or_default()
+			timestamp_ms: kio::clock::wall()
+				.saturating_duration_since(Wall::UNIX_EPOCH)
 				.as_millis(),
 			pad: String::new(),
 		};
@@ -315,11 +317,11 @@ async fn subscribe_named(
 	max_delay: Duration,
 	stats: Arc<Stats>,
 ) -> anyhow::Result<()> {
-	consume
-		.routed(path.as_str())
-		.await
-		.ok_or_else(|| anyhow::anyhow!("target broadcast was never announced: {path}"))?;
-	let broadcast = consume.request_broadcast(path.as_str(), None).await?;
+	let broadcast = consume
+		.follow(path.as_str(), None)?
+		.available()
+		.await?
+		.ok_or_else(|| anyhow::anyhow!("the first change is an instance"))?;
 	drain(broadcast, max_delay, &stats).await
 }
 
@@ -350,7 +352,7 @@ async fn subscribe(
 	let mut eligible = 0;
 
 	// Gather candidates until the startup window closes (or the announce stream ends).
-	let deadline = moq_clock::sleep(startup);
+	let deadline = kio::clock::sleep(startup);
 	tokio::pin!(deadline);
 	loop {
 		tokio::select! {
@@ -361,11 +363,9 @@ async fn subscribe(
 			update = announced.next() => {
 				let update = match update {
 					Some(
-						moq_net::announce::Event::Start(update)
-						| moq_net::announce::Event::Update(update)
-						| moq_net::announce::Event::Restart(update),
+						moq_net::announce::Event::Present(update),
 					) => update,
-					Some(moq_net::announce::Event::End(_)) => continue,
+					Some(_) => continue,
 					None => break,
 				};
 				let path = update.prefix.to_string();
@@ -380,7 +380,7 @@ async fn subscribe(
 
 	let mut selected = pool.len() as u64;
 	for path in pool {
-		let Ok(broadcast) = consume.request_broadcast(path.as_str(), None).await else {
+		let Ok(broadcast) = consume.request(path.as_str(), None).await else {
 			continue;
 		};
 		spawn_drain(&mut tasks, path, broadcast, max_delay, stats.clone());
@@ -390,19 +390,15 @@ async fn subscribe(
 	// there is nothing to spread over.
 	while selected < want {
 		let update = match announced.next().await {
-			Some(
-				moq_net::announce::Event::Start(update)
-				| moq_net::announce::Event::Update(update)
-				| moq_net::announce::Event::Restart(update),
-			) => update,
-			Some(moq_net::announce::Event::End(_)) => continue,
+			Some(moq_net::announce::Event::Present(update)) => update,
+			Some(_) => continue,
 			None => break,
 		};
 		let path = update.prefix.to_string();
 		if own.contains(&path) || !seen.insert(path.clone()) {
 			continue;
 		}
-		let Ok(broadcast) = consume.request_broadcast(path.as_str(), None).await else {
+		let Ok(broadcast) = consume.request(path.as_str(), None).await else {
 			continue;
 		};
 		selected += 1;
@@ -457,7 +453,7 @@ fn spawn_drain(
 async fn drain(broadcast: broadcast::Consumer, max_delay: Duration, stats: &Stats) -> anyhow::Result<()> {
 	let _gauge = Gauge::inc(&stats.subscriptions);
 
-	let subscription = track::Subscription::default().with_max_delay(max_delay);
+	let subscription = track::Subscription::default().with_delay(track::Delay::default().with_max(max_delay));
 	let mut track = broadcast.track(TRACK)?.subscribe(subscription).await?;
 	let mut gaps = GapTracker::new(stats);
 	let mut learned_shape = false;
@@ -521,8 +517,13 @@ async fn read_group(group: &mut group::Consumer, learned_shape: &mut bool, stats
 /// settled once a higher group has confirmed it. A truly skipped group is counted
 /// once the frontier moves past it.
 ///
-/// A group that explicitly fails is known lost immediately, even when it is the
-/// first or live-frontier group. Each observation feeds the shared [`Stats`]
+/// The span's floor is pinned at the first group the subscription receives. A
+/// completed group older than that, such as cached history a relay fills in after
+/// the subscribe, is counted in `groups_history` and never widens the span, so a
+/// join that over-fetches history does not read as loss.
+///
+/// A group that explicitly fails is known lost immediately wherever it falls,
+/// even below the floor or at the live frontier. Each observation feeds the shared [`Stats`]
 /// incrementally so the reporter sees losses live and many subscriptions sum
 /// correctly: `groups_expected - groups_present` is the gaps still outstanding.
 ///
@@ -531,7 +532,8 @@ async fn read_group(group: &mut group::Consumer, learned_shape: &mut bool, stats
 /// failed group once, and a late arrival cannot cancel a later loss.
 struct GapTracker<'a> {
 	stats: &'a Stats,
-	min: u64,
+	/// First sequence received: the span's floor. `None` until a group arrives.
+	floor: Option<u64>,
 	max: u64,
 	/// Second-highest sequence seen: the settled frontier we count up to. `None`
 	/// until a second group arrives.
@@ -540,25 +542,26 @@ struct GapTracker<'a> {
 	complete: u64,
 	/// Whether the live frontier completed rather than failed.
 	frontier_complete: bool,
+	/// Failed groups below the floor: outside the span, but still lost.
+	failed_history: u64,
 	/// This subscription's current contributions, remembered so each update pushes
 	/// only the delta into the shared counters.
 	expected: u64,
 	present: u64,
-	started: bool,
 }
 
 impl<'a> GapTracker<'a> {
 	fn new(stats: &'a Stats) -> Self {
 		Self {
 			stats,
-			min: 0,
+			floor: None,
 			max: 0,
 			cap: None,
 			complete: 0,
 			frontier_complete: false,
+			failed_history: 0,
 			expected: 0,
 			present: 0,
-			started: false,
 		}
 	}
 
@@ -572,27 +575,39 @@ impl<'a> GapTracker<'a> {
 	}
 
 	fn record(&mut self, sequence: u64, complete: bool) {
-		self.complete += u64::from(complete);
-		if !self.started {
-			self.started = true;
-			self.min = sequence;
-			self.max = sequence;
-			self.frontier_complete = complete;
-		} else {
-			self.min = self.min.min(sequence);
-			if sequence > self.max {
-				// New frontier: the old `max` is now settled and becomes the cap.
-				self.cap = Some(self.max);
+		let floor = match self.floor {
+			None => {
+				self.floor = Some(sequence);
 				self.max = sequence;
 				self.frontier_complete = complete;
-			} else if self.cap.is_none_or(|cap| sequence > cap) {
-				self.cap = Some(sequence);
+				sequence
 			}
-		}
+			Some(floor) => {
+				if sequence < floor {
+					// History from before the subscription's start: outside the span.
+					if complete {
+						self.stats.groups_history.fetch_add(1, Ordering::Relaxed);
+						return;
+					}
+					self.failed_history += 1;
+				} else if sequence > self.max {
+					// New frontier: the old `max` is now settled and becomes the cap.
+					self.cap = Some(self.max);
+					self.max = sequence;
+					self.frontier_complete = complete;
+				} else if self.cap.is_none_or(|cap| sequence > cap) {
+					self.cap = Some(sequence);
+				}
+				floor
+			}
+		};
+		self.complete += u64::from(complete);
 
 		// The frontier stays out of inferred spans, but a failed frontier is already
-		// known lost. Completed groups below the frontier are present.
-		let expected = self.cap.map_or(0, |cap| cap - self.min + 1) + u64::from(!self.frontier_complete);
+		// known lost, as is a failed history group. Completed groups below the
+		// frontier are present.
+		let expected =
+			self.cap.map_or(0, |cap| cap - floor + 1) + u64::from(!self.frontier_complete) + self.failed_history;
 		let present = self.complete - u64::from(self.frontier_complete);
 		let grown = (expected - present).saturating_sub(self.expected - self.present);
 		// Grow the denominator first and release the counters bounded by it, so a
@@ -657,7 +672,6 @@ impl Drop for Gauge<'_> {
 }
 
 #[cfg(test)]
-#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
 mod tests {
 	use super::*;
 
@@ -711,7 +725,7 @@ mod tests {
 		complete.finish().unwrap();
 		wait_for(&stats.subscriptions_established, 1).await;
 		assert!(stats.ready());
-		track.finish().unwrap();
+		let _track = track.finish().unwrap();
 		task.await.unwrap().unwrap();
 		assert_eq!(stats.subscriptions_established.load(Ordering::Relaxed), 0);
 		assert!(stats.ready());
@@ -745,7 +759,13 @@ mod tests {
 	/// Sweep connection count and the broadcast fan-out touched by connection establishment.
 	#[test]
 	#[ignore = "benchmark, run nightly"]
+	#[expect(
+		clippy::disallowed_methods,
+		clippy::disallowed_types,
+		reason = "the benchmark measures real establishment time"
+	)]
 	fn benchmark_readiness_establishment() {
+		println!("connections,broadcasts_per_connection,elapsed_ns");
 		for connections in [1, 16, 128] {
 			for broadcasts in [1, 16, 128] {
 				let count = connections * broadcasts;
@@ -773,18 +793,18 @@ mod tests {
 					}
 				}
 				assert!(std::hint::black_box(stats.ready()));
-				println!(
-					"readiness connections={connections} broadcasts_per_connection={broadcasts} elapsed_ns={}",
-					start.elapsed().as_nanos()
-				);
+				println!("{connections},{broadcasts},{}", start.elapsed().as_nanos());
 				assert_eq!(stats.broadcasts_established.load(Ordering::Relaxed), count);
 			}
 		}
 	}
 
-	/// A millisecond track: the frames written here carry timestamps.
+	/// A millisecond track with no publisher max age, for tests that write timestamps and
+	/// rely on the subscription's own delay rather than the authored zero default.
 	fn timed() -> moq_net::track::Info {
-		moq_net::track::Info::default().with_timescale(moq_net::Timescale::MILLI)
+		moq_net::track::Info::default()
+			.with_timescale(moq_net::Timescale::MILLI)
+			.with_max_age(None)
 	}
 
 	async fn wait_for(counter: &AtomicU64, value: u64) {
@@ -804,7 +824,7 @@ mod tests {
 	}
 
 	fn replay() -> track::Subscription {
-		track::Subscription::default().with_max_delay(Duration::from_secs(30))
+		track::Subscription::default().with_delay(track::Delay::default().with_max(Duration::from_secs(30)))
 	}
 
 	/// A produced group must start with the JSON keyframe describing the rolled
@@ -971,28 +991,32 @@ mod tests {
 		let origin = moq_tokio::origin::spawn();
 
 		// The relay-internal broadcast: announced, but with no bench data track.
-		let _internal = origin.create_broadcast(".stats/node/host").unwrap();
-		_internal.announce(Default::default()).unwrap();
+		let _internal = origin
+			.route(".stats/node/host", moq_net::origin::RouteOptions::default())
+			.unwrap();
 
 		// Our own broadcast: in the namespace, but excluded via the `own` set
 		// (paths relative to the namespace, matching the scoped announce consumer).
-		let _previous = origin.create_broadcast("bench/previous/0/0").unwrap();
-		_previous.announce(Default::default()).unwrap();
+		let _previous = origin
+			.route("bench/previous/0/0", moq_net::origin::RouteOptions::default())
+			.unwrap();
 
-		let _own = origin.create_broadcast("bench/current/9/9").unwrap();
-		_own.announce(Default::default()).unwrap();
+		let _own = origin
+			.route("bench/current/9/9", moq_net::origin::RouteOptions::default())
+			.unwrap();
 		let own = HashSet::from(["9/9".to_string()]);
 
 		// One legitimate peer under the bench namespace with a single finished group.
-		let peer = origin.create_broadcast("bench/current/0/0").unwrap();
-		peer.announce(Default::default()).unwrap();
-		let track = peer.create_track(TRACK, timed()).unwrap();
+		let peer = origin
+			.route("bench/current/0/0", moq_net::origin::RouteOptions::default())
+			.unwrap();
+		let track = peer.broadcast().create_track(TRACK, timed()).unwrap();
 		let mut group = track.append_group().unwrap();
 		group
 			.write_frame(moq_net::Timestamp::now(), Bytes::from_static(b"{}"))
 			.unwrap();
 		group.finish().unwrap();
-		track.finish().unwrap();
+		let _track = track.finish().unwrap();
 
 		let announced = discover(&origin, "bench/current");
 		subscribe(announced, own, 1, Duration::ZERO, Duration::ZERO, stats.clone())
@@ -1016,9 +1040,10 @@ mod tests {
 			stats.clone(),
 		));
 
-		let broadcast = origin.create_broadcast("bench/run/chat").unwrap();
-		broadcast.announce(Default::default()).unwrap();
-		let track = broadcast.create_track(TRACK, timed()).unwrap();
+		let broadcast = origin
+			.route("bench/run/chat", moq_net::origin::RouteOptions::default())
+			.unwrap();
+		let track = broadcast.broadcast().create_track(TRACK, timed()).unwrap();
 		tokio::task::yield_now().await;
 		let mut group = track.append_group().unwrap();
 		let header = serde_json::json!({
@@ -1031,11 +1056,11 @@ mod tests {
 			.write_frame(moq_net::Timestamp::now(), serde_json::to_vec(&header).unwrap())
 			.unwrap();
 		group.finish().unwrap();
-		track.finish().unwrap();
+		let _track = track.finish().unwrap();
 
 		task.await.unwrap().unwrap();
 		assert_eq!(stats.groups_recv.load(Ordering::Relaxed), 1);
-		broadcast.close();
+		broadcast.broadcast().close();
 	}
 
 	/// The relay fails a group it gave up on (`Error::Lagged` once a subscriber
@@ -1085,7 +1110,7 @@ mod tests {
 		wait_for(&stats.groups_recv, 2).await;
 		write_group(&mut track);
 		wait_for(&stats.groups_recv, 3).await;
-		track.finish().unwrap();
+		let _track = track.finish().unwrap();
 		broadcast.close();
 
 		task.await
@@ -1133,7 +1158,7 @@ mod tests {
 
 		// A last group moves the live frontier past group 2, so 1 and 2 are accounted.
 		write_group(&mut track, &[2_000]);
-		track.finish().unwrap();
+		let _track = track.finish().unwrap();
 		broadcast.close();
 
 		task.await.unwrap().unwrap();
@@ -1222,11 +1247,50 @@ mod tests {
 	fn gap_tracker_handles_out_of_order() {
 		let stats = Stats::default();
 		let mut gaps = GapTracker::new(&stats);
-		for seq in [2, 0, 1, 3] {
+		for seq in [0, 3, 1, 2, 4] {
 			gaps.complete(seq);
 		}
-		assert_eq!(stats.groups_recv.load(Ordering::Relaxed), 4);
-		assert_eq!(lost(&stats), 0);
+		assert_eq!(stats.groups_recv.load(Ordering::Relaxed), 5);
+		assert_eq!((lost(&stats), outstanding(&stats)), (0, 0));
+	}
+
+	/// Groups older than the first one received are history a relay filled in after
+	/// the subscribe: counted apart, never as loss. Gaps at or after the start still count.
+	#[test]
+	fn gap_tracker_counts_history_apart() {
+		let stats = Stats::default();
+		let mut gaps = GapTracker::new(&stats);
+		let history = |stats: &Stats| stats.groups_history.load(Ordering::Relaxed);
+
+		// Joins live at 10; 11 and 12 settle the span from 10.
+		for seq in [10, 11, 12] {
+			gaps.complete(seq);
+		}
+		assert_eq!(stats.groups_expected.load(Ordering::Relaxed), 2);
+
+		// Cached history arrives behind the live frontier, leaving 0..=4 and 6 unsent.
+		for seq in [5, 7, 8, 9] {
+			gaps.complete(seq);
+		}
+		assert_eq!(stats.groups_recv.load(Ordering::Relaxed), 7);
+		assert_eq!(history(&stats), 4);
+		assert_eq!(
+			(lost(&stats), outstanding(&stats)),
+			(0, 0),
+			"history never widens the span"
+		);
+		assert_eq!(stats.groups_expected.load(Ordering::Relaxed), 2);
+
+		// A skip after the start is still loss: 13 never arrives, 15 settles 14.
+		for seq in [14, 15] {
+			gaps.complete(seq);
+		}
+		assert_eq!((lost(&stats), outstanding(&stats)), (1, 1));
+
+		// A failed history group is lost wherever it falls.
+		gaps.fail(3);
+		assert_eq!(history(&stats), 4, "a failed group is not history");
+		assert_eq!((lost(&stats), outstanding(&stats)), (2, 2));
 	}
 
 	/// The newest group is the live frontier: a hole directly behind it isn't blamed

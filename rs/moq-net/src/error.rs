@@ -38,9 +38,8 @@ pub enum SessionError {
 	#[error("key-value formatting error")]
 	KeyValueFormatting,
 
-	/// The peer went past what the session allows: a request ID at or past the
-	/// MAX_REQUEST_ID we advertised (moq-transport drafts 14 to 16), or more announcements,
-	/// subscriptions, or FETCH requests than its `crate::session::Limits`.
+	/// The peer went past what the session allows, such as more announcements than its
+	/// `crate::session::Limits`.
 	#[error("too many requests")]
 	TooManyRequests,
 
@@ -61,12 +60,16 @@ pub enum SessionError {
 	#[error("version negotiation failed")]
 	Version,
 
+	/// The peer's token could not be parsed. Retrying with the same token will fail again.
+	#[error("malformed auth token")]
+	MalformedAuthToken,
+
 	/// A token named an alias that was never registered.
 	#[error("unknown auth token alias")]
 	UnknownAuthTokenAlias,
 
 	/// The peer left more unacknowledged REQUEST_UPDATEs outstanding on one request stream
-	/// than the MAX_REQUEST_UPDATES it was advertised (draft-19 section 10.3.1.7).
+	/// than the MAX_REQUEST_UPDATES it was advertised (draft-22 section 9.1.7).
 	#[error("too many request updates")]
 	TooManyRequestUpdates,
 
@@ -112,6 +115,7 @@ impl SessionError {
 			Self::Timeout => 0x11,
 			Self::AuthTokenCacheOverflow => 0x13,
 			Self::Version => 0x15,
+			Self::MalformedAuthToken => 0x16,
 			Self::UnknownAuthTokenAlias => 0x17,
 			Self::InvalidAuthority => 0x19,
 			Self::Unsupported => 0x1,
@@ -141,6 +145,7 @@ impl SessionError {
 			0x11 => Self::Timeout,
 			0x13 => Self::AuthTokenCacheOverflow,
 			0x15 => Self::Version,
+			0x16 => Self::MalformedAuthToken,
 			0x17 => Self::UnknownAuthTokenAlias,
 			0x19 => Self::InvalidAuthority,
 			0x1B => Self::TooManyRequestUpdates,
@@ -205,11 +210,6 @@ pub enum StreamError {
 	#[error("not found")]
 	NotFound,
 
-	/// A FETCH reached a datagram, which is never cached. Sent on moq-lite-07
-	/// and later; an earlier version sends [`NotFound`](Self::NotFound) instead.
-	#[error("not fetchable")]
-	NotFetchable,
-
 	/// The broadcast is neither announced nor served, so there is no route to it.
 	#[error("unroutable")]
 	Unroutable,
@@ -218,8 +218,9 @@ pub enum StreamError {
 	#[error("old")]
 	Old,
 
-	/// The group was dropped under memory pressure. Unlike [`Old`](Self::Old) it was still
-	/// current, so it can be re-fetched.
+	/// The group, or the frames a reader still needed from its front, was dropped under
+	/// memory pressure. Unlike [`Old`](Self::Old) it was still current, so it can be
+	/// re-fetched.
 	#[error("evicted")]
 	Evicted,
 
@@ -231,7 +232,7 @@ pub enum StreamError {
 	#[error("frame too large")]
 	FrameTooLarge,
 
-	/// A group grew past its cache budget and was aborted.
+	/// A group could not make room for a write, even by shedding its front, and was aborted.
 	#[error("group too large")]
 	GroupTooLarge,
 
@@ -245,6 +246,11 @@ pub enum StreamError {
 	/// does. Unlike [`SessionError::Unauthorized`], the session stays up.
 	#[error("unauthorized")]
 	Unauthorized,
+
+	/// The publisher reset a group's stream to make room for a higher-priority one, pausing
+	/// the group for a later stream to continue rather than giving it up.
+	#[error("yielded")]
+	Yielded,
 
 	/// An application-chosen code, offset into the 64+ range on the wire.
 	#[error("app code={0}")]
@@ -277,8 +283,8 @@ impl StreamError {
 			Self::WrongSize => 0x37,
 			Self::FrameTooLarge => 0x38,
 			Self::TimestampMismatch => 0x39,
-			Self::NotFetchable => 0x3a,
 			Self::Unauthorized => 0x3b,
+			Self::Yielded => 0x3c,
 			Self::App(app) => *app as u32 + 64,
 			Self::Unknown(code) => *code,
 		}
@@ -310,8 +316,8 @@ impl StreamError {
 			0x37 => Self::WrongSize,
 			0x38 => Self::FrameTooLarge,
 			0x39 => Self::TimestampMismatch,
-			0x3a => Self::NotFetchable,
 			0x3b => Self::Unauthorized,
+			0x3c => Self::Yielded,
 			code @ 64.. => match u16::try_from(code - 64) {
 				Ok(app) => Self::App(app),
 				Err(_) => Self::Unknown(code),
@@ -326,7 +332,10 @@ impl StreamError {
 /// Local conditions are the flat variants (`Cancel`, `NotFound`, `Lagged`, and so
 /// on): this side decided what went wrong. Codes received from a peer are nested
 /// in [`Self::Session`] or [`Self::Stream`], preserving the registry and the numeric
-/// value. [`Self::Remote`] is an unrecognized request-rejection code (the IETF
+/// value. A stream also reads its session ending cleanly, whichever side closed it, as
+/// `Session(SessionError::Cancel)`: to the stream that is the session failing under it,
+/// while `Session::closed` reports the clean close itself as [`Self::Cancel`].
+/// [`Self::Remote`] is an unrecognized request-rejection code (the IETF
 /// request registry), not a session or stream unknown.
 ///
 /// The two registries are the wire. Mapping a local condition onto a code is
@@ -365,13 +374,26 @@ pub enum Error {
 	#[error("invalid path: {0}")]
 	InvalidPath(#[from] crate::InvalidPattern),
 
+	/// A published broadcast or route contains a literal `.` or `..` segment.
+	#[error("broadcast path contains a navigation segment")]
+	NavigationSegment,
+
+	/// A string is not a valid path, such as one with an empty segment.
+	#[error(transparent)]
+	Path(crate::path::Error),
+
 	/// A duplicate ID was used
 	// The broadcast/track is a duplicate
 	#[error("duplicate")]
 	Duplicate,
 
-	/// Nobody is reading any more, so the producer stopped. Not a failure.
-	// Cancel is returned when there are no more readers.
+	/// A group was created at a sequence its track declared skipped: a skip says the
+	/// sequence will never be produced, so it is final. See `track::Producer::skip_groups`.
+	#[error("sequence was skipped")]
+	Skipped,
+
+	/// Nobody is reading any more, so the producer stopped; or the session closed cleanly,
+	/// by either side, as `Session::closed` reports it. Not a failure.
 	#[error("cancelled")]
 	Cancel,
 
@@ -397,15 +419,11 @@ pub enum Error {
 	#[error("not found")]
 	NotFound,
 
-	/// A FETCH reached a datagram, which is never cached.
-	#[error("not fetchable")]
-	NotFetchable,
-
 	/// A joining FETCH named a request that is not an active subscription.
 	#[error("invalid joining request ID")]
 	InvalidJoiningRequestId,
 
-	/// A FETCH range is empty or lies beyond the published objects.
+	/// A range is empty, lies beyond the published objects, or ends at the oldest group.
 	#[error("invalid fetch range")]
 	InvalidRange,
 
@@ -435,7 +453,7 @@ pub enum Error {
 	#[error("unexpected message")]
 	UnexpectedMessage,
 
-	/// The peer asked for a feature this endpoint does not implement.
+	/// A feature was asked for that this endpoint, or the wire to the peer, does not implement.
 	#[error("unsupported")]
 	Unsupported,
 
@@ -443,12 +461,8 @@ pub enum Error {
 	#[error(transparent)]
 	Encode(#[from] coding::EncodeError),
 
-	/// A message carried more parameters than this endpoint accepts.
-	#[error("too many parameters")]
-	TooManyParameters,
-
-	/// The peer already holds as many FETCH requests, announcements, or subscriptions as this
-	/// session allows (see `crate::session::Limits`).
+	/// The peer went past this session's `crate::session::Limits`, such as too many
+	/// announcements.
 	#[error("too many requests")]
 	TooManyRequests,
 
@@ -467,9 +481,8 @@ pub enum Error {
 
 	/// The reader asked for a frame the group never held: below
 	/// [`crate::group::Producer::start_at`]. Named from the consumer's side; distinct
-	/// from [`Self::GroupTooLarge`], which aborts the whole group when a write exceeds
-	/// the cache budget, and from [`Self::Evicted`], which drops a whole group under the
-	/// pool's memory pressure.
+	/// from [`Self::Evicted`], for frames the group held but shed from its front or
+	/// dropped whole under memory pressure.
 	#[error("lagged")]
 	Lagged,
 
@@ -477,9 +490,10 @@ pub enum Error {
 	#[error("frame too large")]
 	FrameTooLarge,
 
-	/// A write would grow the group past its cache budget (byte size or frame count).
-	/// The write is refused and the group is aborted, so every reader sees the same
-	/// failure rather than a prefix some of them missed.
+	/// A write could not make room in the group even by shedding its front: what is left,
+	/// such as the frame in flight, already fills the live tail
+	/// (32 MiB). The write is refused and the
+	/// group is aborted.
 	#[error("group too large")]
 	GroupTooLarge,
 
@@ -489,9 +503,11 @@ pub enum Error {
 	#[error("frame timestamp doesn't fit its track")]
 	TimestampMismatch,
 
-	/// The group was evicted by its own track to pay eviction debt under memory
-	/// pressure (see [`cache::Pool`](crate::cache::Pool)). Unlike [`Self::Old`],
-	/// the group was still within the publisher's window; it can be re-fetched.
+	/// The group was evicted under memory pressure: by its own track to pay eviction debt
+	/// (see [`cache::Pool`](crate::cache::Pool)), or by the transport when incomplete
+	/// messages spent its receive window. Also a read of a frame the group shed from its
+	/// front, past its live tail or under that debt. Unlike [`Self::Old`], the group was
+	/// still fresh under the publisher's max age; it can be re-fetched.
 	#[error("evicted")]
 	Evicted,
 
@@ -504,7 +520,7 @@ pub enum Error {
 	/// The peer did not close the session within the GOAWAY drain deadline.
 	///
 	/// Sent as the session termination code when the draining side force-closes
-	/// after the advertised deadline expires (see [`crate::goaway::Goaway::timeout`]).
+	/// after the advertised drain deadline expires.
 	#[error("goaway timeout")]
 	GoawayTimeout,
 
@@ -515,11 +531,6 @@ pub enum Error {
 	/// The track requires a moq-transport property this endpoint does not understand.
 	#[error("unsupported extension")]
 	UnsupportedExtension,
-
-	/// The stream was torn down because the session closed. The specific reason travels on
-	/// the session close, not here.
-	#[error("session closed")]
-	SessionClosed,
 
 	/// A session-scoped protocol error, with its registry and verbatim code.
 	///
@@ -585,10 +596,46 @@ impl Error {
 
 		match err.close_kind() {
 			crate::transport::CloseKind::IdleTimeout => Self::IdleTimeout,
+			crate::transport::CloseKind::Evicted => Self::Evicted,
 			// A connection ending must not become the model's clean end-of-content.
 			crate::transport::CloseKind::Closed => SessionError::Cancel.into(),
 			_ => Self::Transport(err.to_string()),
 		}
+	}
+
+	/// Whether asking again may succeed: the route failed to deliver rather than judging what
+	/// it carried, which would repeat on every attempt. Mirrors `routeFailed` in
+	/// `js/net/src/resume.ts`.
+	pub(crate) fn retryable(&self) -> bool {
+		self.unroutable() || self.transient()
+	}
+
+	/// Whether a source lost its route to the content: only another route continues it.
+	pub(crate) fn unroutable(&self) -> bool {
+		matches!(self, Self::Unroutable | Self::Stream(StreamError::Unroutable))
+	}
+
+	/// Whether the same source may deliver a fresh copy. An unroutable source needs a new
+	/// route instead: asking it again can replace the withdrawal's cause with a refusal.
+	pub(crate) fn transient(&self) -> bool {
+		matches!(
+			self,
+			Self::Transport(_)
+				| Self::IdleTimeout
+				| Self::Session(_)
+				| Self::GoingAway
+				| Self::GoawayTimeout
+				| Self::Dropped
+				| Self::Closed
+				| Self::Cancel
+				| Self::Stream(
+					StreamError::Session(_)
+						| StreamError::Internal
+						| StreamError::Cancel
+						| StreamError::GoingAway
+						| StreamError::ControlTimeout
+				)
+		)
 	}
 }
 
@@ -606,6 +653,13 @@ impl From<StreamError> for Error {
 	}
 }
 
+/// Lets an entry point taking `impl TryInto<Path, Error: Into<Error>>` accept a `Path` too.
+impl From<std::convert::Infallible> for Error {
+	fn from(never: std::convert::Infallible) -> Self {
+		match never {}
+	}
+}
+
 /// Which session code to send for a local error.
 ///
 /// Lossy on purpose: [`Error`] describes what went wrong locally, while the registry is what
@@ -619,12 +673,11 @@ impl From<&Error> for SessionError {
 			Error::Stream(StreamError::App(app)) => Self::App(*app),
 			// A stream-scoped code has no meaning in this registry; don't forward the number.
 			Error::Stream(_) => Self::Internal,
-			Error::Cancel | Error::Closed | Error::GoingAway | Error::SessionClosed => Self::Cancel,
+			Error::Cancel | Error::Closed | Error::GoingAway => Self::Cancel,
 			Error::Unauthorized => Self::Unauthorized,
 			Error::Expired => Self::Expired,
 			Error::Unsupported => Self::Unsupported,
 			Error::Version | Error::UnknownAlpn(_) => Self::Version,
-			Error::TooManyParameters => Self::KeyValueFormatting,
 			Error::TooManyRequests => Self::TooManyRequests,
 			Error::GoawayTimeout => Self::GoawayTimeout,
 			Error::Timeout => Self::Timeout,
@@ -632,11 +685,14 @@ impl From<&Error> for SessionError {
 			| Error::UnexpectedMessage
 			| Error::UnexpectedStream
 			| Error::Duplicate
+			| Error::Skipped
 			| Error::Decode(_)
 			| Error::Encode(_)
 			| Error::WrongSize
 			| Error::BoundsExceeded(_)
-			| Error::InvalidPath(_) => Self::ProtocolViolation,
+			| Error::InvalidPath(_)
+			| Error::NavigationSegment
+			| Error::Path(_) => Self::ProtocolViolation,
 			Error::App(app) => Self::App(*app),
 			// A code we did not recognize, so we cannot say which space it came from.
 			// Forwarding it into this one risks landing on a value that IS registered here
@@ -650,7 +706,6 @@ impl From<&Error> for SessionError {
 			| Error::Evicted
 			| Error::Lagged
 			| Error::NotFound
-			| Error::NotFetchable
 			| Error::InvalidRange
 			| Error::InvalidJoiningRequestId
 			| Error::Unroutable
@@ -680,13 +735,11 @@ impl From<&Error> for StreamError {
 			// this session is fine, and the failed session's code means nothing here.
 			Error::Session(_) | Error::Transport(_) | Error::IdleTimeout => Self::Unroutable,
 			Error::Cancel | Error::Closed => Self::Cancel,
-			Error::SessionClosed => Self::Session(SessionError::Cancel),
 			Error::Decode(coding::DecodeError::Session(err)) => Self::Session(err.clone()),
 			Error::Old => Self::Old,
 			Error::Evicted => Self::Evicted,
 			Error::Lagged => Self::TooFarBehind,
 			Error::NotFound => Self::NotFound,
-			Error::NotFetchable => Self::NotFetchable,
 			Error::Unroutable => Self::Unroutable,
 			Error::WrongSize => Self::WrongSize,
 			Error::FrameTooLarge => Self::FrameTooLarge,
@@ -698,9 +751,12 @@ impl From<&Error> for StreamError {
 			Error::Timeout => Self::DeliveryTimeout,
 			Error::GoingAway => Self::GoingAway,
 			// Our own parse failure is, from the peer's side, a malformed track.
-			Error::Decode(_) | Error::BoundsExceeded(_) | Error::InvalidPath(_) | Error::MalformedTrack => {
-				Self::MalformedTrack
-			}
+			Error::Decode(_)
+			| Error::BoundsExceeded(_)
+			| Error::InvalidPath(_)
+			| Error::NavigationSegment
+			| Error::Path(_)
+			| Error::MalformedTrack => Self::MalformedTrack,
 			Error::App(app) => Self::App(*app),
 			// See the SessionError impl: an unregistered code carries no registry, so
 			// re-sending the number could mistranslate it.
@@ -711,9 +767,9 @@ impl From<&Error> for StreamError {
 			Error::UnexpectedStream => Self::Internal,
 			Error::Version
 			| Error::UnknownAlpn(_)
-			| Error::TooManyParameters
 			| Error::TooManyRequests
 			| Error::Duplicate
+			| Error::Skipped
 			| Error::GoawayTimeout
 			| Error::ProtocolViolation
 			| Error::UnexpectedMessage => Self::Session(SessionError::from(err)),
@@ -775,6 +831,7 @@ mod tests {
 			(SessionError::Timeout, 0x11),
 			(SessionError::AuthTokenCacheOverflow, 0x13),
 			(SessionError::Version, 0x15),
+			(SessionError::MalformedAuthToken, 0x16),
 			(SessionError::UnknownAuthTokenAlias, 0x17),
 			(SessionError::Expired, 0x18),
 			(SessionError::InvalidAuthority, 0x19),
@@ -825,8 +882,8 @@ mod tests {
 			(StreamError::WrongSize, 0x37),
 			(StreamError::FrameTooLarge, 0x38),
 			(StreamError::TimestampMismatch, 0x39),
-			(StreamError::NotFetchable, 0x3a),
 			(StreamError::Unauthorized, 0x3b),
+			(StreamError::Yielded, 0x3c),
 			(StreamError::App(7), 0x40 + 7),
 		] {
 			assert_eq!(err.to_code(), spec, "{err:?} moved off its assigned code");
@@ -862,12 +919,9 @@ mod tests {
 		let relayed = StreamError::from(&Error::from(StreamError::from_code(0x3)));
 		assert_eq!(relayed.to_code(), 0x3);
 
-		// A datagram reached by a FETCH keeps its own code rather than reading as a plain miss.
-		assert_eq!(StreamError::from(&Error::NotFetchable), StreamError::NotFetchable);
-
 		// Registered stream codes survive the hop unchanged.
 		for code in [
-			0x0, 0x1, 0x2, 0x4, 0x5, 0x12, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b,
+			0x0, 0x1, 0x2, 0x4, 0x5, 0x12, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3b,
 		] {
 			let relayed = StreamError::from(&Error::from(StreamError::from_code(code)));
 			assert_eq!(relayed.to_code(), code, "stream {code:#x} changed across a relay");

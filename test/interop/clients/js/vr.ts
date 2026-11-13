@@ -5,10 +5,9 @@ import { check, finishTraces, launch, open, throwPageErrors } from "./harness";
 
 const { values } = parseArgs({ options: { url: { type: "string" } } });
 if (!values.url) throw new Error("vr.ts requires --url");
-const run = process.env.MOQ_TEST_RUN;
+const run = process.env.HARNESS_RUN_DIR;
 if (!run) throw new Error("vr.ts runs under test/vr/run.sh, which builds the page into the run directory");
 
-// Cross-origin isolated like the demo's vite server, so audio takes the SharedArrayBuffer path a deployment does.
 const root = join(run, "vr-dist");
 const server = Bun.serve({
 	port: 0,
@@ -17,9 +16,7 @@ const server = Bun.serve({
 		if (path === "/") path = "/index.html";
 		const file = Bun.file(join(root, path));
 		if (!(await file.exists())) return new Response("not found", { status: 404 });
-		return new Response(file, {
-			headers: { "Cross-Origin-Opener-Policy": "same-origin", "Cross-Origin-Embedder-Policy": "require-corp" },
-		});
+		return new Response(file);
 	},
 });
 const origin = `http://localhost:${server.port}`;

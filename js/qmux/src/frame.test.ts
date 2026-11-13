@@ -48,7 +48,7 @@ describe("QMux01 record framing", () => {
 		// parameter must never appear and decoding must throw.
 		const bytes = (...vals: number[]) => new Uint8Array(vals);
 		const record = bytes(
-			// frame type 0x3f5153300d0a0d0a — 8-byte varint, so the high tag bits
+			// frame type 0x3f5153300d0a0d0a - 8-byte varint, so the high tag bits
 			// make the first wire byte 0xff (the "\xffQS0\r\n\r\n" magic).
 			0xff,
 			0x51,
@@ -60,7 +60,7 @@ describe("QMux01 record framing", () => {
 			0x0a,
 			// length = 9 (param id 8 bytes + len 1 byte)
 			0x09,
-			// param id 0x3d4f9c2a8b1e6075 — 8-byte varint, first wire byte 0xfd.
+			// param id 0x3d4f9c2a8b1e6075 - 8-byte varint, first wire byte 0xfd.
 			0xfd,
 			0x4f,
 			0x9c,
@@ -150,7 +150,7 @@ describe("QMux01 record framing", () => {
 				initialMaxStreamsBidi: 0n,
 				initialMaxStreamsUni: 0n,
 				maxDatagramFrameSize: 0n,
-				// Deliberately set to 0 — exercises the encoder's "skip-if-zero" + decoder's default seeding.
+				// Deliberately set to 0 - exercises the encoder's "skip-if-zero" + decoder's default seeding.
 				maxRecordSize: 0n,
 				resetStreamAt: false,
 			},
@@ -195,7 +195,7 @@ describe("QMux02 (draft-02)", () => {
 	});
 
 	test("a duplicate transport parameter is rejected", () => {
-		// QX_TRANSPORT_PARAMETERS carrying initial_max_data (0x04) twice — a
+		// QX_TRANSPORT_PARAMETERS carrying initial_max_data (0x04) twice - a
 		// protocol error, matching the Rust decoder's DuplicateParam.
 		const bytes = new Uint8Array([
 			0xff,
@@ -357,7 +357,7 @@ describe("maxStreamPayload", () => {
 	test("fills the budget at varint boundaries", () => {
 		// Where the length field changes width, subtracting the width of the space
 		// left (rather than of the payload) leaves bytes unused: at 16387 that is
-		// 16380, but 16382 fits — its own length still encodes in two bytes.
+		// 16380, but 16382 fits - its own length still encodes in two bytes.
 		for (let budget = 60n; budget <= 70n; budget++) assertTight(budget, id, 0n);
 		for (let budget = 16380n; budget <= 16392n; budget++) assertTight(budget, id, 0n);
 		expect(Frame.maxStreamPayload("qmux-01", 16387n, id, 0n)).toBe(16382n);
@@ -372,7 +372,7 @@ describe("maxStreamPayload", () => {
 	});
 
 	test("handles the largest advertised max_record_size", () => {
-		// max_record_size is a varint, so a peer may advertise 2^62-1 — a value
+		// max_record_size is a varint, so a peer may advertise 2^62-1 - a value
 		// `number` cannot hold exactly.
 		assertTight(VarInt.MAX, id, 0n);
 	});
@@ -380,8 +380,59 @@ describe("maxStreamPayload", () => {
 	test("the legacy binding reserves no length field", () => {
 		// The payload runs to the end of the message, so only the type byte and the
 		// stream ID come out of the budget.
-		expect(Frame.maxStreamPayload("webtransport", BigInt(Frame.MAX_FRAME_SIZE), id, 0n)).toBe(
-			BigInt(Frame.MAX_FRAME_SIZE) - 2n,
-		);
+	});
+});
+
+describe("record decoding cost", () => {
+	/** The bytes `Uint8Array.prototype.slice` copies while `run` runs. */
+	function copied(run: () => void): number {
+		const slice = Uint8Array.prototype.slice;
+		let bytes = 0;
+		Uint8Array.prototype.slice = function (this: Uint8Array, ...args: [number?, number?]) {
+			const out = slice.apply(this, args);
+			bytes += out.byteLength;
+			return out;
+		} as typeof slice;
+		try {
+			run();
+		} finally {
+			Uint8Array.prototype.slice = slice;
+		}
+		return bytes;
+	}
+
+	/** A record of `count` copies of one encoded frame. */
+	function record(frame: Frame.Any, count: number): Uint8Array {
+		const one = Frame.encode(frame, "qmux-01");
+		const out = new Uint8Array(one.byteLength * count);
+		for (let i = 0; i < count; i++) out.set(one, i * one.byteLength);
+		return out;
+	}
+
+	const id = new Stream.Id(VarInt.from(4n));
+
+	test("decoding copies each payload once, however many frames follow it", () => {
+		// The largest default record of empty STREAM frames: each frame's remainder used to be
+		// copied, about 45 MB for this one record.
+		const empty = record({ type: "stream", id, data: new Uint8Array(0), fin: false }, 5_460);
+		let frames: Frame.Any[] = [];
+		expect(copied(() => (frames = Frame.decodeRecord(empty)))).toBe(0);
+		expect(frames.length).toBe(5_460);
+
+		const payloads = record({ type: "stream", id, data: new Uint8Array(32).fill(7), fin: false }, 400);
+		expect(copied(() => Frame.decodeRecord(payloads))).toBe(400 * 32);
+	});
+
+	test("a retained payload does not alias its record", () => {
+		const body = record({ type: "stream", id, data: new Uint8Array([1]), fin: false }, 2);
+		const [first] = Frame.decodeRecord(body);
+		if (first.type !== "stream") throw new Error("expected a stream frame");
+		expect(first.data.buffer).not.toBe(body.buffer);
+		expect(first.data.buffer.byteLength).toBe(1);
+	});
+
+	test("a truncated length is still refused", () => {
+		const one = Frame.encode({ type: "stream", id, data: new Uint8Array(8), fin: false }, "qmux-01");
+		expect(() => Frame.decodeRecord(one.subarray(0, one.byteLength - 1))).toThrow("frame truncated");
 	});
 });

@@ -1,19 +1,81 @@
+import Foundation
 import MoqFFI
 
 /// Native video encoding, publication, and decoding.
 public enum Video {
-    /// The pixel layout, resolution, and framerate written to a `Producer`.
+    /// An exact video frame rate in frames per second.
+    public typealias FrameRate = MoqFFI.MoqVideoFrameRate
+
+    /// The raw frame layout, resolution, and framerate the caller writes.
     public typealias EncoderInput = VideoEncoderInput
-    /// The track name, codec, bitrate, group mode, and backend preference.
+    /// The codec, bitrate, join interval, and backend preference.
     public typealias EncoderOutput = VideoEncoderOutput
-    /// What a `Consumer` delivers: an optional resize, a max delay, and the decoder's surface (macOS only).
+    /// What a `Consumer` delivers: an optional resize, a delay, and the decoder's surface (macOS only).
     public typealias DecoderOutput = VideoDecoderOutput
     /// One raw picture with its presentation timestamp.
     public typealias Frame = VideoFrame
+    /// One item a `Consumer` reads, in delivery order: a decoded `.frame`, a `.gap`
+    /// where media was lost, or an `.end` where the publisher stopped its encoder.
+    public enum Read: Sendable {
+        /// A decoded picture; release it promptly, since held frames stall the decoder.
+        case frame(DecodedFrame)
+        /// Media after `timestamp` was lost; what follows resumes within `duration` and does not continue it.
+        case gap(timestamp: Timestamp, duration: TimeInterval)
+        /// The publisher stopped its encoder at `end`; what follows comes from a fresh encoder.
+        case end(Timestamp)
+
+        init(_ read: MoqVideoRead) {
+            switch read {
+            case .frame(let frame): self = .frame(DecodedFrame(frame))
+            case .gap(let timestamp, let duration): self = .gap(timestamp: timestamp, duration: duration)
+            case .end(let end): self = .end(end)
+            }
+        }
+    }
+
+    /// One decoded picture, owning the decoder's surface until released;
+    /// `pixels(format:)` converts it to packed CPU pixels.
+    public final class DecodedFrame: Sendable {
+        let ffi: MoqVideoDecodedFrame
+
+        init(_ ffi: MoqVideoDecodedFrame) {
+            self.ffi = ffi
+        }
+
+        /// The presentation timestamp.
+        public func timestamp() -> Timestamp { ffi.timestamp() }
+
+        /// The decoded width in pixels; `resize` is only a hint.
+        public func width() -> UInt32 { ffi.width() }
+
+        /// The decoded height in pixels.
+        public func height() -> UInt32 { ffi.height() }
+
+        /// The picture converted to tightly packed CPU pixels in `format`.
+        public func pixels(format: PixelFormat) throws -> Data { try ffi.pixels(format: format) }
+
+        /// The decoder's platform surface, or `nil` when the frame is in CPU memory.
+        public func surface() -> Surface? { ffi.surface().map(Surface.init) }
+    }
+
+    /// The platform image backing a `DecodedFrame`, when `DecoderOutput` asked for one.
+    public enum Surface: Sendable, Equatable {
+        /// A borrowed `CVPixelBufferRef` address, valid while its frame lives.
+        case pixelBuffer(pointer: UInt64)
+        /// A surface kind this version of the package does not know yet.
+        case unknown
+
+        init(_ surface: MoqVideoSurface) {
+            // `if case` rather than `switch`, so a variant this package predates maps to `.unknown`.
+            if case .pixelBuffer(let pointer) = surface {
+                self = .pixelBuffer(pointer: pointer)
+            } else {
+                self = .unknown
+            }
+        }
+    }
     /// One encoded access unit from an `Encoder`.
     public typealias Packet = MoqVideoPacket
-    /// How pictures are split into independently decodable groups.
-    public typealias Gop = MoqVideoGop
     /// A video codec identifier (H.264 or H.265).
     public typealias Codec = VideoCodec
     /// A CPU pixel layout (I420 or RGBA).
@@ -28,13 +90,23 @@ public enum Video {
         let ffi: MoqVideoProducer
 
         /// Open a video track on the catalog's broadcast and register its rendition.
+        ///
+        /// Pass `lower`, the next rendition down a simulcast ladder, to disable this
+        /// one while the bandwidth grant cannot fund it; it resumes once the grant
+        /// recovers. Needs `bandwidth` and a bitrate above the lower rendition's.
         public init(
             catalog: Media.CatalogProducer,
             input: EncoderInput,
             output: EncoderOutput,
-            bandwidth: Bandwidth? = nil
+            track: String? = nil,
+            bandwidth: Allocator? = nil,
+            lower: Producer? = nil
         ) throws {
-            ffi = try MoqVideoProducer(catalog: catalog.ffi, input: input, output: output, bandwidth: bandwidth?.ffi)
+            ffi = try MoqVideoProducer(
+                catalog: catalog.ffi,
+                options: MoqVideoProducerOptions(
+                    input: input, output: output, track: track, bandwidth: bandwidth?.ffi,
+                    lower: lower?.ffi))
         }
 
         /// A watch-only handle to whether the video track has subscribers.
@@ -52,7 +124,7 @@ public enum Video {
 
         /// Start a new group at the next written frame.
         ///
-        /// Optional: the encoder starts groups on its own per `output.gop`, so a
+        /// Optional: the encoder starts groups on its own per `output.join`, so a
         /// subscriber can always join without this. Reach for it only to place the
         /// boundaries yourself, aligning groups with something the encoder can't
         /// see such as a scene change. Throws if the selected encoder cannot force
@@ -82,11 +154,12 @@ public enum Video {
     }
 
     /// Read side of a video track decoded inside the bindings. Iterating yields
-    /// frames that own their decoded picture; call `pixels(format:)` for tightly
-    /// packed CPU pixels. Release frames promptly: held frames hold decoder buffers.
+    /// frames that own their decoded picture, and the gaps and encoder ends between
+    /// them; call `pixels(format:)` for tightly packed CPU pixels. Release frames
+    /// promptly: held frames hold decoder buffers.
     public final class Consumer: AsyncSequence, Sendable {
-        /// The decoded video frame emitted by this sequence.
-        public typealias Element = VideoDecodedFrame
+        /// The frame, gap, or end emitted by this sequence.
+        public typealias Element = Read
 
         let ffi: MoqVideoConsumer
 
@@ -101,17 +174,18 @@ public enum Video {
             rendition: Media.Video,
             output: DecoderOutput = DecoderOutput()
         ) async throws -> Consumer {
-            Consumer(try await MoqVideoConsumer.subscribe(
-                broadcast: broadcast.ffi,
-                id: id,
-                catalogVideo: rendition,
-                output: output
-            ))
+            Consumer(
+                try await MoqVideoConsumer.subscribe(
+                    broadcast: broadcast.ffi,
+                    id: id,
+                    catalogVideo: rendition,
+                    output: output
+                ))
         }
 
-        /// The next frame, or `nil` once the track ends or is closed.
-        public func next() async throws -> VideoDecodedFrame? {
-            try await ffi.next()
+        /// The next frame, gap, or end, or `nil` once the track ends or is closed.
+        public func next() async throws -> Read? {
+            try await ffi.next().map(Read.init)
         }
 
         /// Cancel all current and future reads.
@@ -120,9 +194,10 @@ public enum Video {
         }
 
         /// Create an iterator that cancels native reads when iteration ends.
-        public func makeAsyncIterator() -> AsyncThrowingStream<VideoDecodedFrame, Swift.Error>.Iterator {
+        public func makeAsyncIterator() -> AsyncThrowingStream<Read, Swift.Error>.Iterator {
+
             moqStream(cancel: { [ffi] in ffi.cancel() }) { [ffi] in
-                try await ffi.next()
+                try await ffi.next().map(Read.init)
             }.makeAsyncIterator()
         }
     }
@@ -131,13 +206,16 @@ public enum Video {
     public final class Encoder: Sendable {
         let ffi: MoqVideoEncoder
 
-        /// Open a codec-only encoder; `output.track` is ignored.
+        /// Open a codec-only encoder.
         public init(input: EncoderInput, output: EncoderOutput) throws {
             ffi = try MoqVideoEncoder(input: input, output: output)
         }
 
-        /// Encode one picture, returning any access units now available.
-        public func encode(_ frame: Frame) throws -> [Packet] { try ffi.encode(frame: frame) }
+        /// Submit one picture, whose access units `receive` returns.
+        public func encode(_ frame: Frame) throws { try ffi.encode(frame: frame) }
+
+        /// Pop the oldest ready access unit, or nil while the codec holds the rest; call until nil.
+        public func receive() throws -> Packet? { try ffi.receive() }
 
         /// Force the next encoded picture to start a new group.
         public func cut() throws { try ffi.cut() }
@@ -145,10 +223,7 @@ public enum Video {
         /// Retune the live encoder in bits per second.
         public func setBitrate(_ bitrate: UInt64) throws { try ffi.setBitrate(bitrate: bitrate) }
 
-        /// Drain buffered access units and keep the encoder open.
-        public func flush() throws -> [Packet] { try ffi.flush() }
-
-        /// Drain and close the encoder.
-        public func finish() throws -> [Packet] { try ffi.finish() }
+        /// Mark the end of input, so `receive` returns every access unit the codec still holds, without closing the encoder.
+        public func flush() throws { try ffi.flush() }
     }
 }

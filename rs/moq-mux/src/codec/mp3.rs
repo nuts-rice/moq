@@ -98,12 +98,12 @@ impl Config {
 /// passing the track producer and the [`catalog::Reserved`](crate::catalog::Reserved)
 /// it reserves its rendition from.
 ///
-/// Every MP3 frame is independently decodable, so [`decode`](Self::decode) marks only the first frame
-/// of each group a keyframe (the rest extend it): frames accumulate into the current group until the
-/// caller [`cut`](Self::cut)s or [`seek`](Self::seek)s. The [`import::Track`](crate::import::Track)
-/// facade passes that through, so boundaries are the caller's either way: cut per frame for one
-/// group per frame, or at a segment cadence to align with video. MP3 carries its config in band, so
-/// the rendition has no out-of-band description.
+/// Every MP3 frame is independently decodable, so [`decode`](Self::decode) marks only the first
+/// frame of each group a keyframe (the rest extend it): frames accumulate into the current group
+/// until the caller [`cut`](Self::cut)s or [`seek`](Self::seek)s. The
+/// [`import::Track`](crate::import::Track) facade passes that through, so boundaries are the
+/// caller's either way: cut per frame for one group per frame, or less often to batch frames into
+/// fewer groups. MP3 carries its config in band, so the rendition has no out-of-band description.
 pub struct Import {
 	track: crate::container::Producer<crate::catalog::hang::Container, hang::catalog::AudioConfig>,
 }
@@ -134,14 +134,9 @@ impl Import {
 		self.track.track().demand()
 	}
 
-	/// Record a locally encoded frame's transport handoff for catalog jitter measurement.
-	pub fn flush(&mut self, timestamp: moq_net::Timestamp, now: moq_clock::Instant) -> crate::Result<()> {
-		self.track.flush(timestamp, now)
-	}
-
 	/// Finish the track, flushing the current group.
 	pub fn finish(&mut self) -> crate::Result<()> {
-		self.track.finish()?;
+		self.track.end_with(None)?;
 		Ok(())
 	}
 
@@ -151,8 +146,6 @@ impl Import {
 		self.track.abort(err);
 	}
 
-	/// Publish what the track measured (bitrate, jitter) into the catalog rendition, filling only
-	/// the fields its config didn't supply.
 	/// Cut the current group at `end` without finishing the track.
 	pub fn cut(&mut self, end: Option<moq_net::Timestamp>) -> crate::Result<()> {
 		self.track.cut(end)?;

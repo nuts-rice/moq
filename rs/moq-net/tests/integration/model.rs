@@ -1,6 +1,6 @@
 //! The explicit-time model works without async helpers or a runtime.
 
-use moq_net::{Error, Hop, Timestamp, broadcast, frame, group, kio, origin, track};
+use moq_net::{Error, Timestamp, broadcast, frame, group, origin, track};
 use std::task::Poll;
 
 fn ready<T>(value: Poll<T>) -> T {
@@ -14,10 +14,13 @@ fn ready<T>(value: Poll<T>) -> T {
 fn origin_front_serves_media_with_only_explicit_polls() {
 	let now = moq_net::time::Instant::now();
 	let waiter = kio::Waiter::noop();
-	let (origin, mut driver) = origin::Producer::new(origin::Config::new(Hop::new(1).unwrap()));
+	let (origin, mut driver) = origin::Producer::new(origin::Config::new(std::num::NonZeroU64::new(1).unwrap()));
 	driver.poll(now, &waiter).unwrap();
-	let broadcast = origin.create_broadcast("room/live").unwrap();
+	let broadcast = origin
+		.route("room/live", moq_net::origin::RouteOptions::hidden())
+		.unwrap();
 	let track = broadcast
+		.broadcast()
 		.create_track(
 			"video",
 			track::Info::default().with_timescale(moq_net::Timescale::MILLI),
@@ -26,10 +29,10 @@ fn origin_front_serves_media_with_only_explicit_polls() {
 	let mut group = track.create_group(group::Info { sequence: 7 }).unwrap();
 	group.write_frame(Timestamp::ZERO, b"media").unwrap();
 	group.finish().unwrap();
-	broadcast.announce(origin::Route::default()).unwrap();
+	broadcast.announce().unwrap();
 
 	// Resolving and subscribing pass through the origin's core front tasks.
-	let requesting = origin.consume().request_broadcast("room/live", None);
+	let mut requesting = origin.consume().request("room/live", None);
 	assert!(requesting.poll_ok(&waiter).is_pending());
 	driver.poll(now, &waiter).unwrap();
 	let receiving: broadcast::Consumer = ready(requesting.poll_ok(&waiter)).unwrap();
@@ -44,34 +47,37 @@ fn origin_front_serves_media_with_only_explicit_polls() {
 
 	// Driver teardown also works without any executor-owned tasks.
 	drop(driver);
-	assert!(matches!(origin.create_broadcast("after-close"), Err(Error::Closed)));
+	assert!(matches!(
+		origin.route("after-close", moq_net::origin::RouteOptions::hidden()),
+		Err(Error::Closed)
+	));
 }
 
 #[test]
-fn routed_broadcast_resolves_with_only_explicit_polls() {
-	use kio::Task;
-
+fn follow_resolves_with_only_explicit_polls() {
 	let now = moq_net::time::Instant::now();
 	let waiter = kio::Waiter::noop();
-	let (origin, mut driver) = origin::Producer::new(origin::Config::new(Hop::new(1).unwrap()));
+	let (origin, mut driver) = origin::Producer::new(origin::Config::new(std::num::NonZeroU64::new(1).unwrap()));
 	driver.poll(now, &waiter).unwrap();
 
-	// Nothing covers the path yet: the first ask fails `Unroutable` and parks on the routes.
-	let mut routing = origin.consume().routed_broadcast("room/live");
-	assert!(routing.poll(&waiter).is_pending());
-	let broadcast = origin.create_broadcast("room/live").unwrap();
-	assert!(routing.poll(&waiter).is_pending());
+	// Nothing covers the path yet: the follower waits for an announcement.
+	let mut following = origin.consume().follow("room/live", None).unwrap();
+	assert!(following.poll_available(&waiter).is_pending());
+	let broadcast = origin
+		.route("room/live", moq_net::origin::RouteOptions::hidden())
+		.unwrap();
+	assert!(following.poll_available(&waiter).is_pending());
 
-	// Announcing moves the routes, so the next poll asks again and the driver serves it.
-	broadcast.announce(origin::Route::default()).unwrap();
-	assert!(routing.poll(&waiter).is_pending());
+	// Announcing starts the path, so the next poll asks and the driver serves it.
+	broadcast.announce().unwrap();
+	assert!(following.poll_available(&waiter).is_pending());
 	driver.poll(now, &waiter).unwrap();
-	let resolved = ready(routing.poll(&waiter)).unwrap();
+	let resolved = ready(following.poll_available(&waiter)).unwrap().unwrap();
 	assert_eq!(resolved.info().path.as_str(), "room/live");
 
-	// A closed origin ends a parked resolution.
-	let mut routing = origin.consume().routed_broadcast("room/other");
-	assert!(routing.poll(&waiter).is_pending());
+	// A closed origin ends a parked follower.
+	let mut following = origin.consume().follow("room/other", None).unwrap();
+	assert!(following.poll_available(&waiter).is_pending());
 	drop(driver);
-	assert!(matches!(ready(routing.poll(&waiter)), Err(Error::Closed)));
+	assert!(matches!(ready(following.poll_available(&waiter)), Err(Error::Closed)));
 }

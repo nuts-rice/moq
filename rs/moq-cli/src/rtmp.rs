@@ -6,7 +6,6 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::Context;
-use hang::moq_net;
 use moq_rtmp::{Client, Request, Server};
 use url::Url;
 
@@ -40,25 +39,25 @@ pub struct ExportArgs {
 	/// FLV frame release delay and stalled-group budget. Late video resumes at
 	/// its next keyframe; zero releases available frames without deadline drops.
 	#[usage(long, default = "500ms")]
-	pub max_delay: crate::duration::Duration,
+	pub delay: moq_tokio::cli::Duration,
 
-	/// The released spelling of [`Self::max_delay`].
+	/// The released spelling of `--delay`.
 	#[usage(long = "max-age", hide = true)]
-	max_age: Option<crate::duration::Duration>,
+	max_age: Option<moq_tokio::cli::Duration>,
 
-	/// The released spelling of [`Self::max_delay`], before `--max-age`.
+	/// The released spelling of `--delay`, before `--max-age`.
 	#[usage(long = "latency-max", hide = true)]
-	latency_max: Option<crate::duration::Duration>,
+	latency_max: Option<moq_tokio::cli::Duration>,
 }
 
 impl ExportArgs {
 	pub(crate) fn deprecated(&self) -> moq_tokio::cli::Deprecated {
 		let mut found = moq_tokio::cli::Deprecated::default();
 		if self.max_age.is_some() {
-			found.flag("--max-age", None, "--max-delay");
+			found.flag("--max-age", None, "--delay");
 		}
 		if self.latency_max.is_some() {
-			found.flag("--latency-max", None, "--max-delay");
+			found.flag("--latency-max", None, "--delay");
 		}
 		found
 	}
@@ -66,12 +65,8 @@ impl ExportArgs {
 
 /// Accept incoming RTMP publishes into the Origin as `target.name`; reject plays (import).
 pub async fn listen_import(target: ImportTarget, addr: SocketAddr) -> anyhow::Result<()> {
-	let ImportTarget {
-		origin,
-		name,
-		max_age,
-		bandwidth,
-	} = target;
+	let ImportTarget { origin, name, ingest } = target;
+	let name = moq_net::Path::new(&name)?;
 	let mut server = Server::bind(addr).await?;
 	tracing::info!(%addr, %name, "RTMP listening (import)");
 	notify_ready();
@@ -81,14 +76,9 @@ pub async fn listen_import(target: ImportTarget, addr: SocketAddr) -> anyhow::Re
 			Request::Publish(publish) => {
 				let origin = origin.clone();
 				let name = name.clone();
-				let bandwidth = bandwidth.clone();
+				let ingest = ingest.clone();
 				tokio::spawn(async move {
-					if let Err(err) = publish
-						.with_max_age(max_age)
-						.with_bandwidth(bandwidth)
-						.accept(&origin, &name)
-						.await
-					{
+					if let Err(err) = publish.accept(&origin, &name, &ingest).await {
 						tracing::warn!(%name, %err, "RTMP ingest ended with error");
 					}
 				});
@@ -110,8 +100,9 @@ pub async fn listen_export(
 	origin: moq_net::origin::Consumer,
 	addr: SocketAddr,
 	name: String,
-	max_delay: Duration,
+	delay: Duration,
 ) -> anyhow::Result<()> {
+	let name = moq_net::Path::new(&name)?;
 	let mut server = Server::bind(addr).await?;
 	tracing::info!(%addr, %name, "RTMP listening (export)");
 	notify_ready();
@@ -122,7 +113,7 @@ pub async fn listen_export(
 				let origin = origin.clone();
 				let name = name.clone();
 				tokio::spawn(async move {
-					if let Err(err) = play.with_max_delay(max_delay).accept(&origin, &name).await {
+					if let Err(err) = play.with_delay(delay).accept(&origin, &name).await {
 						tracing::warn!(%name, %err, "RTMP play ended with error");
 					}
 				});
@@ -144,16 +135,13 @@ pub async fn listen_export(
 /// Dial a remote RTMP server and pull its play into the Origin under `target.name` (import).
 pub async fn connect_import(target: ImportTarget, url: Url) -> anyhow::Result<()> {
 	let (addr, app, key) = parse_url(&url).await?;
-	let name = &target.name;
+	let name = moq_net::Path::new(&target.name)?;
 	// The stream key is the ingest credential, so log the dial target and app instead.
 	tracing::info!(%addr, %app, %name, "RTMP client pulling");
 	notify_ready();
 
-	let client = Client::connect(addr, &app)
-		.await?
-		.with_import_max_age(target.max_age)
-		.with_import_bandwidth(target.bandwidth);
-	Ok(client.pull(&key, &target.origin, name).await?)
+	let client = Client::connect(addr, &app).await?;
+	Ok(client.pull(&key, &target.origin, name, &target.ingest).await?)
 }
 
 /// Push a broadcast from the Origin to a remote RTMP server (export).
@@ -161,22 +149,26 @@ pub async fn connect_export(
 	origin: moq_net::origin::Consumer,
 	url: Url,
 	name: String,
-	max_delay: Duration,
+	delay: Duration,
 ) -> anyhow::Result<()> {
+	let name = moq_net::Path::new(&name)?;
 	let (addr, app, key) = parse_url(&url).await?;
-	// Confirm the broadcast is reachable (and wait for it to be announced) before dialing;
-	// the FLV export re-resolves it (and any referenced sibling broadcast) through the origin.
-	origin
-		.routed(&name)
+	// Wait for the broadcast to be announced before dialing; the FLV export resolves any
+	// referenced sibling broadcast through the same origin.
+	let broadcast = origin
+		.follow(&name, None)?
+		.available()
 		.await
-		.with_context(|| format!("origin closed before broadcast `{name}` was announced"))?;
+		.with_context(|| format!("failed to resolve broadcast `{name}`"))?
+		.context("went offline before serving")?;
+	let source = moq_mux::Source::new(origin, broadcast);
 
 	// The stream key is the ingest credential, so log the dial target and app instead.
 	tracing::info!(%addr, %app, %name, "RTMP client pushing");
 	notify_ready();
 
-	let client = Client::connect(addr, &app).await?.with_export_max_delay(max_delay);
-	Ok(client.publish(&key, origin, &name).await?)
+	let client = Client::connect(addr, &app).await?.with_delay(delay);
+	Ok(client.publish(&key, source).await?)
 }
 
 /// Parse `rtmp://host[:1935]/<app>/<key>` into a resolved address, app, and stream key.

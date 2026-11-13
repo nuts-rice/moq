@@ -1,4 +1,4 @@
-//! The DEFLATE codec behind compressed tracks ([`crate::track::Info::compress`]).
+//! The DEFLATE codec behind compressed tracks ([`crate::track::Info::compression`]).
 //!
 //! Each group is one raw DEFLATE stream ([RFC 1951]) with a sync flush after every frame, so
 //! each frame's slice is self-delimited while later frames compress against earlier ones.
@@ -26,9 +26,10 @@ const CHUNK: usize = 8 * 1024;
 /// The DEFLATE window, 2^15 bytes for raw DEFLATE at the default `windowBits`.
 const WINDOW: u64 = 1 << 15;
 
-/// Heap an [`Encoder`] holds, as zlib sizes it at the default `memLevel` of 8: the doubled
-/// window, its `prev` chain and hash `head` tables, and the pending buffer, 64 KiB each.
-pub(super) const ENCODER_HEAP: u64 = 8 * WINDOW;
+/// Heap an [`Encoder`] holds with zlib-rs at the default `memLevel` of 8: 64 KiB each
+/// for the doubled window, `prev` chain and pending buffer, a 128 KiB hash table and
+/// a separate 48 KiB symbol buffer, plus the codec state and alignment rounded to 16 KiB.
+pub(super) const ENCODER_HEAP: u64 = 12 * WINDOW;
 
 /// Heap a [`Decoder`] holds: the window, plus its inflate state rounded up to 8 KiB.
 pub(super) const DECODER_HEAP: u64 = WINDOW + 8 * 1024;
@@ -42,6 +43,11 @@ impl Encoder {
 	pub(super) fn new() -> Self {
 		// `false`: raw DEFLATE, no zlib header/trailer, matching `deflate-raw` in browsers.
 		Self(Box::new(Compress::new(flate2::Compression::new(LEVEL), false)))
+	}
+
+	/// Start another group with a cold window, retaining the codec's allocations.
+	pub(super) fn reset(&mut self) {
+		self.0.reset();
 	}
 
 	/// Compress the next frame, returning its slice minus the sync-flush marker. Empty in

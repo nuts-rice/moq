@@ -10,9 +10,7 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use super::fixture::{ACCESS, Flags, MS, Mux, WRAP, paced, program};
-use super::passthrough::{
-	GROUP_BYTES_MAX, GROUP_OBJECTS_MAX, PacketSizeError, Passthrough, PcrGapError, PcrRestartError, PcrRewindError,
-};
+use super::passthrough::{GROUP_BYTES_MAX, GROUP_OBJECTS_MAX, Passthrough};
 
 /// A delay budget no test timeline comes close to, so the reader sees every group.
 const RECORDING_MAX_DELAY: Duration = Duration::from_secs(30);
@@ -38,10 +36,11 @@ struct Imported {
 impl Imported {
 	/// Every object's packets, concatenated in order.
 	fn bytes(&self) -> Vec<u8> {
-		self.objects
-			.iter()
-			.flat_map(|object| object.payload.iter().copied())
-			.collect()
+		let mut bytes = Vec::new();
+		for object in &self.objects {
+			bytes.extend_from_slice(&object.payload);
+		}
+		bytes
 	}
 
 	fn section(&self) -> &hang::catalog::M2ts {
@@ -85,15 +84,18 @@ async fn import_onto(
 	for chunk in data.chunks(chunk) {
 		passthrough.decode(chunk)?;
 	}
-	passthrough.finish()?;
+	let _finished = passthrough.finish()?;
 
 	let mut track = consumer
 		.track(&name)?
-		.subscribe(moq_net::track::Subscription::default().with_max_delay(RECORDING_MAX_DELAY))
+		.subscribe(
+			moq_net::track::Subscription::default()
+				.with_delay(moq_net::track::Delay::default().with_max(RECORDING_MAX_DELAY)),
+		)
 		.await?;
 	let mut objects = Vec::new();
 	let mut markers = Vec::new();
-	while let Some(mut group) = tokio::time::timeout(Duration::from_secs(1), track.recv_group()).await?? {
+	while let Some(mut group) = kio::clock::timeout(Duration::from_secs(1), track.recv_group()).await?? {
 		while let Some(frame) = group.read_frame().await? {
 			if frame.payload.is_empty() {
 				markers.push(group.sequence);
@@ -508,7 +510,7 @@ async fn the_section_goes_with_the_importer() {
 		if abort {
 			passthrough.abort(moq_net::Error::Cancel);
 		} else {
-			passthrough.finish().unwrap();
+			let passthrough = passthrough.finish().unwrap();
 			assert!(catalog.snapshot().m2ts.is_some(), "a finished track is still described");
 			drop(passthrough);
 		}
@@ -595,7 +597,7 @@ async fn an_import_shifts_onto_a_clock_already_in_use() {
 	let mut broadcast = moq_net::broadcast::Info::new().produce();
 	let catalog = crate::catalog::Producer::new(&mut broadcast, Default::default()).unwrap();
 	let clock = catalog.clock();
-	let fixed = catalog.snapshot().clock;
+	let fixed = catalog.snapshot().media.clock;
 	tokio::time::advance(Duration::from_secs(5)).await;
 	let before = clock.now().as_micros() as u64;
 	let shifted = import_onto(broadcast, catalog.clone(), &data, data.len(), None)
@@ -603,7 +605,11 @@ async fn an_import_shifts_onto_a_clock_already_in_use() {
 		.unwrap();
 	let after = clock.now().as_micros() as u64;
 
-	assert_eq!(catalog.snapshot().clock, fixed, "the import never moves the clock");
+	assert_eq!(
+		catalog.snapshot().media.clock,
+		fixed,
+		"the import never moves the clock"
+	);
 	let first = shifted.objects[0].micros;
 	assert!(
 		(before..=after).contains(&first),
@@ -634,8 +640,11 @@ async fn a_flagged_step_back_is_a_restart() {
 		Ok(_) => panic!("a restart was carried on one timeline"),
 		Err(err) => err,
 	};
-	let restart = err.downcast_ref::<PcrRestartError>().expect("a typed refusal");
-	assert_eq!((restart.pid, restart.to), (0x100, 2_000 * MS));
+	let restart = err.downcast_ref::<crate::Error>();
+	assert!(
+		matches!(restart, Some(crate::Error::PcrRestart { pid: 0x100, to, .. }) if *to == 2_000 * MS),
+		"{err:?}"
+	);
 }
 
 /// A break before any group has started is no group start, so the first group still waits for a
@@ -665,8 +674,11 @@ async fn an_unflagged_rewind_is_refused() {
 		Ok(_) => panic!("a rewind was accepted"),
 		Err(err) => err,
 	};
-	let rewind = err.downcast_ref::<PcrRewindError>().expect("a typed refusal");
-	assert_eq!((rewind.pid, rewind.to), (0x100, 9_000 * MS));
+	let rewind = err.downcast_ref::<crate::Error>();
+	assert!(
+		matches!(rewind, Some(crate::Error::PcrRewind { pid: 0x100, to, .. }) if *to == 9_000 * MS),
+		"{err:?}"
+	);
 }
 
 #[tokio::test(start_paused = true)]
@@ -744,7 +756,13 @@ async fn a_clock_that_stops_is_refused_once_a_group_would_overflow() {
 		Ok(_) => panic!("an untimed run was accepted"),
 		Err(err) => err,
 	};
-	assert_eq!(err.downcast_ref::<PcrGapError>().map(|gap| gap.pid), Some(0x100));
+	assert!(
+		matches!(
+			err.downcast_ref::<crate::Error>(),
+			Some(crate::Error::PcrGap { pid: 0x100, .. })
+		),
+		"{err:?}"
+	);
 }
 
 #[tokio::test(start_paused = true)]
@@ -781,7 +799,10 @@ async fn a_192_or_204_byte_source_is_refused() {
 			Ok(_) => panic!("{size}-byte packets were accepted"),
 			Err(err) => err,
 		};
-		assert_eq!(err.downcast_ref::<PacketSizeError>(), Some(&PacketSizeError { size }));
+		assert!(
+			matches!(err.downcast_ref::<crate::Error>(), Some(crate::Error::TsPacketSize(got)) if *got == size),
+			"{err:?}"
+		);
 	}
 }
 

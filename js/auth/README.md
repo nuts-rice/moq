@@ -7,7 +7,10 @@ contract, the relay flags, and worked examples, see the
 [Authentication Documentation](../../doc/bin/relay/auth.md).
 
 Grants and claims name paths with patterns from `@moq/pattern`: `foo` is one
-broadcast, `foo/**` is a subtree, `**` is everything.
+broadcast, `foo/**` is a subtree, `**` is everything. A role may also carry a
+bitrate cap, written `{"path": [...], "rate": bps}` and parsed into
+`publish_rate` or `subscribe_rate` beside the patterns. `Key.sign` takes that
+parsed form.
 
 ## Installation
 
@@ -82,9 +85,10 @@ Or you can sign as a CLI
 moq-auth sign --key "root.jwk" \
   --root "rooms/meeting-123" \
   --subscribe "**" \
-  --publish "alice/**" \
-  --expires 1703980800 > "alice.jwt"
+  --publish "alice/**" > "alice.jwt"
 ```
+
+The token expires in an hour unless `--ttl`, `--expires`, or `--unbounded` says otherwise.
 
 ### Verifying
 
@@ -97,10 +101,6 @@ const claims = await Key.verify(key, token); // signature, kid, strict claims, a
 const permissions = authorize(claims, "rooms/meeting-123"); // patterns relative to the path
 ```
 
-Use `Key.decode(key, token)` when the signed payload is not a MoQ `Claims` object.
-It returns an unvalidated value after checking signature, algorithm, and key ID;
-validate its fields and lifetime in your application.
-
 Or as a CLI:
 
 ```bash
@@ -109,13 +109,15 @@ moq-auth verify --key root.jwk --in alice.jwt
 
 ### Answering a relay
 
-A server implementing the contract validates what the relay sends and answers a grant:
+A server implementing the contract validates what the relay sends and answers a grant.
+`encodeGrant` writes a cap into its role, where the relay reads it:
 
 ```typescript
-import { type Grant, GrantSchema, RequestSchema } from "@moq/auth";
+import { encodeGrant, type Grant, RequestSchema } from "@moq/auth";
 
 const request = RequestSchema.parse(await body.json());
-const grant: Grant = GrantSchema.parse({ subscribe: ["**"], expires: 4102444800, revalidate: 60 });
+const grant: Grant = { subscribe: ["**"], subscribe_rate: 8_000_000, expires: 4102444800, revalidate: 60 };
+return Response.json(encodeGrant(grant));
 ```
 
 ### Working example

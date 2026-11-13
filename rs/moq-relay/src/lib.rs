@@ -12,7 +12,6 @@
 
 #![warn(missing_docs)]
 
-pub mod acme;
 pub mod auth;
 pub mod cache;
 /// Joining other relays into a cluster that shares one origin.
@@ -20,7 +19,6 @@ pub mod cluster;
 mod config;
 mod connection;
 mod critical;
-mod duration;
 mod fetch;
 mod http_client;
 mod incoming;
@@ -35,13 +33,12 @@ pub mod session;
 mod settings;
 pub mod shutdown;
 pub mod stats;
+#[cfg(any(feature = "stun", test))]
 pub mod stun;
-#[cfg(test)]
-mod test_env;
 #[cfg(feature = "test-support")]
 mod test_support;
 #[cfg(all(target_os = "linux", feature = "_uring"))]
-pub mod uring;
+pub(crate) mod uring;
 /// The HTTP/HTTPS server: health, certificate fingerprint, announcements, fetch, and WebSocket sessions.
 pub mod web;
 #[cfg(feature = "websocket")]
@@ -57,13 +54,17 @@ pub const DEFAULT_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from
 
 /// Resolve an optional stats tier label. An absent or empty label selects the
 /// default unprefixed tier.
-fn configured_tier(label: Option<String>) -> moq_net::stats::Tier {
-	label.map(moq_net::stats::Tier::new).unwrap_or_default()
+fn configured_tier(label: Option<String>) -> Result<moq_net::stats::Tier, moq_net::path::Error> {
+	match label {
+		Some(label) => Ok(moq_net::stats::Tier::new(moq_net::Path::new(&label)?)),
+		None => Ok(Default::default()),
+	}
 }
 
 pub use config::*;
 pub use connection::*;
 pub use fetch::*;
+#[cfg(feature = "test-support")]
 pub use incoming::{Accepted, Incoming};
 pub use relay::*;
 #[cfg(feature = "test-support")]

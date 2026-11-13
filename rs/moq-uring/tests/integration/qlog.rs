@@ -5,9 +5,9 @@
 //! actually produces a file for each end of the connection, and every record in it is JSON, so a reader is not handed a truncated or
 //! interleaved trace.
 //!
-//! Unsupported local kernels skip loudly; MOQ_STRICT makes CI refuse them.
+//! Unsupported local kernels skip loudly; CI_STRICT makes CI refuse them.
 
-#![cfg(all(target_os = "linux", feature = "qlog", feature = "quic"))]
+#![cfg(all(feature = "qlog", feature = "quic"))]
 
 use crate::support;
 
@@ -18,7 +18,7 @@ use moq_uring::{Config, Error, Worker, quic, udp};
 fn worker() -> Option<Worker> {
 	match Worker::new(Config::default()) {
 		Ok(worker) => Some(worker),
-		Err(Error::Unsupported(reason)) if std::env::var_os("MOQ_STRICT").is_none() => {
+		Err(Error::Unsupported(reason)) if std::env::var_os("CI_STRICT").is_none() => {
 			eprintln!("skipping io_uring qlog test: {reason}");
 			None
 		}
@@ -49,12 +49,7 @@ fn a_connection_writes_a_trace() {
 
 	let sink = quic::qlog::Sink::directory(dir.path()).expect("qlog sink");
 
-	let mut server = quic::server::Config::new(
-		quic::Identity::open(&certs.cert, &certs.key)
-			.expect("identity")
-			.server(&[ALPN], quic::server::ClientAuth::None)
-			.expect("tls"),
-	);
+	let mut server = quic::server::Config::new(certs.server(&[ALPN]));
 	server.transport.qlog = Some(sink.clone());
 
 	let server_sock = handle
@@ -65,9 +60,7 @@ fn a_connection_writes_a_trace() {
 		.udp(UdpSocket::bind("127.0.0.1:0").expect("bind"), udp::Config::default())
 		.expect("client socket");
 
-	let mut dial = quic::client::Config::new(server_addr, "localhost");
-	dial.alpn = vec![ALPN.to_string()];
-	dial.verify = false;
+	let mut dial = quic::client::Config::new(support::client_tls(&[ALPN]));
 	dial.transport.qlog = Some(sink.clone());
 
 	handle.spawn(async move {
@@ -80,12 +73,10 @@ fn a_connection_writes_a_trace() {
 
 	worker
 		.block_on(async move {
-			let conn = quic::client::connect(client_sock, &dial).await.expect("quic connect");
-			assert_eq!(
-				web_transport_trait::poll::Session::protocol(&conn),
-				Some(ALPN),
-				"negotiated ALPN"
-			);
+			let conn = quic::client::connect(client_sock, &dial, server_addr, "localhost")
+				.await
+				.expect("quic connect");
+			assert_eq!(conn.protocol(), Some(ALPN), "negotiated ALPN");
 		})
 		.expect("worker");
 

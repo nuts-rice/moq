@@ -1,24 +1,53 @@
-import { Milli, Nano, sleep } from "@moq/clock";
-import Session, { type Version as QmuxVersion } from "@moq/qmux";
-import { error, fromClose, ProtocolViolation, sessionCause } from "../error.ts";
+import { Duration, Elapsed, sleep, timeout } from "@moq/clock";
+import { Session as Qmux, type SessionOptions as QmuxOptions, type Version as QmuxVersion } from "@moq/qmux";
+import { type Getter, race } from "@moq/signals";
+import type * as Auth from "../auth.ts";
+import { vacant } from "../auth_session.ts";
+import type { Viewers } from "../bandwidth.ts";
+import { ConnectTimeout, error, fromClose, ProtocolViolation, sessionCause } from "../error.ts";
 import * as Ietf from "../ietf/index.ts";
+import { IMPLEMENTATION } from "../implementation.ts";
 import * as Lite from "../lite/index.ts";
 import type { Consumer as OriginConsumer, Producer as OriginProducer } from "../origin.ts";
 import { Stream } from "../stream.ts";
 import * as Hex from "../util/hex.ts";
-import { redact } from "../util/log.ts";
+import { after } from "../util/timer.ts";
 import { isWebTransportSupported } from "./browser.ts";
-import type { Established } from "./established.ts";
+import { parse, show } from "./endpoint.ts";
 import * as Extensions from "./extensions.ts";
 import { DISCOVERY_REMOVED, forwardAnnounced } from "./forward.ts";
-import { exchangeSetup } from "./handshake.ts";
+import { DEFAULT_TIMEOUT, exchangeSetup, handsOff } from "./handshake.ts";
+import type { Session } from "./session.ts";
+import { inspect } from "./stats.ts";
+import { credential, fallback, hold, type Presentation } from "./tokens.ts";
 
 // Default head start for WebTransport before attempting the WebSocket fallback.
-const DEFAULT_WEBSOCKET_DELAY_MS = Milli(500);
+const DEFAULT_WEBSOCKET_DELAY = Duration.millis(500);
+
+// How long the first WebTransport dial may stay unopened before a second one dials alongside
+// it. The same moment as the WebSocket's default head start, so a fresh WebTransport flow
+// races the fallback rather than losing to it, which would leave the session on WebSocket for
+// good. A healthy open is about two round trips, so this spares round trips up to about
+// 250 ms, and it is inside the 2 s ceiling RFC 8305 recommends for staggered attempts.
+const WEBTRANSPORT_HEDGE = DEFAULT_WEBSOCKET_DELAY;
+
+// How long a WebSocket dial may stay unopened before it is closed and dialed again. Generous,
+// since script cannot tell a silent connect from a slow one; Firefox and socket.io give a
+// WebSocket 20 s to open.
+const WEBSOCKET_REDIAL = Duration.millis(10_000);
+
+// MoQ holds a stream open per subscription and per live group, far past qmux's default of
+// 100 each way, where the peer's opens are refused or wait on credit forever. Matches
+// `moq-tokio`'s `quic.max_streams`, the limit of Rust's sessions and the relay.
+const DEFAULT_MAX_STREAMS = 10_000;
+
+// Match moq-tokio so WebSocket readers have the same bandwidth-delay budget.
+const DEFAULT_RECEIVE_WINDOW = 4 << 20;
+const DEFAULT_STREAM_RECEIVE_WINDOW = 1 << 20;
 
 // RESET_STREAM and CONNECTION_CLOSE are separate transport notifications. Give the latter
 // time to surface its authoritative code without letting a reset-only peer stall SETUP forever.
-const SETUP_CLOSE_GRACE = Nano.fromMilli(Milli(100));
+const SETUP_CLOSE_GRACE = Duration.millis(100);
 
 /** Tuning for the WebSocket fallback used when WebTransport is unavailable or loses the connect race. */
 export interface WebSocketProps {
@@ -30,9 +59,24 @@ export interface WebSocketProps {
 
 	/**
 	 * The delay in milliseconds before attempting the WebSocket fallback (default: 500).
-	 * If WebSocket won the previous race for a given URL, this is 0.
+	 * It is 0 while WebSocket holds the last win against the host and port the fallback dials,
+	 * until WebTransport wins a race there again.
 	 */
-	delay?: Milli;
+	delay?: Duration;
+
+	/**
+	 * How many streams the server may hold open at once, applied to bidirectional and
+	 * unidirectional streams alike (default: 10,000), like `moq-tokio`'s `quic.max_streams`.
+	 * MoQ holds a stream per subscription and per live group, so a low limit stalls or refuses them.
+	 * Must be a positive integer.
+	 */
+	maxStreams?: number;
+
+	/** Connection receive window in bytes (default: 4 MiB). Must be a positive safe integer. */
+	receiveWindow?: number;
+
+	/** Per-stream receive window in bytes (default: 1 MiB). Must be a positive safe integer. */
+	streamReceiveWindow?: number;
 }
 
 /**
@@ -66,76 +110,64 @@ export interface WebTransportProps extends Omit<WebTransportOptions, "serverCert
 	serverCertificate?: string | BufferSource;
 }
 
-type SetupVersion = Lite.Version | Ietf.Version;
-
-// Each version name, most preferred first, with the ALPN that negotiates it. Names sharing
-// `moql` then negotiate in SETUP, where `setup` is the version code offered.
-const VERSIONS: Record<string, { alpn: string; setup?: SetupVersion }> = {
-	"moq-lite-07-wip": { alpn: Lite.ALPN_07_WIP },
-	"moq-lite-06": { alpn: Lite.ALPN_06 },
-	"moq-lite-05": { alpn: Lite.ALPN_05 },
-	"moq-lite-04": { alpn: Lite.ALPN_04 },
-	"moq-lite-03": { alpn: Lite.ALPN_03 },
+// Each version name, most preferred first, with the ALPN that negotiates it. `setup` is the
+// version code offered in SETUP, used when the transport negotiated `moql` or no ALPN at all;
+// moq-transport has no version list in SETUP.
+const VERSIONS: Record<string, { alpn: string; setup?: Lite.Version }> = {
+	"moq-lite-07-wip": { alpn: Lite.ALPN_07_WIP, setup: Lite.Version.DRAFT_07 },
+	"moq-lite-06": { alpn: Lite.ALPN_06, setup: Lite.Version.DRAFT_06 },
+	"moq-lite-05": { alpn: Lite.ALPN_05, setup: Lite.Version.DRAFT_05 },
+	"moq-lite-04": { alpn: Lite.ALPN_04, setup: Lite.Version.DRAFT_04 },
+	"moq-lite-03": { alpn: Lite.ALPN_03, setup: Lite.Version.DRAFT_03 },
 	"moq-lite-02": { alpn: Lite.ALPN, setup: Lite.Version.DRAFT_02 },
 	"moq-lite-01": { alpn: Lite.ALPN, setup: Lite.Version.DRAFT_01 },
 	"moq-transport-22": { alpn: Ietf.ALPN.DRAFT_22 },
-	"moq-transport-21": { alpn: Ietf.ALPN.DRAFT_21 },
 	"moq-transport-20": { alpn: Ietf.ALPN.DRAFT_20 },
-	"moq-transport-19": { alpn: Ietf.ALPN.DRAFT_19 },
 	"moq-transport-18": { alpn: Ietf.ALPN.DRAFT_18 },
-	"moq-transport-17": { alpn: Ietf.ALPN.DRAFT_17 },
-	"moq-transport-16": { alpn: Ietf.ALPN.DRAFT_16 },
-	"moq-transport-15": { alpn: Ietf.ALPN.DRAFT_15 },
-	"moq-transport-14": { alpn: Lite.ALPN, setup: Ietf.Version.DRAFT_14 },
 };
 
 // Experimental lite-07 is offered only when named.
 const DEFAULT_VERSIONS = Object.keys(VERSIONS).filter((name) => name !== "moq-lite-07-wip");
 
-// moq-transport-18 and newer are pinned to qmux-01. Every other ALPN is currently
+// moq-transport is pinned to qmux-01. Every other ALPN is currently
 // negotiated as `qmux-00.{alpn}`, but `null` lets the polyfill advertise every QMux draft
 // it knows and the server pick one.
 const QMUX: Record<string, QmuxVersion | QmuxVersion[] | null> = {
 	[Ietf.ALPN.DRAFT_22]: "qmux-01",
-	[Ietf.ALPN.DRAFT_21]: "qmux-01",
 	[Ietf.ALPN.DRAFT_20]: "qmux-01",
-	[Ietf.ALPN.DRAFT_19]: "qmux-01",
 	[Ietf.ALPN.DRAFT_18]: "qmux-01",
 };
 
-/** What one version list offers: the ALPNs in preference order, and the SETUP versions behind `moql`. */
+/** What one version list offers: the ALPNs in preference order, and the versions offered in SETUP. */
 interface Offer {
 	alpns: string[];
-	setup: SetupVersion[];
+	setup: Lite.Version[];
 	/** Whether the caller named the versions, so the peer must pick one of them. */
 	explicit: boolean;
+	/** Whether every offered version carries the connection credential in SETUP. */
+	setupToken: boolean;
+}
+
+// moq-lite gained the SETUP token in lite-07; every moq-transport draft has one.
+function hasSetupToken(name: string): boolean {
+	return !name.startsWith("moq-lite-") || name === "moq-lite-07-wip";
 }
 
 function offer(versions?: readonly string[]): Offer {
 	const names = versions ?? DEFAULT_VERSIONS;
 	const alpns = new Set<string>();
-	const setup: SetupVersion[] = [];
+	const setup: Lite.Version[] = [];
 	for (const name of names) {
 		const version = VERSIONS[name];
 		if (!version) throw new TypeError(`unsupported version: ${name}`);
 		alpns.add(version.alpn);
 		if (version.setup !== undefined) setup.push(version.setup);
 	}
-	return { alpns: [...alpns], setup, explicit: versions !== undefined };
+	return { alpns: [...alpns], setup, explicit: versions !== undefined, setupToken: names.every(hasSetupToken) };
 }
 
-/** Validate and snapshot an ordered version list before acquiring a connection. @internal */
-export function normalizeVersions(props?: {
-	versions?: readonly string[];
-	webtransport?: WebTransportProps;
-	websocket?: WebSocketProps;
-}): string[] | undefined {
-	if (props?.webtransport && "protocols" in props.webtransport)
-		throw new TypeError("webtransport.protocols was removed; set versions instead");
-	if (props?.websocket && "protocols" in props.websocket)
-		throw new TypeError("websocket.protocols was removed; set versions instead");
-	const versions = props?.versions;
-	if (versions === undefined) return undefined;
+/** Copy a version list that can be offered, throwing a `TypeError` if it is empty or has an unsupported or duplicate name. */
+export function checkVersions(versions: readonly string[]): string[] {
 	if (versions.length === 0) throw new TypeError("versions must not be empty");
 	const seen = new Set<string>();
 	for (const name of versions) {
@@ -146,7 +178,25 @@ export function normalizeVersions(props?: {
 	return [...versions];
 }
 
-/** Options for {@link connect}. */
+/** Validate the transport options and snapshot an ordered version list before acquiring a connection. @internal */
+export function normalizeVersions(props?: {
+	versions?: readonly string[];
+	webtransport?: WebTransportProps;
+	websocket?: WebSocketProps;
+}): string[] | undefined {
+	if (props?.webtransport && "protocols" in props.webtransport)
+		throw new TypeError("webtransport.protocols was removed; set versions instead");
+	if (props?.websocket && "protocols" in props.websocket)
+		throw new TypeError("websocket.protocols was removed; set versions instead");
+	for (const key of ["maxStreams", "receiveWindow", "streamReceiveWindow"] as const) {
+		const value = props?.websocket?.[key];
+		if (value !== undefined && !(Number.isSafeInteger(value) && value > 0))
+			throw new RangeError(`websocket.${key} must be a positive safe integer: ${value}`);
+	}
+	return props?.versions === undefined ? undefined : checkVersions(props.versions);
+}
+
+/** Options for {@link Connection.connect}. */
 export interface ConnectProps {
 	/** The relay URL. */
 	url: URL;
@@ -154,9 +204,9 @@ export interface ConnectProps {
 	/**
 	 * Protocol versions to offer on every transport, most preferred first, spelled like
 	 * `moq-lite-06`. Defaults to every supported version except the work-in-progress
-	 * `moq-lite-07-wip`; list every fallback you still want. A peer that negotiates no
-	 * subprotocol (such as WebTransport in Firefox before 155) is refused unless the list
-	 * includes `moq-lite-02`, `moq-lite-01` or `moq-transport-14`, which negotiate in SETUP.
+	 * `moq-lite-07-wip`; list every fallback you still want. With a peer that negotiates no
+	 * subprotocol (such as WebTransport in Firefox before 155), the version is negotiated in
+	 * SETUP instead, which moq-transport cannot do.
 	 */
 	versions?: readonly string[];
 
@@ -170,8 +220,9 @@ export interface ConnectProps {
 	 * Use a pre-existing WebTransport session instead of connecting; skips the
 	 * WebTransport/WebSocket race. The publisher acquires the session's datagram
 	 * writer lock (`datagrams.writable.getWriter()`) for the session's lifetime,
-	 * so the caller must not hold it. Aborting via {@link ConnectProps.signal}
-	 * closes this session, so don't share one you intend to reuse afterwards.
+	 * so the caller must not hold it. Aborting via {@link ConnectProps.signal}, or
+	 * {@link ConnectProps.timeout} passing, closes this session, so don't share one
+	 * you intend to reuse afterwards.
 	 */
 	transport?: WebTransport;
 
@@ -190,7 +241,7 @@ export interface ConnectProps {
 	 * nothing.
 	 *
 	 * What the peer announces under the prefixes the origin's readers watch
-	 * (`announced(scope)` or `request(path, { announced: true })`) appears in its table for
+	 * (`announced(scope)`, `request(path)`, or `follow(path)`) appears in its table for
 	 * the session's lifetime, consumable by path; nothing is asked until something watches,
 	 * and the entries retract when the session dies. Pass the producer behind
 	 * {@link ConnectProps.publish} to route both directions through one origin: a locally
@@ -199,13 +250,57 @@ export interface ConnectProps {
 	 */
 	consume?: OriginProducer;
 
-	/** The moq-transport extensions to offer, each on unless set to `false`. */
+	/**
+	 * The moq-transport extensions to offer, each on unless set to `false`.
+	 *
+	 * @internal Tests only; nothing outside the package consumes it.
+	 */
 	extensions?: Extensions.Extensions;
+
+	/**
+	 * Credentials to present, kept apart from the URL.
+	 *
+	 * The first is the connection credential: it rides SETUP, and the URL's `jwt` query too
+	 * while an offered version can't carry it in SETUP (moq-lite before 07). Each other token
+	 * rides its own AUTH stream, widening the session's grant. A URL that already has a `jwt`
+	 * keeps it as the connection credential, and then every token rides AUTH.
+	 */
+	tokens?: readonly string[];
+
+	/**
+	 * Build the session on `auth`, so it presents every token the handle holds and a route
+	 * naming one of its `Credential`s keeps it across a reconnect. Omit to give the session a handle
+	 * of its own, which ends with it.
+	 *
+	 * The handle backs one active session at a time, plus the ones draining after a GOAWAY or a
+	 * `close()`: connecting another while one is still active rejects with {@link Auth.Duplicate}.
+	 */
+	auth?: Auth.Handle;
+
+	/**
+	 * The implementation this side advertises in SETUP, a User-Agent style product token such as
+	 * `my-app/1.0`. Defaults to this library's, like `moq-net-js/0.4.2`. Empty sends nothing.
+	 */
+	implementation?: string;
+
+	/**
+	 * The viewers whose ceilings summed the session sends as its PROBE target, so a peer
+	 * that advertised `Increase` probes the connection up to it (moq-lite-05+). Omit to send
+	 * no target. The registry is borrowed, so the same one can span reconnects.
+	 */
+	viewers?: Viewers;
+
+	/**
+	 * Maximum time for one connect, covering the dial and the MoQ handshake, which has no
+	 * deadline of its own (default: 30000ms). `0` waits forever. Past it, the connect rejects
+	 * with {@link ConnectTimeout} and closes whatever it had opened.
+	 */
+	timeout?: Duration;
 
 	/**
 	 * Aborts the connection attempt with the signal's reason. An already-aborted
 	 * signal rejects before anything opens, and aborting after the connection is
-	 * established has no effect. Use `AbortSignal.timeout(ms)` for a deadline.
+	 * established has no effect. Set {@link ConnectProps.timeout} for a deadline.
 	 */
 	signal?: AbortSignal;
 }
@@ -213,14 +308,35 @@ export interface ConnectProps {
 /** The per-session wiring shared by every negotiated protocol path. */
 type SessionProps = {
 	publish?: OriginConsumer;
+	/** The auth handle the session is built on, or undefined for one of its own. */
+	handle?: Auth.Handle;
 	/** Whether this side dialed; only the dialing side aborts on a publication its grant does not cover. */
 	client: boolean;
 	/** The moq-transport extensions this side offers. */
 	extensions: Extensions.Offered;
+	/** The connection credential SETUP presents, on versions that carry one. */
+	token?: Uint8Array;
+	/** The implementation this side advertises in SETUP; empty sends nothing. */
+	implementation: string;
+	/** The PROBE target to send a peer that advertised `Increase`. */
+	probeTarget?: Getter<number>;
 };
 
-// Save if WebSocket won the last race, so we won't give QUIC a head start next time.
+/**
+ * Servers (host and port) the WebSocket fallback dials where WebSocket won the last race, so the
+ * next dial there skips QUIC's head start. Both transports still race. The entry is provisional:
+ * a WebTransport win or {@link reachable} probe deletes it, since UDP gets through again, and so
+ * does the end of the MoQ session the winning WebSocket carried, so a redial after an outage gives WebTransport
+ * its head start. Keyed like moq-tokio's: whether UDP reaches a server does not depend on the
+ * path or query, which may hold a rotating credential.
+ */
 const websocketWon = new Set<string>();
+
+/** The {@link websocketWon} key for the URL the WebSocket fallback dials. */
+function websocketKey(url: URL): string {
+	const endpoint = parse(url);
+	return `${endpoint.url.hostname}:${endpoint.port}`;
+}
 
 /** The default connect signal: never aborts. */
 const NEVER_ABORTED = new AbortController().signal;
@@ -228,98 +344,164 @@ const NEVER_ABORTED = new AbortController().signal;
 /**
  * Establishes a connection to a MOQ server.
  *
- * @param url - The URL of the server to connect to
- * @param props - Connection options
  * @returns A promise that resolves to an established session
  */
-export async function connect({ url, ...props }: ConnectProps): Promise<Established> {
+export function connect(props: ConnectProps): Promise<Session> {
+	return establish(props);
+}
+
+/**
+ * {@link connect}, finishing the MoQ handshake over `reached`, a WebTransport session a
+ * {@link reachable} probe opened, instead of racing the transports.
+ *
+ * @internal
+ */
+export async function establish({ url, ...props }: ConnectProps, reached?: Reached): Promise<Session> {
 	if ("discovery" in props) throw new TypeError(DISCOVERY_REMOVED);
 	props.versions = normalizeVersions(props);
 	if (props.transport && props.versions) throw new TypeError("versions cannot reconfigure a supplied transport");
 	const signal = props.signal ?? NEVER_ABORTED;
+	if (signal.aborted) reached?.transport.close();
 	signal.throwIfAborted();
+	// Fail before dialing; the session checks again when it attaches.
+	if (props.auth) vacant(props.auth);
+	const limit = props.timeout ?? DEFAULT_TIMEOUT;
 
-	// Resolves on abort so every in-flight transport tears itself down.
+	// Resolves on abort or timeout so every in-flight transport tears itself down.
 	const { promise: abort, resolve } = Promise.withResolvers<void>();
 	const onAbort = () => resolve();
 	signal.addEventListener("abort", onAbort, { once: true });
 
-	const pending = connectInner(url, props, abort);
+	let expired: ConnectTimeout | undefined;
+	const disarm = !limit.isZero()
+		? after(limit, () => {
+				expired = new ConnectTimeout(limit);
+				resolve();
+			})
+		: () => {};
+
+	const tokens = reached?.tokens ?? props.tokens ?? [];
+	const pending = connectInner(url, tokens, props, abort, reached?.transport);
 	try {
-		// A `pending` rejection propagates unless the abort beat it to the finish line.
-		const connection = await Promise.race([pending, abort.then(() => undefined)]);
-		if (connection && !signal.aborted) {
+		// A `pending` rejection propagates unless the abort or timeout beat it to the finish line.
+		const connected = await Promise.race([pending, abort.then(() => undefined)]);
+		if (connected && !signal.aborted && !expired) {
+			const [connection, dial] = connected;
 			if (props.consume) forwardAnnounced(connection, props.consume);
+			// Before the caller sees the session, so its first requests wait on these answers.
+			hold(connection, dial, tokens);
 			return connection;
 		}
 
-		// Close a connection that settles after the abort.
-		pending.then((conn) => conn.abort()).catch(() => {});
-		throw signal.reason;
+		// Close a connection that settles after the abort or timeout.
+		pending.then(([conn]) => conn.abort()).catch(() => {});
+		// The caller's abort is teardown and wins over the timeout.
+		throw signal.aborted ? signal.reason : expired;
 	} finally {
 		signal.removeEventListener("abort", onAbort);
+		disarm();
 	}
 }
 
-async function connectInner(url: URL, props: Omit<ConnectProps, "url">, abort: Promise<void>): Promise<Established> {
-	const wiring: SessionProps = {
+/**
+ * A WebTransport session a {@link reachable} probe opened, and the tokens its dial presented.
+ *
+ * @internal
+ */
+export class Reached {
+	readonly transport: WebTransport;
+	readonly tokens: readonly string[];
+
+	constructor(transport: WebTransport, tokens: readonly string[]) {
+		this.transport = transport;
+		this.tokens = tokens;
+	}
+}
+
+/**
+ * Open a bare WebTransport session to `url`, for a session on the WebSocket fallback deciding
+ * to move back. It presents what a dial would and runs no MoQ handshake: {@link establish}
+ * finishes that over it, or the caller closes it. Reaching it clears the WebSocket win.
+ * Resolves undefined on failure, after `props.timeout`, or once `signal` aborts.
+ *
+ * @internal
+ */
+export async function reachable(
+	url: URL,
+	props: Pick<ConnectProps, "tokens" | "versions" | "webtransport" | "websocket" | "timeout">,
+	signal: AbortSignal,
+): Promise<Reached | undefined> {
+	if (!isWebTransportSupported() || signal.aborted) return undefined;
+	const tokens = props.tokens ?? [];
+	const offered = offer(normalizeVersions(props));
+	const dialUrl = parse(credential(url, tokens, offered.setupToken).url).url;
+	const { promise: cancel, resolve } = Promise.withResolvers<void>();
+	const onAbort = () => resolve();
+	signal.addEventListener("abort", onAbort, { once: true });
+	const limit = props.timeout ?? DEFAULT_TIMEOUT;
+	const disarm = !limit.isZero() ? after(limit, resolve) : () => {};
+	try {
+		const target = await resolveWebTransport(dialUrl, cancel, offered.alpns, props.webtransport);
+		const quic = target && (await dialWebTransport(target, cancel));
+		if (!quic) return undefined;
+		if (signal.aborted) {
+			quic.close();
+			return undefined;
+		}
+		websocketWon.delete(websocketKey(props.websocket?.url ? new URL(props.websocket.url) : dialUrl));
+		return new Reached(quic, tokens);
+	} catch {
+		return undefined;
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+		disarm();
+	}
+}
+
+/** Dial `raw`, resolving with the session and the credential the winning transport presented. */
+async function connectInner(
+	raw: URL,
+	tokens: readonly string[],
+	props: Omit<ConnectProps, "url">,
+	abort: Promise<void>,
+	reached?: WebTransport,
+): Promise<[Session, Presentation]> {
+	const offered = offer(props.versions);
+	const dial = credential(raw, tokens, offered.setupToken);
+	const url = parse(dial.url).url;
+	const fallbackDial = props.websocket?.url && fallback(raw, props.websocket.url, tokens, offered.setupToken);
+	const wiring = (presented: Presentation): SessionProps => ({
 		publish: props.publish,
+		handle: props.auth,
 		client: true,
 		extensions: Extensions.offered(props.extensions),
-	};
-
-	const offered = offer(props.versions);
+		token: presented.setup === undefined ? undefined : new TextEncoder().encode(presented.setup),
+		implementation: props.implementation ?? IMPLEMENTATION,
+		probeTarget: props.viewers?.target,
+	});
 
 	if (props.transport) {
 		const transport = props.transport;
 		void abort.then(() => transport.close());
-		return connectTransport(url, transport, wiring, offered.setup);
+		return [await connectTransport(url, transport, wiring(dial), offered.setup), dial];
 	}
 
-	// Stop transports after one connects or the caller aborts.
-	const { promise: raced, resolve: done } = Promise.withResolvers<void>();
-	const cancel = Promise.race([raced, abort]);
-
-	const webtransport = isWebTransportSupported()
-		? connectWebTransport(url, cancel, offered.alpns, props.webtransport)
-		: undefined;
-
-	// Give QUIC a head start to connect before trying WebSocket, unless WebSocket has won in the past.
-	// NOTE that QUIC should be faster because it involves 1/2 fewer RTTs.
-	const headstart =
-		!webtransport || websocketWon.has(url.toString()) ? 0 : (props.websocket?.delay ?? DEFAULT_WEBSOCKET_DELAY_MS);
-	const websocket =
-		props.websocket?.enabled !== false
-			? connectWebSocket(props.websocket?.url ?? url, headstart, cancel, offered.alpns)
-			: undefined;
-
-	if (!websocket && !webtransport) {
-		throw new Error("no transport available; WebTransport not supported and WebSocket is disabled");
-	}
-
-	// Race the available transports, using `.any` to ignore if one participant has an error.
-	// `webtransport`/`websocket` are `Promise | undefined`, so test existence explicitly: a
-	// promise is always truthy, so bare truthiness here would be a misused-promise.
-	const session = await Promise.any(
-		webtransport !== undefined
-			? websocket !== undefined
-				? [websocket, webtransport]
-				: [webtransport]
-			: [websocket],
-	);
-	done();
-
+	const websocketUrl = fallbackDial?.url ?? url;
+	const server = websocketKey(websocketUrl);
+	// A probe already reached WebTransport, so there is nothing to race.
+	const session = reached ?? (await dialRace(url, websocketUrl, server, props, offered, abort));
 	if (!session) throw new Error("no transport available");
 
 	// Abort the setup handshake without leaking the selected transport.
 	void abort.then(() => session.close());
 
-	// Save if WebSocket won the last race, so we won't give QUIC a head start next time.
-	if (session instanceof Session) {
-		console.debug(redact(url), "connected via WebSocket");
-		websocketWon.add(url.toString());
+	// Record who won the race to this server, so QUIC's next head start follows the last result.
+	if (session instanceof Qmux) {
+		console.debug(show(parse(url)), "connected via WebSocket");
+		websocketWon.add(server);
 	} else {
-		console.debug(redact(url), "connected via WebTransport");
+		console.debug(show(parse(url)), "connected via WebTransport");
+		websocketWon.delete(server);
 	}
 
 	// The remaining setup is identical whether the transport was raced or supplied.
@@ -332,22 +514,93 @@ async function connectInner(url: URL, props: Omit<ConnectProps, "url">, abort: P
 		session.close();
 		throw new Error("server negotiated no protocol, and no offered version negotiates in SETUP");
 	}
-	return await connectTransport(url, session as WebTransport, wiring, offered.setup);
+	const won = session instanceof Qmux && fallbackDial ? fallbackDial : dial;
+	const connection = await connectTransport(url, session as WebTransport, wiring(won), offered.setup);
+	if (session instanceof Qmux) {
+		const forget = () => websocketWon.delete(server);
+		void connection.closed.then(forget, forget);
+	}
+	return [connection, won];
+}
+
+/** Race WebTransport against the WebSocket fallback to `url`, resolving with the winner. */
+async function dialRace(
+	url: URL,
+	websocketUrl: URL,
+	server: string,
+	props: Omit<ConnectProps, "url">,
+	offered: Offer,
+	abort: Promise<void>,
+): Promise<WebTransport | Qmux | undefined> {
+	// Stop transports after one connects or the caller aborts.
+	const { promise: raced, resolve: done } = Promise.withResolvers<void>();
+	const cancel = Promise.race([raced, abort]);
+
+	const webtransport = isWebTransportSupported()
+		? hedgeWebTransport(url, cancel, offered.alpns, props.webtransport)
+		: undefined;
+
+	// Give QUIC a head start to connect before trying WebSocket, unless WebSocket won the last race
+	// to this server. NOTE that QUIC should be faster because it involves 1/2 fewer RTTs.
+	const headstart =
+		!webtransport || websocketWon.has(server) ? Duration.ZERO : (props.websocket?.delay ?? DEFAULT_WEBSOCKET_DELAY);
+	const maxStreams = BigInt(props.websocket?.maxStreams ?? DEFAULT_MAX_STREAMS);
+	const websocket =
+		props.websocket?.enabled !== false
+			? connectWebSocket(websocketUrl, headstart, cancel, {
+					// The default (`requireProtocol: false`) also advertises the bare `qmux-02`,
+					// `qmux-01`, and `qmux-00`, so we still interop with relays that only know a
+					// wire-format version.
+					protocols: offered.alpns,
+					versions: Object.fromEntries(offered.alpns.map((alpn) => [alpn, QMUX[alpn] ?? null])),
+					config: {
+						maxStreamsBidi: maxStreams,
+						maxStreamsUni: maxStreams,
+						receiveWindow: BigInt(props.websocket?.receiveWindow ?? DEFAULT_RECEIVE_WINDOW),
+						streamReceiveWindow: BigInt(
+							props.websocket?.streamReceiveWindow ?? DEFAULT_STREAM_RECEIVE_WINDOW,
+						),
+					},
+				})
+			: undefined;
+
+	if (!websocket && !webtransport) {
+		throw new Error("no transport available; WebTransport not supported and WebSocket is disabled");
+	}
+
+	// Race the available transports, using `.any` to ignore if one participant has an error.
+	// `webtransport`/`websocket` are `Promise | undefined`, so test existence explicitly: a
+	// promise is always truthy, so bare truthiness here would be a misused-promise.
+	const contenders: Promise<WebTransport | Qmux | undefined>[] = [];
+	if (websocket !== undefined) contenders.push(websocket);
+	if (webtransport !== undefined) contenders.push(webtransport);
+	const session = await Promise.any(contenders).catch((err: unknown) => {
+		// Promise.any rejects with an empty message; name each transport's failure instead.
+		if (!(err instanceof AggregateError)) throw err;
+		const reasons = err.errors.map((e: unknown) => (e instanceof Error ? e.message : String(e)));
+		throw new Error(`no transport connected: ${reasons.join("; ")}`, { cause: err });
+	});
+	done();
+	// A contender that opened in the same turn as the winner has already returned its
+	// transport, so cancelling cannot close it; the rest close themselves on cancel.
+	closeLosers(contenders, session);
+
+	return session;
 }
 
 async function connectTransport(
 	url: URL,
 	session: WebTransport,
 	wiring: SessionProps,
-	setup: SetupVersion[],
-): Promise<Established> {
+	setup: Lite.Version[],
+): Promise<Session> {
 	const closed = session.closed.then(fromClose, error);
 	const terminal = closed.then((cause) => {
 		throw cause ?? new Error("session closed during SETUP");
 	});
 
 	try {
-		return await Promise.race([terminal, negotiate(url, session, wiring, setup)]);
+		return await Promise.race([terminal, inspect(session).then(() => negotiate(url, session, wiring, setup))]);
 	} catch (failure) {
 		// We refused the peer's SETUP and already closed with the code that says why.
 		if (failure instanceof ProtocolViolation) throw failure;
@@ -372,39 +625,28 @@ async function connectTransport(
 // Negotiate the MoQ protocol over an established transport. The caller races this against
 // the session closing so a close code is not lost behind a failed or stalled SETUP stream.
 // `setup` lists the versions a `moql` or ALPN-less session offers in SETUP.
+// A moq-lite version newer than 02 selected there continues as its ALPN would.
 async function negotiate(
 	url: URL,
 	session: WebTransport,
 	wiring: SessionProps,
-	setup: SetupVersion[],
-): Promise<Established> {
+	setup: Lite.Version[],
+): Promise<Session> {
 	// The DOM lib has no `protocol` property yet. It is "" when none was negotiated, and
 	// undefined in a browser that predates subprotocols (Firefox before 155).
 	const protocol: string | undefined = (session as { protocol?: string }).protocol || undefined;
-	console.debug(redact(url), "negotiated ALPN:", protocol ?? "(none)");
+	console.debug(show(parse(url)), "negotiated ALPN:", protocol ?? "(none)");
 
-	// Choose setup encoding based on negotiated WebTransport protocol (if any).
-	let setupVersion: Ietf.Version;
-	const modernVersion =
+	const ietf =
 		protocol === Ietf.ALPN.DRAFT_22
 			? Ietf.Version.DRAFT_22
-			: protocol === Ietf.ALPN.DRAFT_21
-				? Ietf.Version.DRAFT_21
-				: protocol === Ietf.ALPN.DRAFT_20
-					? Ietf.Version.DRAFT_20
-					: protocol === Ietf.ALPN.DRAFT_19
-						? Ietf.Version.DRAFT_19
-						: protocol === Ietf.ALPN.DRAFT_18
-							? Ietf.Version.DRAFT_18
-							: protocol === Ietf.ALPN.DRAFT_17
-								? Ietf.Version.DRAFT_17
-								: undefined;
-	if (modernVersion !== undefined) {
-		return await handshakeAlpn(url, session, modernVersion, wiring);
-	} else if (protocol === Ietf.ALPN.DRAFT_16) {
-		setupVersion = Ietf.Version.DRAFT_16;
-	} else if (protocol === Ietf.ALPN.DRAFT_15) {
-		setupVersion = Ietf.Version.DRAFT_15;
+			: protocol === Ietf.ALPN.DRAFT_20
+				? Ietf.Version.DRAFT_20
+				: protocol === Ietf.ALPN.DRAFT_18
+					? Ietf.Version.DRAFT_18
+					: undefined;
+	if (ietf !== undefined) {
+		return await handshakeAlpn(url, session, ietf, wiring);
 	} else if (protocol === Lite.ALPN_07_WIP) {
 		return new Lite.Connection({ url, quic: session, version: Lite.Version.DRAFT_07, ...wiring });
 	} else if (protocol === Lite.ALPN_06) {
@@ -415,75 +657,29 @@ async function negotiate(
 		return new Lite.Connection({ url, quic: session, version: Lite.Version.DRAFT_04, ...wiring });
 	} else if (protocol === Lite.ALPN_03) {
 		return new Lite.Connection({ url, quic: session, version: Lite.Version.DRAFT_03, ...wiring });
-	} else if (protocol === Lite.ALPN || protocol === "" || protocol === undefined) {
-		setupVersion = Ietf.Version.DRAFT_14;
-	} else {
+	} else if (protocol !== Lite.ALPN && protocol !== undefined) {
 		throw new Error(`unsupported WebTransport protocol: ${protocol}`);
 	}
 
-	const stream = await Stream.open(session, { version: setupVersion });
-	await stream.writer.u53(Lite.StreamId.ClientCompat);
-
-	const encoder = new TextEncoder();
-
-	const params = new Ietf.SetupOptions();
-	params.setVarint(Ietf.SetupOption.MaxRequestId, Ietf.initialMaxRequestId(false));
-	params.setBytes(Ietf.SetupOption.Implementation, encoder.encode("moq-lite-js"));
-	Extensions.intoSetup(params, wiring.extensions, setupVersion);
-	Ietf.hiddenIntoSetup(params);
-	Ietf.maxAgeIntoSetup(params);
-	Ietf.activeCountIntoSetup(params, setupVersion);
-
-	const client = new Ietf.ClientSetup({
-		versions:
-			setupVersion === Ietf.Version.DRAFT_16
-				? [Ietf.Version.DRAFT_16]
-				: setupVersion === Ietf.Version.DRAFT_15
-					? [Ietf.Version.DRAFT_15]
-					: setup,
-		parameters: params,
-	});
-	await client.encode(stream.writer, setupVersion);
-
-	const serverCompat = await stream.reader.u53();
-	if (serverCompat !== Lite.StreamId.ServerCompat) {
-		throw new Error(`unsupported server message type: ${serverCompat.toString()}`);
+	// `moql`, or no subprotocol: negotiate moq-lite in SETUP, which keeps lite-02's framing
+	// whichever version it offers.
+	if (setup.length === 0) throw new Error("no version negotiates in SETUP");
+	const stream = await Stream.open(session, { version: Lite.Version.DRAFT_02 });
+	await new Lite.ClientSetup(setup).encode(stream.writer);
+	const server = await Lite.ServerSetup.decode(stream.reader);
+	const version = setup.find((v) => v === server.version);
+	if (version === undefined) throw new Error(`unsupported server version: 0x${server.version.toString(16)}`);
+	if (handsOff(version)) {
+		// The server ends the stream after its SETUP; nothing else may follow.
+		if (!(await stream.reader.done())) throw new Error("unexpected data after SERVER_SETUP");
+		stream.close();
+		return new Lite.Connection({ url, quic: session, version, ...wiring });
 	}
-
-	const server = await Ietf.ServerSetup.decode(stream.reader, setupVersion);
-
-	if (Object.values(Lite.Version).includes(server.version as Lite.Version)) {
-		return new Lite.Connection({
-			url,
-			quic: session,
-			version: server.version as Lite.Version,
-			session: stream,
-			...wiring,
-		});
-	} else if (Object.values(Ietf.Version).includes(server.version as Ietf.Version)) {
-		const maxRequestId = server.parameters.getVarint(Ietf.SetupOption.MaxRequestId) ?? 0n;
-		// The IETF session code loads on demand, since most sessions negotiate lite.
-		const { Connection } = await import("../ietf/connection.ts");
-		return new Connection({
-			...wiring,
-			client: true,
-			url,
-			quic: session,
-			control: stream,
-			maxRequestId,
-			version: server.version as Ietf.IetfVersion,
-			solicit: Ietf.solicitFromSetup(server.parameters),
-			hidden: Ietf.hiddenFromSetup(server.parameters),
-			maxAge: Ietf.maxAgeFromSetup(server.parameters),
-			activeCount: Ietf.activeCountFromSetup(server.parameters, server.version as Ietf.IetfVersion),
-		});
-	} else {
-		throw new Error(`unsupported server version: ${server.version.toString()}`);
-	}
+	return new Lite.Connection({ url, quic: session, version, session: stream, ...wiring });
 }
 
 /**
- * Draft-17+ client handshake. ALPN already pinned the version; SETUP is
+ * Moq-transport client handshake. ALPN already pinned the version; SETUP is
  * exchanged over a pair of uni streams using stream type 0x2F00.
  */
 async function handshakeAlpn(
@@ -491,12 +687,12 @@ async function handshakeAlpn(
 	session: WebTransport,
 	version: Ietf.IetfVersion,
 	wiring: SessionProps,
-): Promise<Established> {
+): Promise<Session> {
 	// Spread whole, so every negotiated flag reaches the connection.
 	// The IETF session code loads on demand, since most sessions negotiate lite; the ALPN already
 	// committed to IETF, so fetch it alongside SETUP.
 	const [setup, { Connection }] = await Promise.all([
-		exchangeSetup(session, version, "moq-lite-js", wiring),
+		exchangeSetup(session, version, wiring.implementation, wiring),
 		import("../ietf/connection.ts"),
 	]);
 
@@ -506,8 +702,6 @@ async function handshakeAlpn(
 		url,
 		quic: session,
 		...setup,
-		// v17+ uses NativeSession which manages its own request IDs; maxRequestId is unused.
-		maxRequestId: 0n,
 		version,
 	});
 }
@@ -561,12 +755,75 @@ async function resolveCertificateHashes(options?: WebTransportProps): Promise<We
 	return hashes.length > 0 ? hashes : undefined;
 }
 
-async function connectWebTransport(
+// Close every transport the race opened other than `winner`.
+function closeLosers(contenders: Promise<WebTransport | Qmux | undefined>[], winner: unknown): void {
+	for (const contender of contenders) {
+		void contender.then(
+			(transport) => {
+				if (transport && transport !== winner) transport.close();
+			},
+			() => {},
+		);
+	}
+}
+
+/**
+ * Dial WebTransport, and dial it again alongside if the first has not opened within
+ * {@link WEBTRANSPORT_HEDGE}. The first to open wins and the other is closed.
+ *
+ * A load balancer that still places some new flows on a target that just died sends every
+ * packet of such a flow there, and the browser waits seconds before failing the dial. A
+ * second dial is a new flow that the balancer places afresh. Neither dial is cut on a timer of
+ * its own, only by the attempt's {@link ConnectProps.timeout}: the browser's handshake timer
+ * tells a silent dial from a slow one, which script cannot, and every dial the browser fails
+ * or abandons counts against its WebTransport throttle. A first dial that fails outright is
+ * not hedged; that is left to the caller's retry.
+ */
+async function hedgeWebTransport(
 	url: URL,
 	cancel: Promise<void>,
 	alpns: string[],
 	options?: WebTransportProps,
 ): Promise<WebTransport | undefined> {
+	// Resolve pins (and fetch an http:// fingerprint) once, before the hedge delay starts, so a slow
+	// fingerprint fetch can't start a second dial and both dials share the one fetch.
+	const target = await resolveWebTransport(url, cancel, alpns, options);
+	if (!target) return undefined;
+
+	const first = dialWebTransport(target, cancel);
+
+	// The first dial opening, failing, or being cancelled settles this before the delay does.
+	const hedge = await timeout(WEBTRANSPORT_HEDGE, first).then(
+		() => false,
+		(err: unknown) => err instanceof Elapsed,
+	);
+	if (!hedge) return first;
+	console.debug(show(parse(url)), `WebTransport not open after ${WEBTRANSPORT_HEDGE}; dialing a second`);
+
+	const dials = [first, dialWebTransport(target, cancel)];
+	try {
+		const winner = await Promise.any(dials);
+		closeLosers(dials, winner);
+		return winner;
+	} catch (err) {
+		// Both failed. Report the first dial's reason, as when there is no hedge, so `no transport
+		// connected` keeps one reason per transport; a browser words every handshake failure alike.
+		throw (err as AggregateError).errors[0];
+	}
+}
+
+interface WebTransportTarget {
+	url: URL;
+	options: WebTransportOptions;
+}
+
+/** Resolve the URL and options to dial, or `undefined` once `cancel` resolves. */
+async function resolveWebTransport(
+	url: URL,
+	cancel: Promise<void>,
+	alpns: string[],
+	options?: WebTransportProps,
+): Promise<WebTransportTarget | undefined> {
 	let finalUrl = url;
 
 	// Our custom pinning fields are normalized separately; the rest are DOM options.
@@ -594,17 +851,15 @@ async function connectWebTransport(
 		// Dev-only path: http:// can't be a real WebTransport origin, so we fetch the
 		// self-signed cert's hash over plain HTTP and pin it. Production uses https://
 		// and never reaches here. Keep this at debug so it doesn't read as a problem.
-		console.debug(redact(fingerprintUrl), "performing an insecure fingerprint fetch; use https:// in production");
+		console.debug(
+			show(parse(fingerprintUrl)),
+			"performing an insecure fingerprint fetch; use https:// in production",
+		);
 
-		// Fetch the fingerprint from the server.
-		// TODO cancel the request if the effect is cancelled.
-		const fingerprint = await Promise.race([fetch(fingerprintUrl), cancel]);
+		const fingerprint = await fetchFingerprint(fingerprintUrl, cancel);
 		if (!fingerprint) return undefined;
 
-		const fingerprintText = await Promise.race([fingerprint.text(), cancel]);
-		if (fingerprintText === undefined) return undefined;
-
-		hashes.push({ algorithm: "sha-256", value: Hex.toBytes(fingerprintText) });
+		hashes.push({ algorithm: "sha-256", value: fingerprint });
 
 		finalUrl = new URL(url);
 		finalUrl.protocol = "https:";
@@ -614,7 +869,11 @@ async function connectWebTransport(
 		finalOptions.serverCertificateHashes = hashes;
 	}
 
-	const quic = new WebTransport(finalUrl, finalOptions);
+	return { url: finalUrl, options: finalOptions };
+}
+
+async function dialWebTransport(target: WebTransportTarget, cancel: Promise<void>): Promise<WebTransport | undefined> {
+	const quic = new WebTransport(target.url, target.options);
 
 	// Both .ready and .closed reject on failure; catch .closed to avoid an unhandled rejection.
 	quic.closed.catch(() => {});
@@ -630,35 +889,95 @@ async function connectWebTransport(
 	return quic;
 }
 
+/** A SHA-256 certificate fingerprint is 32 bytes, served as this many hex characters. */
+const FINGERPRINT_HEX_LENGTH = 64;
+
+/**
+ * Fetch the SHA-256 certificate fingerprint served at `url`, or `undefined` once `cancel` resolves.
+ *
+ * Resolving `cancel` aborts the request. The body is read chunk by chunk and refused at the first
+ * chunk that takes it past a fingerprint, so a reply with no `Content-Length` cannot accumulate:
+ * it holds at most a fingerprint plus the one chunk the network stack handed over.
+ */
+async function fetchFingerprint(url: URL, cancel: Promise<void>): Promise<Uint8Array<ArrayBuffer> | undefined> {
+	const controller = new AbortController();
+	void cancel.then(() => controller.abort());
+
+	try {
+		const response = await fetch(url, { signal: controller.signal });
+		if (!response.ok) throw new Error(`fingerprint fetch failed: HTTP ${response.status}`);
+
+		const body = new Uint8Array(FINGERPRINT_HEX_LENGTH);
+		let length = 0;
+		const reader = response.body?.getReader();
+		for (;;) {
+			const chunk = await reader?.read();
+			if (!chunk || chunk.done) break;
+			if (length + chunk.value.byteLength > body.length) {
+				throw new Error(`fingerprint is longer than ${FINGERPRINT_HEX_LENGTH} hex characters`);
+			}
+			body.set(chunk.value, length);
+			length += chunk.value.byteLength;
+		}
+		if (length !== body.length) {
+			throw new Error(`fingerprint is ${length} characters, expected ${FINGERPRINT_HEX_LENGTH} hex characters`);
+		}
+
+		return Hex.toBytes(new TextDecoder().decode(body));
+	} catch (err) {
+		// Cancelled: another transport won or the caller aborted, which is no failure of this dial.
+		if (controller.signal.aborted) return undefined;
+		throw err;
+	} finally {
+		// Releases the request and cancels any unread body, whichever way this ended.
+		controller.abort();
+	}
+}
+
 // TODO accept arguments to control the port/path used.
+/**
+ * Dial the WebSocket fallback after `delay`, and if a dial has not opened within
+ * {@link WEBSOCKET_REDIAL}, close it and dial again, doubling the wait each time.
+ *
+ * A browser lets one WebSocket to an address be connecting at a time (RFC 6455 section 4.1),
+ * so a second dial alongside a silent one only queues behind it, and a TCP connect whose SYNs
+ * go unanswered waits for the OS's connect timeout. Closing the silent dial lets the next one
+ * start, on a new connection that a load balancer places afresh. The doubling lets a
+ * slow but working path through, and {@link ConnectProps.timeout} bounds the whole attempt. A
+ * dial that fails outright is not redialed.
+ */
 async function connectWebSocket(
 	url: URL,
-	delay: number,
+	delay: Duration,
 	cancel: Promise<void>,
-	alpns: string[],
-): Promise<Session | undefined> {
-	const timer = sleep(Nano.fromMilli(Milli(delay)));
+	options: QmuxOptions,
+): Promise<Qmux | undefined> {
+	const timer = sleep(delay);
 
 	const active = await Promise.race([cancel, timer.then(() => true)]);
 	if (!active) return undefined;
 
-	// The default (`requireProtocol: false`) also advertises bare `qmux-01`,
-	// `qmux-00`, and `webtransport` so we still interop with relays that only
-	// know a wire-format version (today's moq-relay only accepts bare
-	// `webtransport`).
-	const quic = new Session(url, {
-		protocols: alpns,
-		versions: Object.fromEntries(alpns.map((alpn) => [alpn, QMUX[alpn] ?? null])),
-	});
+	for (let wait = WEBSOCKET_REDIAL; ; wait = wait.mul(2)) {
+		const quic = new Qmux(url, options);
 
-	// Wait for the WebSocket to connect, or for the cancel promise to resolve.
-	// `ready` rejects on a refused/failed connection, so a throw here is the caller's
-	// cue to retry; a lost cancel race instead resolves and we close the loser.
-	const loaded = await Promise.race([quic.ready.then(() => true), cancel]);
-	if (!loaded) {
-		quic.close();
-		return undefined;
+		// Wait for the WebSocket to connect, for the cancel promise to resolve, or for the
+		// redial. `ready` rejects on a refused/failed connection, so a throw here is the
+		// caller's cue to retry; a lost cancel race instead resolves and we close the loser.
+		const disarm = new AbortController();
+		try {
+			// `race` rather than `Promise.race`, and `cancel` itself rather than something derived
+			// from it: `cancel` outlives every dial, and `race` releases what it attached.
+			const outcome = await race([
+				quic.ready.then(() => "open" as const),
+				cancel,
+				sleep(wait, { signal: disarm.signal }).then(() => "redial" as const),
+			]);
+			if (outcome === "open") return quic;
+			quic.close();
+			if (outcome !== "redial") return undefined;
+			console.debug(show(parse(url)), `WebSocket not open after ${wait}; dialing again`);
+		} finally {
+			disarm.abort();
+		}
 	}
-
-	return quic;
 }

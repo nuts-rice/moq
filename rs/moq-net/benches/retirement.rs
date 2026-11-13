@@ -2,7 +2,7 @@
 //! The route-only control models the old gate: a more-specific source does not retract the broad route.
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
-use moq_net::{Path, fuzz::RequestValidity, kio, origin};
+use moq_net::{Path, fuzz::RequestValidity, origin};
 use std::{hint::black_box, time::Duration};
 
 fn retirement(c: &mut Criterion) {
@@ -22,7 +22,11 @@ fn retirement(c: &mut Criterion) {
 							|| {
 								let (origin, driver) = origin::Producer::new(origin::Config::default());
 								let routes: Vec<_> = (0..routes)
-									.map(|i| origin.dynamic(format!("route/{i}")).unwrap())
+									.map(|i| {
+										origin
+											.claim(format!("route/{i}"), moq_net::origin::RouteOptions::default())
+											.unwrap()
+									})
 									.collect();
 								let mut watches = Vec::new();
 								let mut controls = Vec::new();
@@ -30,9 +34,9 @@ fn retirement(c: &mut Criterion) {
 								for (i, route) in routes.iter().enumerate() {
 									for reader in 0..if i == 0 { consumers } else { 1 } {
 										if selected {
-											let watch = RequestValidity::new(
+											let mut watch = RequestValidity::new(
 												route,
-												&Path::new(&format!("route/{i}/jobs/{reader}")),
+												&Path::new(&format!("route/{i}/jobs/{reader}")).unwrap(),
 											);
 											pending.push(watch.start());
 											watches.push(watch);
@@ -46,7 +50,10 @@ fn retirement(c: &mut Criterion) {
 								(origin, driver, routes, watches, controls, pending)
 							},
 							|fixture| {
-								let replacement = fixture.0.dynamic("route/0/jobs").unwrap();
+								let replacement = fixture
+									.0
+									.claim("route/0/jobs", moq_net::origin::RouteOptions::default())
+									.unwrap();
 								let refused = fixture
 									.5
 									.iter()
